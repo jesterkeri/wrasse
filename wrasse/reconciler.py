@@ -27,7 +27,7 @@ DEALS_ABI = [{
         {"internalType": "uint64", "name": "payoutDelay", "type": "uint64"},
         {"internalType": "uint64", "name": "payoutAvailableAt", "type": "uint64"},
         {"internalType": "bytes32", "name": "policyHash", "type": "bytes32"},
-        {"internalType": "enum RapportEscrow.State", "name": "state", "type": "uint8"},
+        {"internalType": "enum WrasseEscrow.State", "name": "state", "type": "uint8"},
     ],
     "stateMutability": "view",
     "type": "function",
@@ -35,7 +35,7 @@ DEALS_ABI = [{
 
 
 class ChainVerificationError(RuntimeError):
-    """A receipt does not prove the neutral event Rapport was asked to ingest."""
+    """A receipt does not prove the neutral event Wrasse was asked to ingest."""
 
 
 def _field(value: Any, name: str) -> Any:
@@ -96,7 +96,7 @@ def verify_timeout_claim(
     deal = contract.functions.deals(deal_id).call(block_identifier=_field(receipt, "blockNumber"))
     if Web3.to_checksum_address(deal[1]) != provider:
         raise ChainVerificationError("stored deal provider does not match")
-    if int(deal[11]) != 4:  # RapportEscrow.State.TimedOut
+    if int(deal[11]) != 4:  # WrasseEscrow.State.TimedOut
         raise ChainVerificationError("deal is not in TimedOut state at the receipt block")
 
     block = web3.eth.get_block(_field(receipt, "blockNumber"))

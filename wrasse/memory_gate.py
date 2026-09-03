@@ -9,7 +9,7 @@ from sibyl_memory_client import SibylMemoryError, VerdictCode, refine_zero
 
 
 class MemoryRequired(RuntimeError):
-    """Raised when Rapport cannot safely read its persistent memory."""
+    """Raised when Wrasse cannot safely read its persistent memory."""
 
 
 class MemoryReader(Protocol):

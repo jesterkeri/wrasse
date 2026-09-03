@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from web3 import Web3
 
-from rapport.reconciler import ChainVerificationError, TIMEOUT_SIGNATURE, verify_timeout_claim
+from wrasse.reconciler import ChainVerificationError, TIMEOUT_SIGNATURE, verify_timeout_claim
 
 
 CONTRACT = "0x1111111111111111111111111111111111111111"

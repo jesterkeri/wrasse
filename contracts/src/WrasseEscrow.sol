@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-/// @title RapportEscrow
+/// @title WrasseEscrow
 /// @notice Minimal bilateral escrow committing each deal to memory-derived terms.
-contract RapportEscrow {
+contract WrasseEscrow {
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant MAX_PROVIDER_BOND_BPS = 10_000;
 

@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 from sibyl_memory_client import MemoryClient
 
-from rapport.evidence import EventConflict, event_id, persist_verified_event
+from wrasse.evidence import EventConflict, event_id, persist_verified_event
 
 
 def test_event_id_is_stable_and_abi_encoded(chain_event):

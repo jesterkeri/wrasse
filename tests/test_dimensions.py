@@ -5,7 +5,7 @@ import json
 import pytest
 from sibyl_memory_client import MemoryClient
 
-from rapport.dimensions import (
+from wrasse.dimensions import (
     DimensionDefinition,
     DimensionError,
     create_dimension,

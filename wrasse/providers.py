@@ -33,7 +33,7 @@ def request_bid(
 ) -> Bid:
     if reference_price_wei <= 0 or service_window <= 0:
         raise ValueError("price and service window must be positive")
-    rng = random.Random(f"rapport:{seed}:{provider.address.lower()}")
+    rng = random.Random(f"wrasse:{seed}:{provider.address.lower()}")
     jitter_bps = rng.randint(-75, 75)
     price = reference_price_wei * (10_000 + provider.price_bias_bps + jitter_bps) // 10_000
     return Bid(provider, price, provider.preferred_bond_bps, service_window, seed)
@@ -43,7 +43,7 @@ def counteroffer(bid: Bid, *, proposed_price_wei: int, proposed_bond_bps: int) -
     """One deterministic compromise; callers must not invoke a second round."""
 
     if bid.round != 0:
-        raise ValueError("Rapport permits exactly one counteroffer")
+        raise ValueError("Wrasse permits exactly one counteroffer")
     if proposed_price_wei <= 0 or not 0 <= proposed_bond_bps <= 10_000:
         raise ValueError("invalid counteroffer")
     price = (bid.price_wei + proposed_price_wei) // 2

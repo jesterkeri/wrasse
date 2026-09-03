@@ -71,7 +71,7 @@ def _bounded_number(value: Any, name: str) -> float:
 
 
 DIMENSION_JSON_SCHEMA = {
-    "name": "rapport_dimension",
+    "name": "wrasse_dimension",
     "strict": True,
     "schema": {
         "type": "object",

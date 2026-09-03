@@ -1,5 +1,5 @@
 [project]
-name = "rapport"
+name = "wrasse"
 version = "0.1.0"
 description = "Memory-conditioned agent negotiation with verified Base outcomes"
 readme = "README.md"
@@ -18,7 +18,7 @@ dev = [
 ]
 
 [project.scripts]
-rapport = "rapport.cli:main"
+wrasse = "wrasse.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -30,7 +30,7 @@ addopts = "-q"
 
 [tool.coverage.run]
 branch = true
-source = ["rapport"]
+source = ["wrasse"]
 
 [tool.coverage.report]
 show_missing = true

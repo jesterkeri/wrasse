@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import {RapportEscrow} from "../src/RapportEscrow.sol";
+import {WrasseEscrow} from "../src/WrasseEscrow.sol";
 
 interface Vm {
     function deal(address who, uint256 newBalance) external;
@@ -14,18 +14,18 @@ interface Vm {
 }
 
 contract ReentrantBuyer {
-    RapportEscrow private immutable escrow;
+    WrasseEscrow private immutable escrow;
     uint256 private dealId;
     bool private attempted;
     bool public reentrySucceeded;
 
-    constructor(RapportEscrow target) {
+    constructor(WrasseEscrow target) {
         escrow = target;
     }
 
     function create(address provider, uint64 acceptBy) external payable {
         dealId = escrow.createDeal{value: msg.value}(
-            provider, 2_000, acceptBy, 2 hours, 30 minutes, keccak256("rapport/0.1.0"), keccak256("evidence")
+            provider, 2_000, acceptBy, 2 hours, 30 minutes, keccak256("wrasse/0.1.0"), keccak256("evidence")
         );
     }
 
@@ -36,15 +36,15 @@ contract ReentrantBuyer {
     receive() external payable {
         if (!attempted) {
             attempted = true;
-            (reentrySucceeded,) = address(escrow).call(abi.encodeCall(RapportEscrow.cancelUnaccepted, (dealId)));
+            (reentrySucceeded,) = address(escrow).call(abi.encodeCall(WrasseEscrow.cancelUnaccepted, (dealId)));
         }
     }
 }
 
-contract RapportEscrowTest {
+contract WrasseEscrowTest {
     Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
-    RapportEscrow private escrow;
+    WrasseEscrow private escrow;
     address private constant BUYER = address(0xB0B);
     address private constant PROVIDER = address(0xA11CE);
     uint256 private constant PRICE = 1 ether;
@@ -52,12 +52,12 @@ contract RapportEscrowTest {
     uint64 private constant ACCEPT_WINDOW = 1 hours;
     uint64 private constant SERVICE_WINDOW = 2 hours;
     uint64 private constant PAYOUT_DELAY = 30 minutes;
-    bytes32 private constant ENGINE_VERSION_HASH = 0x67579eefed8eb8adb46fd42d8e620a9d236f76a74680b3d84bc76acb85bd99c9;
+    bytes32 private constant ENGINE_VERSION_HASH = 0x3adccb560ae1964af4cdd5471d5863cdbd37f484db6bbd2cc7a9f397d4753c81;
     bytes32 private constant EVIDENCE_HASH = 0x2f685994ab703309ca4d0393ec2524b0368f819050ff85e7e3fb719cc5b48de3;
-    bytes32 private constant POLICY_HASH = 0x37e7cc805371ef4785d992cac48ef3bcf082c19e706dbe057e009a9c41ad8484;
+    bytes32 private constant POLICY_HASH = 0x42d7fe689da394b89bd8f6bc4ffc06bcf6f4720ebfae05b132bbb756e2224358;
 
     function setUp() public {
-        escrow = new RapportEscrow();
+        escrow = new WrasseEscrow();
         vm.deal(BUYER, 10 ether);
         vm.deal(PROVIDER, 10 ether);
     }
@@ -68,16 +68,16 @@ contract RapportEscrowTest {
         uint256 acceptedAt = block.timestamp;
         _accept(dealId);
 
-        (,,,,, uint64 storedAcceptedAt,, uint64 deadline,,,, RapportEscrow.State state) = escrow.deals(dealId);
+        (,,,,, uint64 storedAcceptedAt,, uint64 deadline,,,, WrasseEscrow.State state) = escrow.deals(dealId);
         _assertEq(uint256(storedAcceptedAt), acceptedAt);
         _assertEq(uint256(deadline), acceptedAt + SERVICE_WINDOW);
-        _assertEq(uint256(state), uint256(RapportEscrow.State.Accepted));
+        _assertEq(uint256(state), uint256(WrasseEscrow.State.Accepted));
     }
 
     function testCancelOnlyAfterAcceptanceWindow() public {
         uint256 dealId = _create();
         vm.prank(BUYER);
-        vm.expectRevert(RapportEscrow.AcceptanceStillOpen.selector);
+        vm.expectRevert(WrasseEscrow.AcceptanceStillOpen.selector);
         escrow.cancelUnaccepted(dealId);
 
         vm.warp(block.timestamp + ACCEPT_WINDOW + 1);
@@ -104,7 +104,7 @@ contract RapportEscrowTest {
         vm.prank(PROVIDER);
         escrow.markDelivered(dealId);
         vm.prank(PROVIDER);
-        vm.expectRevert(RapportEscrow.PayoutNotReady.selector);
+        vm.expectRevert(WrasseEscrow.PayoutNotReady.selector);
         escrow.claimPayment(dealId);
 
         vm.warp(block.timestamp + PAYOUT_DELAY);
@@ -119,7 +119,7 @@ contract RapportEscrowTest {
         (,,,,,,, uint64 deadline,,,,) = escrow.deals(dealId);
         vm.warp(uint256(deadline) + 1);
         vm.prank(PROVIDER);
-        vm.expectRevert(RapportEscrow.DeadlinePassed.selector);
+        vm.expectRevert(WrasseEscrow.DeadlinePassed.selector);
         escrow.markDelivered(dealId);
     }
 
@@ -137,11 +137,11 @@ contract RapportEscrowTest {
     function testOnlyProviderCanAcceptAndBondMustMatch() public {
         uint256 dealId = _create();
         vm.prank(BUYER);
-        vm.expectRevert(RapportEscrow.Unauthorized.selector);
+        vm.expectRevert(WrasseEscrow.Unauthorized.selector);
         escrow.acceptDeal{value: BOND}(dealId);
 
         vm.prank(PROVIDER);
-        vm.expectRevert(abi.encodeWithSelector(RapportEscrow.WrongBond.selector, BOND, BOND - 1));
+        vm.expectRevert(abi.encodeWithSelector(WrasseEscrow.WrongBond.selector, BOND, BOND - 1));
         escrow.acceptDeal{value: BOND - 1}(dealId);
     }
 

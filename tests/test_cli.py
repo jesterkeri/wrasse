@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 
-from rapport.cli import main
+from wrasse.cli import main
 
 
 PROVIDER = "0x3333333333333333333333333333333333333333"
 
 
 def test_cold_start_policy_is_emitted_as_json(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("RAPPORT_MEMORY_PATH", str(tmp_path / "memory.db"))
+    monkeypatch.setenv("WRASSE_MEMORY_PATH", str(tmp_path / "memory.db"))
     output_path = tmp_path / "policy.json"
     assert main(["policy", PROVIDER, "--output", str(output_path)]) == 0
     output = json.loads(capsys.readouterr().out)

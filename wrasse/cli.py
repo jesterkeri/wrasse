@@ -1,4 +1,4 @@
-"""Small, scriptable terminal surface for the Rapport demo."""
+"""Small, scriptable terminal surface for the Wrasse demo."""
 
 from __future__ import annotations
 
@@ -19,13 +19,13 @@ from .reconciler import reconcile_timeout_claim
 
 
 def _memory() -> MemoryClient:
-    path = Path(os.getenv("RAPPORT_MEMORY_PATH", ".rapport/memory.db"))
+    path = Path(os.getenv("WRASSE_MEMORY_PATH", ".wrasse/memory.db"))
     path.parent.mkdir(parents=True, exist_ok=True)
     return MemoryClient.local(path)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rapport")
+    parser = argparse.ArgumentParser(prog="wrasse")
     sub = parser.add_subparsers(dest="command", required=True)
     recall = sub.add_parser("recall", help="recall verified evidence for a provider")
     recall.add_argument("provider")
@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
             memory,
             event,
             api_key=api_key,
-            model=os.getenv("RAPPORT_LLM_MODEL", "openai/gpt-oss-20b"),
+            model=os.getenv("WRASSE_LLM_MODEL", "openai/gpt-oss-20b"),
         )
         print(json.dumps({"created": created, "dimension": definition.body()}, indent=2, sort_keys=True))
         return 0
@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
                 bond_bps=terms.provider_bond_bps,
                 service_window=terms.service_window,
                 payout_delay=args.payout_delay,
-                engine_version="rapport/0.1.0",
+                engine_version="wrasse/0.1.0",
                 evidence_hash=evidence_commitment,
             )
             profiles[name] = {
@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         print(rendered)
         return 0
     if args.command == "reconcile-timeout":
-        contract = os.environ["RAPPORT_ESCROW_ADDRESS"]
+        contract = os.environ["WRASSE_ESCROW_ADDRESS"]
         chain_id = int(os.getenv("BASE_SEPOLIA_CHAIN_ID", "84532"))
         web3 = Web3(HTTPProvider(os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")))
         result = reconcile_timeout_claim(

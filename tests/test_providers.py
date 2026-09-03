@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from rapport.providers import Provider, counteroffer, request_bid
+from wrasse.providers import Provider, counteroffer, request_bid
 
 
 def test_provider_bid_is_reproducible_from_logged_seed():

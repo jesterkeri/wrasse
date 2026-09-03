@@ -1,8 +1,8 @@
-# RapportEscrow pre-deployment review
+# WrasseEscrow pre-deployment review
 
 Date: 2026-09-03 UTC
 
-Scope: `contracts/src/RapportEscrow.sol` and its Python policy-hash producer.
+Scope: `contracts/src/WrasseEscrow.sol` and its Python policy-hash producer.
 Target: Base Sepolia. This review was performed before any deployment.
 
 ## Result

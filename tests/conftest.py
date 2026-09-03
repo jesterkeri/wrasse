@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from rapport.evidence import ChainEvent
+from wrasse.evidence import ChainEvent
 
 
 @pytest.fixture

@@ -10,7 +10,7 @@ build/
 *.egg-info/
 
 # Sibyl local state and generated demo output
-.rapport/
+.wrasse/
 policy.json
 
 # Foundry

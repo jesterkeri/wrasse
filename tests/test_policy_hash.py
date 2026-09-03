@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rapport.policy_hash import PolicyPreimage, evidence_hash, policy_hash
+from wrasse.policy_hash import PolicyPreimage, evidence_hash, policy_hash
 
 
 def test_evidence_hash_is_order_independent():
@@ -17,7 +17,7 @@ def test_policy_hash_changes_with_committed_terms():
         bond_bps=2_000,
         service_window=3_600,
         payout_delay=1_800,
-        engine_version="rapport/0.1.0",
+        engine_version="wrasse/0.1.0",
         evidence_hash=evidence,
     )
     changed = PolicyPreimage(**{**original.as_dict(), "price": 999})
@@ -32,8 +32,8 @@ def test_policy_hash_matches_solidity_fixture():
         bond_bps=2_000,
         service_window=7_200,
         payout_delay=1_800,
-        engine_version="rapport/0.1.0",
+        engine_version="wrasse/0.1.0",
         evidence_hash=evidence,
     )
     assert evidence == "0x2f685994ab703309ca4d0393ec2524b0368f819050ff85e7e3fb719cc5b48de3"
-    assert policy_hash(preimage) == "0x37e7cc805371ef4785d992cac48ef3bcf082c19e706dbe057e009a9c41ad8484"
+    assert policy_hash(preimage) == "0x42d7fe689da394b89bd8f6bc4ffc06bcf6f4720ebfae05b132bbb756e2224358"

@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 from sibyl_memory_client import MemoryClient, StorageError
 
-from rapport.evidence import persist_verified_event
-from rapport.memory_gate import MemoryRequired, recall_counterparty_evidence
+from wrasse.evidence import persist_verified_event
+from wrasse.memory_gate import MemoryRequired, recall_counterparty_evidence
 
 
 class BrokenMemory:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from rapport.dimensions import DimensionDefinition
-from rapport.engine import PROFILES, produce_terms
+from wrasse.dimensions import DimensionDefinition
+from wrasse.engine import PROFILES, produce_terms
 
 
 def test_same_history_changes_terms_by_task_profile():
