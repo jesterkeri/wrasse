@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 import requests
+from sibyl_memory_client import NotFoundError
 
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
@@ -17,6 +18,12 @@ _CONTEXTS = {"deadline_sensitive", "cost_sensitive", "quality_sensitive"}
 
 class DimensionError(RuntimeError):
     pass
+
+
+class DimensionMemory(Protocol):
+    def list_entities(self, category: str | None = None, *, status: str | None = None, limit: int = 100): ...
+    def get_entity(self, category: str, name: str): ...
+    def set_entity(self, category: str, name: str, body, *, status: str | None = None): ...
 
 
 @dataclass(frozen=True)
@@ -128,3 +135,43 @@ def create_dimension(
             last_error = exc
     raise DimensionError("model failed to return a valid dimension after two attempts") from last_error
 
+
+def load_dimensions(memory: DimensionMemory) -> tuple[DimensionDefinition, ...]:
+    definitions = []
+    for entity in memory.list_entities("behavior_dimension", status="active", limit=100):
+        body = entity["body"]
+        source_event_type = str(body["source_event_type"])
+        model_body = {key: body[key] for key in (
+            "dimension_id", "signal_direction", "severity", "confidence", "applies_when"
+        )}
+        definitions.append(DimensionDefinition.from_model(model_body, source_event_type))
+    return tuple(definitions)
+
+
+def get_or_create_dimension(
+    memory: DimensionMemory,
+    event: dict[str, Any],
+    *,
+    api_key: str,
+    model: str = "openai/gpt-oss-20b",
+    post: Callable[..., Any] = requests.post,
+) -> tuple[DimensionDefinition, bool]:
+    event_type = str(event.get("event_type", ""))
+    for definition in load_dimensions(memory):
+        if definition.source_event_type == event_type:
+            return definition, False
+
+    definition = create_dimension(event, api_key=api_key, model=model, post=post)
+    try:
+        collision = memory.get_entity("behavior_dimension", definition.dimension_id)
+    except NotFoundError:
+        collision = None
+    if collision is not None and collision["body"].get("source_event_type") != event_type:
+        raise DimensionError("model reused a dimension id for an incompatible event type")
+    memory.set_entity(
+        "behavior_dimension",
+        definition.dimension_id,
+        definition.body(),
+        status="active",
+    )
+    return definition, True

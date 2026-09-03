@@ -3,8 +3,15 @@ from __future__ import annotations
 import json
 
 import pytest
+from sibyl_memory_client import MemoryClient
 
-from rapport.dimensions import DimensionDefinition, DimensionError, create_dimension
+from rapport.dimensions import (
+    DimensionDefinition,
+    DimensionError,
+    create_dimension,
+    get_or_create_dimension,
+    load_dimensions,
+)
 
 
 class FakeResponse:
@@ -55,4 +62,30 @@ def test_creation_retries_once_after_malformed_json():
     assert len(calls) == 2
     assert dimension.dimension_id == "deadline_followthrough"
     assert dimension.source_event_type == "timeout_claimed_without_delivery"
+
+
+def test_existing_source_event_dimension_is_reused_without_model_call(tmp_path):
+    memory = MemoryClient.local(tmp_path / "memory.db")
+    existing = DimensionDefinition(
+        "deadline_followthrough",
+        "timeout_claimed_without_delivery",
+        "negative",
+        0.8,
+        0.4,
+        ("deadline_sensitive",),
+    )
+    memory.set_entity("behavior_dimension", existing.dimension_id, existing.body(), status="active")
+
+    def must_not_call(*args, **kwargs):
+        raise AssertionError("model was called for a known event type")
+
+    loaded, created = get_or_create_dimension(
+        memory,
+        {"event_type": "timeout_claimed_without_delivery"},
+        api_key="unused",
+        post=must_not_call,
+    )
+    assert loaded == existing
+    assert created is False
+    assert load_dimensions(memory) == (existing,)
 
