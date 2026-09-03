@@ -14,7 +14,12 @@ from web3 import HTTPProvider, Web3
 from .dimensions import get_or_create_dimension, load_dimensions
 from .engine import PROFILES, produce_terms
 from .memory_gate import recall_counterparty_evidence
-from .policy_hash import PolicyPreimage, evidence_hash, policy_hash
+from .policy_hash import (
+    EMPTY_EVIDENCE_HASH,
+    PolicyPreimage,
+    evidence_hash,
+    policy_hash,
+)
 from .reconciler import reconcile_timeout_claim
 
 
@@ -33,10 +38,21 @@ def build_parser() -> argparse.ArgumentParser:
     learn.add_argument("event_id")
     policy = sub.add_parser("policy", help="produce profile-conditioned policy terms")
     policy.add_argument("provider")
+    policy.add_argument("--buyer", required=True, help="buyer address; the commitment covers it")
     policy.add_argument("--base-price-wei", type=int, default=10**15)
     policy.add_argument("--base-bond-bps", type=int, default=500)
     policy.add_argument("--service-window", type=int, default=3_600)
     policy.add_argument("--payout-delay", type=int, default=1_800)
+    policy.add_argument(
+        "--accept-by",
+        type=int,
+        required=True,
+        help=(
+            "absolute unix deadline for provider acceptance. Required rather than derived "
+            "from the clock: a commitment that moves on every run is not a commitment. "
+            "The orchestrator will supply this immediately before signing."
+        ),
+    )
     policy.add_argument("--output", type=Path)
     reconcile = sub.add_parser("reconcile-timeout", help="verify a timeout receipt and persist it")
     reconcile.add_argument("tx_hash")
@@ -93,13 +109,19 @@ def main(argv: list[str] | None = None) -> int:
                 base_service_window=args.service_window,
             )
             preimage = PolicyPreimage(
+                buyer=args.buyer,
                 provider=args.provider,
                 price=terms.price_wei,
                 bond_bps=terms.provider_bond_bps,
+                accept_by=args.accept_by,
                 service_window=terms.service_window,
                 payout_delay=args.payout_delay,
                 engine_version="wrasse/0.1.0",
-                evidence_hash=evidence_commitment,
+                buyer_evidence_hash=evidence_commitment,
+                # The provider recalls nothing about this buyer yet. Bilateral recall
+                # lands at gate 6; until then this side is honestly empty rather than
+                # borrowing the buyer's own evidence.
+                provider_evidence_hash=EMPTY_EVIDENCE_HASH,
             )
             profiles[name] = {
                 "terms": {

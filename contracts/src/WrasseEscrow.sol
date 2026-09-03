@@ -6,6 +6,9 @@ pragma solidity 0.8.30;
 contract WrasseEscrow {
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant MAX_PROVIDER_BOND_BPS = 10_000;
+    /// @notice Upper bound on every caller-supplied duration. A typo must not create a deal
+    /// that nobody can resolve for years.
+    uint64 public constant MAX_DURATION = 30 days;
 
     enum State {
         Offered,
@@ -47,16 +50,35 @@ contract WrasseEscrow {
     error PayoutNotReady();
     error TransferFailed();
     error ReentrantCall();
+    error DurationOutOfRange();
+    error ZeroBond();
 
+    /// @notice The economic terms of a deal, in the form the commitment covers.
+    /// @dev `providerBondBps` is emitted alongside the absolute `providerBond` because the
+    /// commitment folds the basis points, and integer division makes them unrecoverable
+    /// from the absolute figure alone. Without it the preimage cannot be rebuilt from logs.
     event DealCreated(
         uint256 indexed dealId,
         address indexed buyer,
         address indexed provider,
         uint256 price,
+        uint256 providerBondBps,
         uint256 providerBond,
         uint64 acceptBy,
         uint64 serviceWindow,
         uint64 payoutDelay,
+        bytes32 policyHash
+    );
+
+    /// @notice The memory half of the commitment, emitted in the same transaction as
+    /// `DealCreated`. Split from it so neither event overflows the stack.
+    /// @param buyerEvidenceHash commitment to receipts the BUYER recalled ABOUT THE PROVIDER
+    /// @param providerEvidenceHash commitment to receipts the PROVIDER recalled ABOUT THE BUYER
+    event DealCommitment(
+        uint256 indexed dealId,
+        bytes32 engineVersionHash,
+        bytes32 buyerEvidenceHash,
+        bytes32 providerEvidenceHash,
         bytes32 policyHash
     );
     event DealAccepted(uint256 indexed dealId, uint64 acceptedAt, uint64 deadline);
@@ -72,6 +94,9 @@ contract WrasseEscrow {
         _locked = 1;
     }
 
+    /// @notice Open a funded offer whose terms are committed to onchain.
+    /// @param buyerEvidenceHash commitment to receipts the BUYER recalled ABOUT THE PROVIDER
+    /// @param providerEvidenceHash commitment to receipts the PROVIDER recalled ABOUT THE BUYER
     function createDeal(
         address provider,
         uint256 providerBondBps,
@@ -79,17 +104,33 @@ contract WrasseEscrow {
         uint64 serviceWindow,
         uint64 payoutDelay,
         bytes32 engineVersionHash,
-        bytes32 evidenceHash
+        bytes32 buyerEvidenceHash,
+        bytes32 providerEvidenceHash
     ) external payable returns (uint256 dealId) {
         if (provider == address(0) || provider == msg.sender) revert InvalidProvider();
+        if (msg.value == 0 || providerBondBps > MAX_PROVIDER_BOND_BPS) revert InvalidTerms();
         if (
-            msg.value == 0 || providerBondBps > MAX_PROVIDER_BOND_BPS || acceptBy <= block.timestamp
-                || serviceWindow == 0 || payoutDelay == 0
-        ) revert InvalidTerms();
+            acceptBy <= block.timestamp || acceptBy - uint64(block.timestamp) > MAX_DURATION
+                || serviceWindow == 0 || serviceWindow > MAX_DURATION || payoutDelay == 0
+                || payoutDelay > MAX_DURATION
+        ) revert DurationOutOfRange();
 
         uint256 providerBond = (msg.value * providerBondBps) / BPS_DENOMINATOR;
+        // Integer division truncates, so a nonzero rate on a small price can round to a zero
+        // bond. Selling unbonded protection silently would be worse than refusing the deal.
+        if (providerBondBps > 0 && providerBond == 0) revert ZeroBond();
+
         bytes32 policyHash = computePolicyHash(
-            provider, msg.value, providerBondBps, serviceWindow, payoutDelay, engineVersionHash, evidenceHash
+            msg.sender,
+            provider,
+            msg.value,
+            providerBondBps,
+            acceptBy,
+            serviceWindow,
+            payoutDelay,
+            engineVersionHash,
+            buyerEvidenceHash,
+            providerEvidenceHash
         );
         dealId = nextDealId++;
         deals[dealId] = Deal({
@@ -108,22 +149,51 @@ contract WrasseEscrow {
         });
 
         emit DealCreated(
-            dealId, msg.sender, provider, msg.value, providerBond, acceptBy, serviceWindow, payoutDelay, policyHash
+            dealId,
+            msg.sender,
+            provider,
+            msg.value,
+            providerBondBps,
+            providerBond,
+            acceptBy,
+            serviceWindow,
+            payoutDelay,
+            policyHash
         );
+        emit DealCommitment(dealId, engineVersionHash, buyerEvidenceHash, providerEvidenceHash, policyHash);
     }
 
     /// @notice Reproduce the exact commitment stored when a deal is created.
+    /// @dev Every field here is a term the contract itself enforces. `buyer` and `acceptBy`
+    /// were previously enforced but uncommitted, which made the claim that the contract
+    /// commits to the terms it enforces untrue.
+    /// @param buyerEvidenceHash commitment to receipts the BUYER recalled ABOUT THE PROVIDER
+    /// @param providerEvidenceHash commitment to receipts the PROVIDER recalled ABOUT THE BUYER
     function computePolicyHash(
+        address buyer,
         address provider,
         uint256 price,
         uint256 providerBondBps,
+        uint64 acceptBy,
         uint64 serviceWindow,
         uint64 payoutDelay,
         bytes32 engineVersionHash,
-        bytes32 evidenceHash
+        bytes32 buyerEvidenceHash,
+        bytes32 providerEvidenceHash
     ) public pure returns (bytes32) {
         return keccak256(
-            abi.encode(provider, price, providerBondBps, serviceWindow, payoutDelay, engineVersionHash, evidenceHash)
+            abi.encode(
+                buyer,
+                provider,
+                price,
+                providerBondBps,
+                acceptBy,
+                serviceWindow,
+                payoutDelay,
+                engineVersionHash,
+                buyerEvidenceHash,
+                providerEvidenceHash
+            )
         );
     }
 

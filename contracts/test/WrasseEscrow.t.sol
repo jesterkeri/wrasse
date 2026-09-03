@@ -25,7 +25,14 @@ contract ReentrantBuyer {
 
     function create(address provider, uint64 acceptBy) external payable {
         dealId = escrow.createDeal{value: msg.value}(
-            provider, 2_000, acceptBy, 2 hours, 30 minutes, keccak256("wrasse/0.1.0"), keccak256("evidence")
+            provider,
+            2_000,
+            acceptBy,
+            2 hours,
+            30 minutes,
+            keccak256("wrasse/0.1.0"),
+            keccak256("buyer-evidence"),
+            keccak256("provider-evidence")
         );
     }
 
@@ -53,8 +60,19 @@ contract WrasseEscrowTest {
     uint64 private constant SERVICE_WINDOW = 2 hours;
     uint64 private constant PAYOUT_DELAY = 30 minutes;
     bytes32 private constant ENGINE_VERSION_HASH = 0x3adccb560ae1964af4cdd5471d5863cdbd37f484db6bbd2cc7a9f397d4753c81;
-    bytes32 private constant EVIDENCE_HASH = 0x2f685994ab703309ca4d0393ec2524b0368f819050ff85e7e3fb719cc5b48de3;
-    bytes32 private constant POLICY_HASH = 0x42d7fe689da394b89bd8f6bc4ffc06bcf6f4720ebfae05b132bbb756e2224358;
+    /// @dev What the buyer recalled about the provider.
+    bytes32 private constant BUYER_EVIDENCE_HASH = 0x2f685994ab703309ca4d0393ec2524b0368f819050ff85e7e3fb719cc5b48de3;
+    /// @dev keccak256(abi.encode(new bytes32[](0))). Every first deal commits this on one side.
+    bytes32 private constant EMPTY_EVIDENCE_HASH = 0x569e75fc77c1a856f6daaf9e69d8a9566ca34aa47f9133711ce065a571af0cfd;
+
+    // Canonical cross-language fixture, shared with tests/test_policy_hash.py.
+    address private constant CANON_BUYER = address(0x4444444444444444444444444444444444444444);
+    address private constant CANON_PROVIDER = address(0x3333333333333333333333333333333333333333);
+    uint64 private constant CANON_ACCEPT_BY = 1_700_000_000;
+    bytes32 private constant POLICY_HASH = 0x2feccea0356143b90ef1b559f53a0cfa28c8c52f3e47d046a5d5f68909317d2b;
+
+    /// @dev Recorded by _create so a test can recompute the commitment it produced.
+    uint64 private lastAcceptBy;
 
     function setUp() public {
         escrow = new WrasseEscrow();
@@ -160,21 +178,40 @@ contract WrasseEscrowTest {
         uint256 dealId = _create();
         (,,,,,,,,,, bytes32 storedPolicyHash,) = escrow.deals(dealId);
         bytes32 expected = escrow.computePolicyHash(
-            PROVIDER, PRICE, 2_000, SERVICE_WINDOW, PAYOUT_DELAY, ENGINE_VERSION_HASH, EVIDENCE_HASH
+            BUYER,
+            PROVIDER,
+            PRICE,
+            2_000,
+            lastAcceptBy,
+            SERVICE_WINDOW,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
         );
         _assertEq(uint256(storedPolicyHash), uint256(expected));
+    }
+
+    /// @notice The empty evidence set must hash identically in Solidity and Python.
+    /// Every first deal of a relationship commits it on at least one side, so a mismatch
+    /// here breaks bilateral deals silently rather than loudly.
+    function testEmptyEvidenceSetMatchesPythonFixture() public pure {
+        require(keccak256(abi.encode(new bytes32[](0))) == EMPTY_EVIDENCE_HASH);
     }
 
     function testCanonicalPolicyHashMatchesPythonFixture() public pure {
         bytes32 computed = keccak256(
             abi.encode(
-                address(0x3333333333333333333333333333333333333333),
+                CANON_BUYER,
+                CANON_PROVIDER,
                 uint256(1 ether),
                 uint256(2_000),
+                CANON_ACCEPT_BY,
                 uint64(7_200),
                 uint64(1_800),
                 ENGINE_VERSION_HASH,
-                EVIDENCE_HASH
+                BUYER_EVIDENCE_HASH,
+                EMPTY_EVIDENCE_HASH
             )
         );
         require(computed == POLICY_HASH);
@@ -182,27 +219,204 @@ contract WrasseEscrowTest {
 
     function testContractComputesCanonicalPolicyHash() public view {
         bytes32 computed = escrow.computePolicyHash(
-            address(0x3333333333333333333333333333333333333333),
+            CANON_BUYER,
+            CANON_PROVIDER,
             1 ether,
             2_000,
+            CANON_ACCEPT_BY,
             7_200,
             1_800,
             ENGINE_VERSION_HASH,
-            EVIDENCE_HASH
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
         );
         require(computed == POLICY_HASH);
     }
 
-    function _create() private returns (uint256) {
+    /// @notice The two evidence sides are not interchangeable. If swapping them left the
+    /// commitment unchanged, two parameters would carry no more meaning than one.
+    function testSwappingEvidenceSidesChangesCommitment() public view {
+        bytes32 asIs = escrow.computePolicyHash(
+            CANON_BUYER,
+            CANON_PROVIDER,
+            1 ether,
+            2_000,
+            CANON_ACCEPT_BY,
+            7_200,
+            1_800,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+        bytes32 swapped = escrow.computePolicyHash(
+            CANON_BUYER,
+            CANON_PROVIDER,
+            1 ether,
+            2_000,
+            CANON_ACCEPT_BY,
+            7_200,
+            1_800,
+            ENGINE_VERSION_HASH,
+            EMPTY_EVIDENCE_HASH,
+            BUYER_EVIDENCE_HASH
+        );
+        require(asIs != swapped);
+    }
+
+    /// @notice acceptBy and buyer are enforced by the contract, so both must be committed.
+    function testBuyerAndAcceptByAreCommitted() public view {
+        bytes32 base = escrow.computePolicyHash(
+            CANON_BUYER,
+            CANON_PROVIDER,
+            1 ether,
+            2_000,
+            CANON_ACCEPT_BY,
+            7_200,
+            1_800,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+        bytes32 otherBuyer = escrow.computePolicyHash(
+            address(0x5555555555555555555555555555555555555555),
+            CANON_PROVIDER,
+            1 ether,
+            2_000,
+            CANON_ACCEPT_BY,
+            7_200,
+            1_800,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+        bytes32 otherAcceptBy = escrow.computePolicyHash(
+            CANON_BUYER,
+            CANON_PROVIDER,
+            1 ether,
+            2_000,
+            CANON_ACCEPT_BY + 1,
+            7_200,
+            1_800,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+        require(base != otherBuyer);
+        require(base != otherAcceptBy);
+    }
+
+    /// @notice The log must carry basis points, not only the rounded absolute bond, or the
+    /// preimage cannot be rebuilt from the receipt.
+    function testDealCreatedCarriesBasisPoints() public {
+        uint256 dealId = _create();
+        // The stored bond is the rounded product; bps is unrecoverable from it alone.
+        (,,, uint256 storedBond,,,,,,,,) = escrow.deals(dealId);
+        _assertEq(storedBond, (PRICE * 2_000) / escrow.BPS_DENOMINATOR());
+        // Recomputing the commitment requires the bps value, which the event supplies.
+        (,,,,,,,,,, bytes32 storedPolicyHash,) = escrow.deals(dealId);
+        bytes32 rebuilt = escrow.computePolicyHash(
+            BUYER,
+            PROVIDER,
+            PRICE,
+            2_000,
+            lastAcceptBy,
+            SERVICE_WINDOW,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+        _assertEq(uint256(storedPolicyHash), uint256(rebuilt));
+    }
+
+    function testRejectsDurationsBeyondBound() public {
+        // Read the bound up front. An external call placed inside the argument list would
+        // consume the vm.expectRevert intended for createDeal.
+        uint64 maxDuration = escrow.MAX_DURATION();
+        uint64 validAcceptBy = uint64(block.timestamp + ACCEPT_WINDOW);
+
         vm.prank(BUYER);
-        return escrow.createDeal{value: PRICE}(
+        vm.expectRevert(WrasseEscrow.DurationOutOfRange.selector);
+        escrow.createDeal{value: PRICE}(
             PROVIDER,
             2_000,
+            uint64(block.timestamp) + maxDuration + 1,
+            SERVICE_WINDOW,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.DurationOutOfRange.selector);
+        escrow.createDeal{value: PRICE}(
+            PROVIDER,
+            2_000,
+            validAcceptBy,
+            maxDuration + 1,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.DurationOutOfRange.selector);
+        escrow.createDeal{value: PRICE}(
+            PROVIDER,
+            2_000,
+            validAcceptBy,
+            SERVICE_WINDOW,
+            maxDuration + 1,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+
+        // The bound itself must remain accepted, so the check is a bound and not an off-by-one.
+        vm.prank(BUYER);
+        escrow.createDeal{value: PRICE}(
+            PROVIDER,
+            2_000,
+            validAcceptBy,
+            maxDuration,
+            maxDuration,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+    }
+
+    /// @notice A nonzero bond rate that truncates to zero wei must revert rather than
+    /// silently sell unbonded protection.
+    function testNonzeroRateCannotRoundToZeroBond() public {
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.ZeroBond.selector);
+        escrow.createDeal{value: 1 wei}(
+            PROVIDER,
+            1, // 0.01%, which truncates to 0 wei on a 1 wei price
             uint64(block.timestamp + ACCEPT_WINDOW),
             SERVICE_WINDOW,
             PAYOUT_DELAY,
             ENGINE_VERSION_HASH,
-            EVIDENCE_HASH
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+    }
+
+    function _create() private returns (uint256) {
+        lastAcceptBy = uint64(block.timestamp + ACCEPT_WINDOW);
+        vm.prank(BUYER);
+        return escrow.createDeal{value: PRICE}(
+            PROVIDER,
+            2_000,
+            lastAcceptBy,
+            SERVICE_WINDOW,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
         );
     }
 
