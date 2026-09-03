@@ -24,8 +24,9 @@ contract ReentrantBuyer {
     }
 
     function create(address provider, uint64 acceptBy) external payable {
-        dealId =
-            escrow.createDeal{value: msg.value}(provider, 2_000, acceptBy, 2 hours, 30 minutes, keccak256("policy"));
+        dealId = escrow.createDeal{value: msg.value}(
+            provider, 2_000, acceptBy, 2 hours, 30 minutes, keccak256("rapport/0.1.0"), keccak256("evidence")
+        );
     }
 
     function cancel() external {
@@ -51,7 +52,9 @@ contract RapportEscrowTest {
     uint64 private constant ACCEPT_WINDOW = 1 hours;
     uint64 private constant SERVICE_WINDOW = 2 hours;
     uint64 private constant PAYOUT_DELAY = 30 minutes;
-    bytes32 private constant POLICY_HASH = keccak256("policy");
+    bytes32 private constant ENGINE_VERSION_HASH = 0x67579eefed8eb8adb46fd42d8e620a9d236f76a74680b3d84bc76acb85bd99c9;
+    bytes32 private constant EVIDENCE_HASH = 0x2f685994ab703309ca4d0393ec2524b0368f819050ff85e7e3fb719cc5b48de3;
+    bytes32 private constant POLICY_HASH = 0x37e7cc805371ef4785d992cac48ef3bcf082c19e706dbe057e009a9c41ad8484;
 
     function setUp() public {
         escrow = new RapportEscrow();
@@ -156,14 +159,13 @@ contract RapportEscrowTest {
     function testPolicyHashIsStoredExactly() public {
         uint256 dealId = _create();
         (,,,,,,,,,, bytes32 storedPolicyHash,) = escrow.deals(dealId);
-        _assertEq(uint256(storedPolicyHash), uint256(POLICY_HASH));
+        bytes32 expected = escrow.computePolicyHash(
+            PROVIDER, PRICE, 2_000, SERVICE_WINDOW, PAYOUT_DELAY, ENGINE_VERSION_HASH, EVIDENCE_HASH
+        );
+        _assertEq(uint256(storedPolicyHash), uint256(expected));
     }
 
     function testCanonicalPolicyHashMatchesPythonFixture() public pure {
-        bytes32[] memory eventIds = new bytes32[](2);
-        eventIds[0] = bytes32(uint256(0x1111111111111111111111111111111111111111111111111111111111111111));
-        eventIds[1] = bytes32(uint256(0x2222222222222222222222222222222222222222222222222222222222222222));
-        bytes32 evidenceHash = keccak256(abi.encode(eventIds));
         bytes32 computed = keccak256(
             abi.encode(
                 address(0x3333333333333333333333333333333333333333),
@@ -171,18 +173,36 @@ contract RapportEscrowTest {
                 uint256(2_000),
                 uint64(7_200),
                 uint64(1_800),
-                keccak256(bytes("rapport/0.1.0")),
-                evidenceHash
+                ENGINE_VERSION_HASH,
+                EVIDENCE_HASH
             )
         );
-        require(evidenceHash == 0x2f685994ab703309ca4d0393ec2524b0368f819050ff85e7e3fb719cc5b48de3);
-        require(computed == 0x37e7cc805371ef4785d992cac48ef3bcf082c19e706dbe057e009a9c41ad8484);
+        require(computed == POLICY_HASH);
+    }
+
+    function testContractComputesCanonicalPolicyHash() public view {
+        bytes32 computed = escrow.computePolicyHash(
+            address(0x3333333333333333333333333333333333333333),
+            1 ether,
+            2_000,
+            7_200,
+            1_800,
+            ENGINE_VERSION_HASH,
+            EVIDENCE_HASH
+        );
+        require(computed == POLICY_HASH);
     }
 
     function _create() private returns (uint256) {
         vm.prank(BUYER);
         return escrow.createDeal{value: PRICE}(
-            PROVIDER, 2_000, uint64(block.timestamp + ACCEPT_WINDOW), SERVICE_WINDOW, PAYOUT_DELAY, POLICY_HASH
+            PROVIDER,
+            2_000,
+            uint64(block.timestamp + ACCEPT_WINDOW),
+            SERVICE_WINDOW,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            EVIDENCE_HASH
         );
     }
 

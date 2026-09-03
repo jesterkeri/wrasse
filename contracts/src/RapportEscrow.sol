@@ -78,7 +78,8 @@ contract RapportEscrow {
         uint64 acceptBy,
         uint64 serviceWindow,
         uint64 payoutDelay,
-        bytes32 policyHash
+        bytes32 engineVersionHash,
+        bytes32 evidenceHash
     ) external payable returns (uint256 dealId) {
         if (provider == address(0) || provider == msg.sender) revert InvalidProvider();
         if (
@@ -87,6 +88,9 @@ contract RapportEscrow {
         ) revert InvalidTerms();
 
         uint256 providerBond = (msg.value * providerBondBps) / BPS_DENOMINATOR;
+        bytes32 policyHash = computePolicyHash(
+            provider, msg.value, providerBondBps, serviceWindow, payoutDelay, engineVersionHash, evidenceHash
+        );
         dealId = nextDealId++;
         deals[dealId] = Deal({
             buyer: msg.sender,
@@ -105,6 +109,21 @@ contract RapportEscrow {
 
         emit DealCreated(
             dealId, msg.sender, provider, msg.value, providerBond, acceptBy, serviceWindow, payoutDelay, policyHash
+        );
+    }
+
+    /// @notice Reproduce the exact commitment stored when a deal is created.
+    function computePolicyHash(
+        address provider,
+        uint256 price,
+        uint256 providerBondBps,
+        uint64 serviceWindow,
+        uint64 payoutDelay,
+        bytes32 engineVersionHash,
+        bytes32 evidenceHash
+    ) public pure returns (bytes32) {
+        return keccak256(
+            abi.encode(provider, price, providerBondBps, serviceWindow, payoutDelay, engineVersionHash, evidenceHash)
         );
     }
 
@@ -191,4 +210,3 @@ contract RapportEscrow {
         if (!success) revert TransferFailed();
     }
 }
-
