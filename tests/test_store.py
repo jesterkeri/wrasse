@@ -20,6 +20,7 @@ from sibyl_memory_client import MemoryClient
 
 from wrasse.evidence import CHAIN_EVENT_CATEGORY, ChainEvent
 from wrasse.store import (
+    IDENTITY_CATEGORY,
     INDEX_CATEGORY,
     EvidenceRejected,
     StoreError,
@@ -463,3 +464,95 @@ def test_the_marker_is_written_before_the_record(buyer_store, monkeypatch):
 
     assert seen["marker_present"] is True, "the record was written with nothing marking it"
     assert buyer_store.pending_ingestions() == []
+
+
+# --------------------------------------------------------------------------------------
+# Repair is a writer, and adoption is a decision about whose memory this is
+# --------------------------------------------------------------------------------------
+
+
+def test_repair_holds_the_same_lock_a_writer_takes(tmp_path):
+    """Repair is a read-modify-write over the entry an ingest is writing.
+
+    Unlocked, a repair that read the index before a concurrent ingest and wrote it after put
+    back its own stale copy. The id the ingest had just added was gone, the ingest had already
+    cleared its marker on the way out, and nothing was left to say the store was short: the
+    quote path then read a shorter history and could not tell. The property that stops it is
+    that no other writer can be inside the index while a repair is running.
+
+    `flock` is held per open file description, so a second `open` of the same path contends
+    exactly as another process would.
+    """
+
+    import fcntl
+
+    store = _open(tmp_path, "buyer", BUYER, "buyer.db")
+    store.ingest(_event(tx_hash="0x" + "a1" * 32))
+    name = store._index_name(PROVIDER)
+    store.memory.set_entity(INDEX_CATEGORY, name, {"event_ids": []}, status="verified")
+
+    lock_path = tmp_path / "buyer.db.lock"
+    observed = {}
+
+    def try_lock() -> bool:
+        with open(lock_path, "w") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(other, fcntl.LOCK_UN)
+            return True
+
+    original = store._add_to_index
+
+    def watch(counterparty, identifier):
+        observed["during"] = try_lock()
+        return original(counterparty, identifier)
+
+    store._add_to_index = watch
+    assert store.repair_index() == 1
+    store._add_to_index = original
+
+    assert observed["during"] is False, "a repair ran with the index open to other writers"
+    assert try_lock() is True, "the lock outlived the repair that took it"
+
+
+def test_a_store_holding_only_a_learned_dimension_is_not_empty(tmp_path):
+    """Emptiness is a property of the file, not of the categories this build happens to name.
+
+    A dimension is economically active: it is what turns a receipt into a number. Adopting a
+    store that already holds one would let a configuration line decide whose ontology sets a
+    price.
+    """
+
+    MemoryClient.local(tmp_path / "legacy.db").set_entity(
+        "behavior_dimension", "inherited",
+        {"source_event_type": "timeout_claimed_without_delivery", "severity": 0.9},
+        status="active",
+    )
+
+    with pytest.raises(StoreError, match="already holds records but names no owner"):
+        _open(tmp_path, "buyer", BUYER, "legacy.db")
+
+
+def test_an_identity_nothing_attested_is_not_an_identity(tmp_path):
+    """A `draft` row is one nothing has vouched for, and everything else rests on this one."""
+
+    store = _open(tmp_path, "buyer", BUYER, "buyer.db")
+    row = store.memory.get_entity(IDENTITY_CATEGORY, "self")
+    store.memory.set_entity(IDENTITY_CATEGORY, "self", row["body"], status="draft")
+
+    with pytest.raises(StoreError, match="not verified"):
+        _open(tmp_path, "buyer", BUYER, "buyer.db")
+
+
+def test_an_identity_carrying_fields_this_build_never_wrote_is_refused(tmp_path):
+    """Matching the fields we look at proves nothing about the ones we do not."""
+
+    store = _open(tmp_path, "buyer", BUYER, "buyer.db")
+    body = dict(store.memory.get_entity(IDENTITY_CATEGORY, "self")["body"])
+    body["also_provider"] = True
+    store.memory.set_entity(IDENTITY_CATEGORY, "self", body, status="verified")
+
+    with pytest.raises(StoreError, match="fields this build does not write"):
+        _open(tmp_path, "buyer", BUYER, "buyer.db")

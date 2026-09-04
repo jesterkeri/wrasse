@@ -454,3 +454,74 @@ def test_the_used_set_reproduces_the_same_terms_as_the_whole_history(both):
     assert (reduced.provider_bond_bps, reduced.service_window) == (
         full.provider_bond_bps, full.service_window
     )
+
+
+# --------------------------------------------------------------------------------------
+# A document agreeing with itself is not a document that came from here
+# --------------------------------------------------------------------------------------
+
+
+def test_two_receipts_that_cancel_leave_nothing_to_commit_to(both):
+    """Minimal has to mean minimal after every removal, not after the first pass.
+
+    A positive and a negative receipt that offset each other each look necessary while the
+    other is there. Dropping one makes the other redundant, and a single pass never goes back
+    to reconsider it, so the set named a receipt whose removal changed no number at all.
+    """
+
+    mild = {
+        kind: DimensionDefinition(
+            dimension_id=f"mild_{kind}",
+            source_event_type=event_type,
+            signal_direction=direction,
+            severity=0.1,
+            confidence=1.0,
+            applies_when=("deadline_sensitive",),
+        )
+        for kind, event_type, direction in (
+            ("timeout", "timeout_claimed_without_delivery", "negative"),
+            ("release", "delivered_and_released_by_buyer", "positive"),
+        )
+    }
+    events = [
+        _event("delivered_and_released_by_buyer", tx="0x" + "c1" * 32).canonical_body(),
+        _event("delivered_and_released_by_buyer", tx="0x" + "c2" * 32).canonical_body(),
+        _event("timeout_claimed_without_delivery", tx="0x" + "c3" * 32).canonical_body(),
+    ]
+
+    def quote(rows):
+        return produce_terms(
+            evidence=rows, dimensions=list(mild.values()), profile=PROFILES["urgent"],
+            base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
+            base_service_window=BASE_WINDOW,
+        )
+
+    cold, full = quote([]), quote(events)
+    assert (full.provider_bond_bps, full.service_window) == (
+        cold.provider_bond_bps, cold.service_window
+    ), "this fixture is built so the whole history changes nothing"
+    assert full.used_evidence_ids == (), (
+        "no committed number moved, so no receipt may be named as having moved one"
+    )
+
+
+def test_two_active_dimensions_for_one_outcome_stop_the_quote(both):
+    """A duplicated reading scores the same receipt twice and the document says it once.
+
+    `_score` walks the definitions, so a second active row for an outcome adds its
+    contribution again. The bond moves further for a reason the policy document cannot show,
+    because the evidence hash still names that receipt exactly once. A reader could not
+    reproduce the number from the document, which is the only thing the document is for.
+    """
+
+    from wrasse.dimensions import DimensionError
+
+    duplicate = DIMENSIONS["timeout"]
+    both["buyer"].memory.set_entity(
+        DIMENSION_CATEGORY, "a_second_reading_of_the_same_thing",
+        {**duplicate.body(), "dimension_id": "a_second_reading_of_the_same_thing"},
+        status="active",
+    )
+
+    with pytest.raises(DimensionError, match="two active dimensions describe"):
+        load_dimensions(both["buyer"].memory)

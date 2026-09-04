@@ -1233,8 +1233,29 @@ def test_a_retry_budget_bounds_the_whole_operation(monkeypatch):
         class response:  # noqa: N801
             headers = {"Retry-After": "30"}
 
-    with pytest.raises(chain.RpcUnavailable, match="gave up after"):
+    with pytest.raises(chain.RpcUnavailable, match="gave up"):
         chain._read(_Flaky(99, Slow()), describe="probe")
+
+
+def test_the_budget_counts_a_stalled_call_and_not_only_the_waiting(monkeypatch):
+    """A call that sits on a socket spends the budget without sleeping a second of it.
+
+    Counting only the backoff made the number a fiction: three attempts each stalling until
+    the provider's own twenty second timeout take a minute, and a fifteen second budget that
+    watches the sleeps sees nothing spent at all. The clock is what the caller experiences.
+    """
+
+    now = [0.0]
+    monkeypatch.setattr(chain, "_monotonic", lambda: now[0])
+    monkeypatch.setattr(chain, "_sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+
+    def stalls():
+        now[0] += 20.0  # the provider's own timeout, spent without sleeping
+        raise TimeoutError("read timed out")
+
+    with pytest.raises(chain.RpcUnavailable, match="budget left"):
+        chain._read(stalls, describe="probe")
+    assert now[0] < 25.0, "it should stop after the first stall, not attempt three of them"
 
 
 def test_a_date_form_retry_after_is_understood(monkeypatch):

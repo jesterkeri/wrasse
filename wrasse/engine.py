@@ -202,18 +202,35 @@ def _minimal_causal_set(events, candidates: set[str], committed) -> tuple[str, .
     committed terms stay the same. What remains has the property the name promises, because
     removing any one of them changes at least one committed output. Where several receipts only
     matter together, against a cap say, the set keeps as many as are needed and no more.
+
+    **Dropping is repeated to a fixed point.** One pass is not enough. Removing a later
+    receipt can make an earlier one that was already kept redundant, and a single pass never
+    reconsiders it, so the set could still name a receipt whose removal changes nothing. Two
+    offsetting receipts are the ordinary case: each looks necessary while the other is
+    present, and once one goes the other stops mattering. The loop runs until a whole pass
+    removes nothing, which is when every survivor is individually load-bearing.
+
+    Minimal here means no single member can be removed. It does not mean smallest: where
+    members are jointly necessary the result can depend on the order they are tried, so the
+    order is fixed and sorted rather than arbitrary, and the same evidence always produces the
+    same set and therefore the same commitment.
     """
 
     baseline = committed(events)
-    keep = list(sorted(candidates))
-    for identifier in sorted(candidates):
-        trial = [item for item in keep if item != identifier]
-        without = [
-            event for event in events
-            if canonical_event_id(str(event["event_id"])) in set(trial)
-        ]
-        if committed(without) == baseline:
-            keep = trial
+    keep = sorted(candidates)
+    changed = True
+    while changed:
+        changed = False
+        for identifier in list(keep):
+            trial = [item for item in keep if item != identifier]
+            retained = set(trial)
+            without = [
+                event for event in events
+                if canonical_event_id(str(event["event_id"])) in retained
+            ]
+            if committed(without) == baseline:
+                keep = trial
+                changed = True
     return tuple(keep)
 
 

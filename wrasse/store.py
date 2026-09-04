@@ -115,6 +115,19 @@ def _address(value: str) -> str:
     return Web3.to_checksum_address(value)
 
 
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """The same exclusive lock a store holds, available before a store object exists."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 class WrasseStore:
     """One side's memory, with its own identity and its own index."""
 
@@ -122,27 +135,36 @@ class WrasseStore:
         self._memory = memory
         self.identity = identity
         self._lock_path = lock
+        self._held = 0
 
     @contextmanager
     def _exclusive(self) -> Iterator[None]:
-        """Serialise index updates across processes.
+        """Serialise every read-modify-write on this store, across processes.
 
         The index entry is a read-modify-write and the SDK offers no transaction, so two
-        concurrent ingests would otherwise lose one another's ids. The transaction ledger gets
+        concurrent writers would otherwise lose one another's ids. The transaction ledger gets
         this from SQLite's own write lock; here there is nothing to borrow, so it takes an OS
         lock. POSIX only, which is where this runs.
+
+        Re-entrant within a process, because `flock` on a second descriptor for the same file
+        blocks against the first. Without the counter, a repair that finished a pending ingest
+        would deadlock against itself, and the fix for that would be to leave one of the two
+        unlocked, which is the defect this exists to remove.
         """
 
-        if self._lock_path is None:
-            yield
-            return
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._lock_path, "w") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+        if self._lock_path is None or self._held:
+            self._held += 1
             try:
                 yield
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                self._held -= 1
+            return
+        with _file_lock(self._lock_path):
+            self._held += 1
+            try:
+                yield
+            finally:
+                self._held -= 1
 
     # -- opening --------------------------------------------------------------------------
 
@@ -174,34 +196,58 @@ class WrasseStore:
 
         try:
             memory = MemoryClient.local(path)
-            try:
-                found = memory.get_entity(IDENTITY_CATEGORY, "self")["body"]
-            except NotFoundError:
-                # Only a demonstrably empty store may be adopted. A database that already
-                # holds records but names no owner is a legacy or half-migrated file, and
-                # letting configuration alone assign it a role is precisely the swap the
-                # identity record exists to stop. This needs no compromise to happen; it
-                # needs one careless path.
-                for category in (CHAIN_EVENT_CATEGORY, INDEX_CATEGORY, PENDING_CATEGORY):
-                    if memory.list_entities(category, limit=1):
+            # Adoption is a write, and two processes opening one blank file for different
+            # roles would otherwise both see no identity and each return a live object
+            # carrying the role it asked for. Under the lock, the second one reads the first
+            # one's record and is refused by it.
+            with _file_lock(lock):
+                try:
+                    found = memory.get_entity(IDENTITY_CATEGORY, "self")
+                except NotFoundError:
+                    # Only a demonstrably empty store may be adopted, and emptiness is a
+                    # property of the whole file rather than of the categories this build
+                    # happens to name. A store holding a learned dimension and nothing else
+                    # is economically active: adopting it would let a configuration line
+                    # decide whose ontology sets a price. `list_entities` with no category
+                    # sees every row, which is what makes the check exhaustive rather than a
+                    # list that goes stale the next time a category is added.
+                    if memory.list_entities(limit=1):
                         raise StoreError(
-                            f"{path} already holds {category} records but names no owner. "
-                            "Refusing to adopt it: delete it and reconcile again, rather than "
-                            "letting a configuration line decide whose memory this is."
+                            f"{path} already holds records but names no owner. Refusing to "
+                            "adopt it: delete it and reconcile again, rather than letting a "
+                            "configuration line decide whose memory this is."
                         ) from None
-                memory.set_entity(
-                    IDENTITY_CATEGORY, "self", {**wanted.body(), "created_at": _now()},
-                    status="verified",
-                )
-                return cls(memory, wanted, lock)
+                    memory.set_entity(
+                        IDENTITY_CATEGORY, "self", {**wanted.body(), "created_at": _now()},
+                        status="verified",
+                    )
+                    return cls(memory, wanted, lock)
         except SibylMemoryError as error:
             raise MemoryRequired(f"cannot open the {role} memory at {path}") from error
 
+        # The identity is the thing every other guarantee rests on, so it is checked as an
+        # entity and not only as a body. A row left `draft` is a row nothing has attested,
+        # and accepting a subset of matching fields would let an unknown field ride along.
+        if found.get("status") != "verified":
+            raise StoreError(
+                f"{path} carries an identity that is {found.get('status')!r}, not verified. "
+                "An unattested identity is not one to trust a wallet to."
+            )
+        body = found.get("body")
+        if not isinstance(body, dict):
+            raise StoreError(f"{path} carries an identity with no readable body")
+        expected_fields = set(wanted.body()) | {"created_at"}
+        unknown = sorted(set(body) - expected_fields)
+        if unknown:
+            raise StoreError(
+                f"{path} carries an identity with fields this build does not write: "
+                f"{', '.join(unknown)}"
+            )
         for field, expected in wanted.body().items():
-            if found.get(field) != expected:
+            if body.get(field) != expected:
                 raise StoreError(
-                    f"{path} was created as {found.get('role')} {found.get('owner_address')} "
-                    f"on chain {found.get('chain_id')}; this run wants {role} "
+                    f"{path} was created as {body.get('role')} {body.get('owner_address')} "
+                    f"on chain {body.get('chain_id')}; this run wants {role} "
                     f"{wanted.owner_address} on chain {chain_id}. Its {field} disagrees. "
                     "A store cannot change whose memory it is."
                 )
@@ -223,26 +269,37 @@ class WrasseStore:
         claim actually being made.
         """
 
-        try:
-            existing = self._memory.get_entity(PERSONA_CATEGORY, "self")["body"]
-        except NotFoundError:
-            if self._memory.list_entities(CHAIN_EVENT_CATEGORY, limit=1):
-                raise StoreError(
-                    "this store already holds evidence, so a persona committed now could have "
-                    "been chosen with that evidence in view"
-                ) from None
-            self._memory.set_entity(
-                PERSONA_CATEGORY, "self",
-                {"name": name, "sha256": digest, "created_at": _now()},
-                status="verified",
-            )
-            return
+        # Under the same lock the evidence is written with. Checked outside it, a
+        # reconciliation landing between the check and the write would leave a record that
+        # claims precedence it does not have, which is the entire content of the claim.
+        with self._exclusive():
+            try:
+                found = self._memory.get_entity(PERSONA_CATEGORY, "self")
+            except NotFoundError:
+                if self._memory.list_entities(CHAIN_EVENT_CATEGORY, limit=1):
+                    raise StoreError(
+                        "this store already holds evidence, so a persona committed now could "
+                        "have been chosen with that evidence in view"
+                    ) from None
+                self._memory.set_entity(
+                    PERSONA_CATEGORY, "self",
+                    {"name": name, "sha256": digest, "created_at": _now()},
+                    status="verified",
+                )
+                return
 
-        if existing.get("sha256") != digest:
-            raise StoreError(
-                f"the persona changed after it was committed: {existing.get('sha256')} became "
-                f"{digest}"
-            )
+            if found.get("status") != "verified":
+                raise StoreError(
+                    f"the persona commitment is {found.get('status')!r}, not verified"
+                )
+            existing = found.get("body")
+            if not isinstance(existing, dict) or sorted(existing) != ["created_at", "name", "sha256"]:
+                raise StoreError("the persona commitment is not the shape this build writes")
+            if existing.get("sha256") != digest:
+                raise StoreError(
+                    f"the persona changed after it was committed: {existing.get('sha256')} "
+                    f"became {digest}"
+                )
 
     def persona_commitment(self) -> dict[str, Any] | None:
         try:
@@ -319,12 +376,13 @@ class WrasseStore:
         """
 
         finished = []
-        for identifier in self.pending_ingestions():
-            event = events.get(identifier)
-            if event is None:
-                continue
-            self.ingest(event)
-            finished.append(identifier)
+        with self._exclusive():
+            for identifier in self.pending_ingestions():
+                event = events.get(identifier)
+                if event is None:
+                    continue
+                self.ingest(event)
+                finished.append(identifier)
         return finished
 
     def _add_to_index(self, counterparty: str, identifier: str) -> None:
@@ -357,33 +415,41 @@ class WrasseStore:
         whole reason the entities stay canonical and the index stays a projection.
         """
 
-        rows = self._memory.list_entities(CHAIN_EVENT_CATEGORY, limit=ENUMERATION_LIMIT)
-        if len(rows) >= ENUMERATION_LIMIT:
-            # There is no cursor, so a full page means there may be records this cannot see,
-            # and a repair that silently stops short is worse than one that refuses.
-            raise StoreError(
-                f"this store holds at least {ENUMERATION_LIMIT} records and the SDK offers no "
-                "way to page past that, so a full repair cannot be proved. Refusing rather "
-                "than reporting a partial one as complete."
-            )
+        # Under the same lock as `ingest`, because this is a read-modify-write over the very
+        # entry ingest is writing. Unlocked, a repair that read the index before a concurrent
+        # ingest and wrote it after would put back its own stale copy, dropping the id the
+        # ingest had just added and leaving no marker behind to say so. That is the round-one
+        # defect arriving through the door built to fix it.
+        with self._exclusive():
+            rows = self._memory.list_entities(CHAIN_EVENT_CATEGORY, limit=ENUMERATION_LIMIT)
+            if len(rows) >= ENUMERATION_LIMIT:
+                # There is no cursor, so a full page means there may be records this cannot
+                # see, and a repair that silently stops short is worse than one that refuses.
+                raise StoreError(
+                    f"this store holds at least {ENUMERATION_LIMIT} records and the SDK offers "
+                    "no way to page past that, so a full repair cannot be proved. Refusing "
+                    "rather than reporting a partial one as complete."
+                )
 
-        repaired = 0
-        for row in rows:
-            body = row.get("body")
-            if not isinstance(body, dict):
-                continue
-            counterparty = self.counterparty_of(body)
-            if counterparty is None:
-                continue
-            name = self._index_name(counterparty)
-            try:
-                indexed = set(self._memory.get_entity(INDEX_CATEGORY, name)["body"]["event_ids"])
-            except NotFoundError:
-                indexed = set()
-            if body["event_id"] not in indexed:
-                self._add_to_index(counterparty, body["event_id"])
-                repaired += 1
-        return repaired
+            repaired = 0
+            for row in rows:
+                body = row.get("body")
+                if not isinstance(body, dict):
+                    continue
+                counterparty = self.counterparty_of(body)
+                if counterparty is None:
+                    continue
+                name = self._index_name(counterparty)
+                try:
+                    indexed = set(
+                        self._memory.get_entity(INDEX_CATEGORY, name)["body"]["event_ids"]
+                    )
+                except NotFoundError:
+                    indexed = set()
+                if body["event_id"] not in indexed:
+                    self._add_to_index(counterparty, body["event_id"])
+                    repaired += 1
+            return repaired
 
     # -- reading, on the path that sets prices -----------------------------------------------
 
@@ -397,6 +463,13 @@ class WrasseStore:
 
         counterparty = _address(counterparty)
 
+        # One coherent snapshot. The marker check, the index read and every record read
+        # happen under the same lock a writer takes, so a recall cannot see the half of an
+        # ingest that suits it: no marker yet, and no index entry either.
+        with self._exclusive():
+            return self._recall_locked(counterparty)
+
+    def _recall_locked(self, counterparty: str) -> Recall:
         outstanding = self.pending_ingestions()
         if outstanding:
             raise IngestionIncomplete(

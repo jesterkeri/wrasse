@@ -34,23 +34,30 @@ found.
 observation that ages. The last-moment recheck immediately before a resend is in place, which
 is the case that can lose money; the per-row staleness only affects reporting.
 
-**`policy.json` can still misdescribe itself.** The economic terms a person reads are bound to
-the terms the signature commits to, and the calldata is built from the validated preimage, so
-no substitution changes what is funded. But the executability label, the evidence bodies and
-the profiles that were not selected are shape-checked rather than semantically validated. A
-tampered local file could therefore show a false *reason* beside a genuine transaction. The
-threat model here is an attacker who already has write access to the machine, which the trust
-model places out of scope. It still weakens the explainable-receipt claim, and the claim
-should be stated as covering the committed terms rather than the whole document.
+**~~`policy.json` can still misdescribe itself.~~ CORRECTED, and it was worse than written.**
+This entry claimed that no substitution changes what is funded, because the displayed terms
+are bound to the terms the signature commits to. That was wrong, and the error was in the
+reasoning rather than in the code: the binding is between fields of one document, and the
+commitment those fields produce is a public unkeyed hash of them. An editor who changes a
+price everywhere it appears and recomputes the hash gets a file in which nothing disagrees
+with anything, and the wallet signs the new number. Consistency is not provenance, and a
+validator that only reads the document cannot tell the difference.
+
+Fixed in the Gates 5-6 round two fold: `create-deal` derives both sides' terms again from the
+two identified memories and refuses any document it cannot reproduce, bodies of recalled
+evidence included. The baselines it derives against are its own arguments, not fields of the
+document, because a baseline read out of the file would be one more number the editor gets to
+choose. The document is now a display artifact; the memories are the authority.
 
 **The ledger schema has no migration.** `CREATE TABLE IF NOT EXISTS` leaves an older database
 with a `CHECK` that predates `unbroadcast` and a non-partial nonce index. No such database
 exists, because nothing has been deployed. Before there is a live ledger this needs a version
 stamp and an explicit migration, or a refusal with a reset instruction.
 
-**`Retry-After` is honoured without an upper bound.** A hostile or misconfigured endpoint
-returning a very large value would stall a command, and the retry budget bounds attempts
-rather than total time. The RPC endpoint is ours and is configured locally.
+**~~`Retry-After` is honoured without an upper bound.~~ FIXED.** Capped at
+`READ_MAX_DELAY_SECONDS`, and the whole operation now runs against a monotonic deadline rather
+than a sum of the sleeps, so a call that stalls on a socket spends the budget it actually
+spends.
 
 ## Not deferred, and not negotiable
 
@@ -94,3 +101,48 @@ invented description of a receipt. Funds still follow the committed terms, so th
 misdirect money; it can misdescribe a reason. Gate 7 rebuilds this document for the negotiation
 receipt and folds body verification then. **Until it does, schema 2 should be described as
 validating the terms rather than the whole explanation.**
+
+
+## Gates 5 and 6, round two
+
+Two CRITICAL, four MAJOR, two MINOR. All eight fixed, and the deferral above was retracted
+rather than restated.
+
+**A document that agrees with itself is not a document that came from here.** The second
+CRITICAL is the one recorded above: internal consistency was mistaken for origin. A
+consistently edited `policy.json` authorised a ninefold price. `create-deal` now rebuilds the
+quote from the two memories and refuses anything it cannot reproduce.
+
+**Repair was a writer without a lock.** The first CRITICAL had two halves. `repair_index`
+performed an unlocked read-modify-write over the entry `ingest` writes, so a repair that read
+before a concurrent ingest and wrote after put back its own stale copy, dropping an id while
+the ingest had already cleared its marker. And the bilateral agreement check compared the two
+indexes *before* recalling from them, which is a different question from what the terms were
+computed from: an ingest finishing in between left the two sides pricing on different
+histories. Repair now holds the writer's lock, recall takes a coherent snapshot, and the
+comparison is over what each side actually recalled.
+
+**The minimal causal set was minimal after one pass, not at a fixed point.** Removing a later
+receipt can make an earlier retained one redundant, and a single pass never reconsidered it,
+so two offsetting receipts left one named as having moved a number it did not move. Deletion
+now runs to a fixed point in a fixed order, so the same evidence always produces the same set.
+
+**Adoption checked three categories, and emptiness is a property of the file.** A store
+holding only a learned dimension is economically active, and it could be adopted as either
+side by configuration alone. The check is now an uncategorised enumeration, the identity row
+must be `verified` and exactly the shape this build writes, and initialisation happens under
+the store lock.
+
+**Two active dimensions for one outcome scored the same receipt twice** while the evidence
+hash named it once, so a bond could move for a reason the document could not show. Loading now
+refuses a duplicated or truncated ontology, and learning is serialised.
+
+**A confirmation belongs to a fork, not to a transaction.** `confirmed_success` is terminal, so
+it survived a reorg that re-included the transaction in a block nothing had waited on.
+Reconciliation now requires the live receipt to be in the block the ledger confirmed, and that
+block to still be canonical. The reconciler tests had made this vacuous by giving their fake
+row no block metadata at all; they now carry it.
+
+**The persona precedence check ran outside the lock its claim depends on**, so a receipt
+landing between the check and the write would leave a record claiming a precedence it did not
+have. Now under the same lock, with the existing entity's status and shape validated.

@@ -9,6 +9,7 @@ import sys
 import secrets
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -20,6 +21,7 @@ from . import chain, escrow
 from .chain_time import ChainObservation, observe_chain_time, past_lag, require_recent
 from .dimensions import (
     DIMENSION_CATEGORY,
+    ENUMERATION_LIMIT as DIMENSION_ENUMERATION_LIMIT,
     DimensionDefinition,
     create_dimension,
     load_dimensions,
@@ -206,8 +208,120 @@ def _provider_persona(store: WrasseStore) -> ProviderPersona:
     return persona
 
 
+def _baseline(name: str, fallback: int) -> int:
+    """A quoting baseline, from the environment so both commands read the same one.
+
+    `policy` writes these numbers into a document and `create-deal` derives them again to
+    check that document. They therefore have to come from somewhere outside the document,
+    which is the whole point, and from one place rather than two, which is what keeps an
+    ordinary run from needing four flags twice.
+    """
+
+    raw = os.getenv(name)
+    if raw is None:
+        return fallback
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"{name}={raw!r} is not an integer") from error
+
+
 def _same_address(left: str, right: str) -> bool:
     return Web3.to_checksum_address(left) == Web3.to_checksum_address(right)
+
+
+@dataclass(frozen=True)
+class BilateralQuote:
+    """What the two memories say, and what each side's engine makes of it."""
+
+    recall: dict[str, Any]
+    persona: ProviderPersona
+    provider_terms: Any
+    buyer_terms: dict[str, Any]
+
+
+def _bilateral_quote(
+    stores: dict[str, WrasseStore],
+    *,
+    buyer: str,
+    provider: str,
+    base_price_wei: int,
+    base_bond_bps: int,
+    base_service_window: int,
+    base_payout_delay: int,
+) -> BilateralQuote:
+    """Derive both sides' opening terms from the two identified memories.
+
+    The one place the economics are produced. `policy` writes the result into a document and
+    `create-deal` runs it again to check the document it was handed came from here, so the two
+    must be the same computation rather than two that happen to agree today.
+    """
+
+    persona = _provider_persona(stores["provider"])
+
+    # Each side recalls the other. Both stores hold the same receipts; what differs is who
+    # each one is reading them about, and what it concludes.
+    recall = {
+        "buyer": stores["buyer"].recall(provider),
+        "provider": stores["provider"].recall(buyer),
+    }
+
+    # Both sides receive every receipt, so they must agree on which ones exist. A disagreement
+    # means a delivery landed in one memory and not the other, and quoting across that gap
+    # would price one side on a history the other cannot see.
+    #
+    # Compared after recall rather than before it. An earlier comparison of the two indexes is
+    # a different question from what the terms were actually computed from: an ingest
+    # finishing in between would leave two equal indexes, then one side priced on the new
+    # receipt and the other on the state before it. This compares what was used.
+    held = {
+        side: {str(row["event_id"]) for row in recalled.evidence}
+        for side, recalled in recall.items()
+    }
+    if held["buyer"] != held["provider"]:
+        only_buyer = sorted(held["buyer"] - held["provider"])
+        only_provider = sorted(held["provider"] - held["buyer"])
+        raise RuntimeError(
+            "the two memories disagree about what happened between these parties. "
+            f"Only the buyer holds {only_buyer or 'nothing extra'}; only the provider holds "
+            f"{only_provider or 'nothing extra'}. Replay the missing receipts before quoting "
+            "rather than pricing across the gap."
+        )
+
+    # Each side reads its own ontology. They tend to agree, because both were shown the same
+    # public receipts, and that is different from sharing one database. A provider reading the
+    # buyer's dimensions would not be an independently held memory.
+    dimensions = {side: load_dimensions(stores[side].memory) for side in recall}
+    for side, recalled in recall.items():
+        missing = sorted({
+            event["event_type"]
+            for event in recalled.evidence
+            if not any(d.source_event_type == event["event_type"] for d in dimensions[side])
+        })
+        if missing:
+            raise RuntimeError(
+                f"the {side} holds verified events with no dimension yet: {missing}"
+            )
+
+    provider_terms = produce_provider_terms(
+        evidence=recall["provider"].evidence,
+        dimensions=dimensions["provider"],
+        persona=persona,
+        base_price_wei=base_price_wei,
+        base_payout_delay=base_payout_delay,
+    )
+    buyer_terms = {
+        name: produce_terms(
+            evidence=recall["buyer"].evidence,
+            dimensions=dimensions["buyer"],
+            profile=profile,
+            base_price_wei=base_price_wei,
+            base_bond_bps=base_bond_bps,
+            base_service_window=base_service_window,
+        )
+        for name, profile in PROFILES.items()
+    }
+    return BilateralQuote(recall, persona, provider_terms, buyer_terms)
 
 
 def _memory() -> MemoryClient:
@@ -236,15 +350,15 @@ def build_parser() -> argparse.ArgumentParser:
     policy.add_argument(
         "--base-price-wei",
         type=int,
-        default=10**14,
+        default=_baseline("WRASSE_BASE_PRICE_WEI", 10**14),
         help=(
             "starting price in wei before profile adjustment. Defaults to 0.0001 ETH, sized "
             "so a faucet-funded testnet wallet can run the whole loop several times over."
         ),
     )
-    policy.add_argument("--base-bond-bps", type=int, default=500)
-    policy.add_argument("--service-window", type=int, default=3_600)
-    policy.add_argument("--payout-delay", type=int, default=1_800)
+    policy.add_argument("--base-bond-bps", type=int, default=_baseline("WRASSE_BASE_BOND_BPS", 500))
+    policy.add_argument("--service-window", type=int, default=_baseline("WRASSE_SERVICE_WINDOW", 3_600))
+    policy.add_argument("--payout-delay", type=int, default=_baseline("WRASSE_PAYOUT_DELAY", 1_800))
     policy.add_argument(
         "--accept-by",
         type=int,
@@ -299,6 +413,14 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--profile", required=True, help="chosen explicitly, never inferred")
     create.add_argument("--accept-window", type=int, default=3_600)
     create.add_argument("--inclusion-margin", type=int, default=DEFAULT_INCLUSION_MARGIN_SECONDS)
+    # The same baselines `policy` quoted from. They are arguments rather than document fields
+    # on purpose: the document is the thing being checked, so a baseline read out of it would
+    # let an editor pick the answer the check compares against. Pass whatever was passed to
+    # `policy`; the defaults match, so an ordinary run needs neither.
+    create.add_argument("--base-price-wei", type=int, default=_baseline("WRASSE_BASE_PRICE_WEI", 10**14))
+    create.add_argument("--base-bond-bps", type=int, default=_baseline("WRASSE_BASE_BOND_BPS", 500))
+    create.add_argument("--service-window", type=int, default=_baseline("WRASSE_SERVICE_WINDOW", 3_600))
+    create.add_argument("--payout-delay", type=int, default=_baseline("WRASSE_PAYOUT_DELAY", 1_800))
 
     status = sub.add_parser("tx-status", help="read-only view of the transaction ledger")
     status.add_argument("--intent", help="limit to one intent id")
@@ -530,6 +652,59 @@ def _require_deployment_identity(web3: Web3, address: str, record: dict) -> None
         )
 
 
+def _require_document_came_from_memory(
+    policy: ValidatedPolicy, *, buyer: str, provider: str, args
+) -> None:
+    """Rebuild the quote from the stores and refuse a document that disagrees with it.
+
+    This is what makes `policy.json` safe to sign against. Without it the file is trusted for
+    the one thing it cannot be trusted for: where its numbers came from.
+    """
+
+    stores = _open_stores(buyer=buyer, provider=provider)
+    quote = _bilateral_quote(
+        stores, buyer=buyer, provider=provider,
+        base_price_wei=args.base_price_wei, base_bond_bps=args.base_bond_bps,
+        base_service_window=args.service_window, base_payout_delay=args.payout_delay,
+    )
+    terms = quote.buyer_terms.get(policy.profile)
+    if terms is None:
+        raise RuntimeError(f"{policy.profile!r} is not a profile this engine produces")
+
+    for field, signed, derived in (
+        ("price_wei", policy.price_wei, quote.provider_terms.price_wei),
+        ("payout_delay", policy.payout_delay, quote.provider_terms.payout_delay),
+        ("provider_bond_bps", policy.bond_bps, terms.provider_bond_bps),
+        ("service_window", policy.service_window, terms.service_window),
+        ("buyer_evidence_hash", policy.buyer_evidence_hash,
+         evidence_hash(terms.used_evidence_ids)),
+        ("provider_evidence_hash", policy.provider_evidence_hash,
+         evidence_hash(quote.provider_terms.used_evidence_ids)),
+    ):
+        if signed != derived:
+            raise RuntimeError(
+                f"{args.policy} commits {field}={signed!r}, but quoting profile "
+                f"{policy.profile!r} from these two memories right now gives {derived!r}. "
+                "Refusing to sign terms this build cannot show a reason for. Either the "
+                "document was edited, or a receipt has been reconciled since it was written, "
+                "or the baselines differ from the ones it was produced with: re-run `policy` "
+                "with the same arguments and use the document it writes."
+            )
+
+    # And the half a person reads. The terms above are what the money follows; these are the
+    # receipts the document offers as the reason for them, and a document showing an invented
+    # account of a real receipt id is still a false explanation of a true transaction.
+    for side, recalled in policy.recalled_evidence.items():
+        held = tuple(quote.recall[side].evidence)
+        if list(recalled) != list(held):
+            raise RuntimeError(
+                f"{args.policy} describes {len(recalled)} receipt(s) on the {side} side that "
+                f"the {side} memory does not describe the same way. The signature would still "
+                "fund the committed terms, but the reason shown beside them would not be the "
+                "one this build holds."
+            )
+
+
 def _fee_fields(web3: Web3) -> tuple[int, int]:
     """A priority fee the chain will accept, and a ceiling that survives a fee rise."""
 
@@ -576,6 +751,18 @@ def _create_deal(args) -> int:
                     "or sent. Run tx-resolve to find out what became of it.",
         }, indent=2, sort_keys=True))
         return 0
+
+    # The document is a display artifact, not an authority. Everything in it agrees with
+    # itself by construction: the displayed terms match the preimage, the preimage hashes to
+    # the quoted hash, and that hash is public and unkeyed. An editor who changes the price in
+    # all four places and recomputes the hash produces a document that passes every internal
+    # check and funds a number no memory ever produced. Consistency is not provenance.
+    #
+    # So the economics are derived again here, from the two identified stores, and the
+    # document is only accepted if this machine reaches the same numbers. The baselines are
+    # this command's own arguments rather than fields of the document, because a baseline read
+    # out of the file would be one more number the editor gets to choose.
+    _require_document_came_from_memory(policy, buyer=buyer, provider=provider, args=args)
 
     _require_deployment_identity(web3, address, _deployment_record())
 
@@ -1181,19 +1368,26 @@ def main(argv: list[str] | None = None) -> int:
         # Read the raw rows, not `load_dimensions`. The validator refuses a definition that
         # cannot be trusted, which is right for pricing and wrong here: a bad reading has to be
         # retirable, and going through the validator would make it permanent.
+        #
+        # Under each store's own lock for the whole list-decide-write sequence. Two learners
+        # running at once would both see no definition, both call the model, and leave two
+        # active rows for one outcome. `load_dimensions` refuses to price against that, so the
+        # cost of not locking is not a wrong price; it is a store that has to be repaired
+        # before it can quote at all.
         existing = {}
         for side, store in stores.items():
-            raw = next(
-                (row for row in store.memory.list_entities(DIMENSION_CATEGORY, status="active",
-                                                           limit=100)
-                 if row["body"].get("source_event_type") == event["event_type"]),
-                None,
-            )
-            if raw is not None and args.relearn:
-                store.memory.set_entity(
-                    DIMENSION_CATEGORY, raw["name"], raw["body"], status="retired"
+            with store._exclusive():
+                raw = next(
+                    (row for row in store.memory.list_entities(
+                        DIMENSION_CATEGORY, status="active", limit=DIMENSION_ENUMERATION_LIMIT)
+                     if row["body"].get("source_event_type") == event["event_type"]),
+                    None,
                 )
-                raw = None
+                if raw is not None and args.relearn:
+                    store.memory.set_entity(
+                        DIMENSION_CATEGORY, raw["name"], raw["body"], status="retired"
+                    )
+                    raw = None
             existing[side] = raw
 
         # A disagreement between the two stores is not something to resolve by picking one.
@@ -1226,10 +1420,11 @@ def main(argv: list[str] | None = None) -> int:
         learned = {}
         for side, store in stores.items():
             if existing[side] is None:
-                store.memory.set_entity(
-                    DIMENSION_CATEGORY, definition.dimension_id, definition.body(),
-                    status="active",
-                )
+                with store._exclusive():
+                    store.memory.set_entity(
+                        DIMENSION_CATEGORY, definition.dimension_id, definition.body(),
+                        status="active",
+                    )
             learned[side] = existing[side] is None
 
         print(json.dumps({
@@ -1251,68 +1446,22 @@ def main(argv: list[str] | None = None) -> int:
         provider = Web3.to_checksum_address(args.provider)
 
         stores = _open_stores(buyer=buyer, provider=provider)
-        persona = _provider_persona(stores["provider"])
-
-        # Both sides receive every receipt, so they must agree on which ones exist. A
-        # disagreement means a delivery landed in one memory and not the other, and quoting
-        # across that gap would price one side on a history the other cannot see.
-        indexed = {
-            "buyer": stores["buyer"].indexed_event_ids(provider),
-            "provider": stores["provider"].indexed_event_ids(buyer),
-        }
-        if set(indexed["buyer"]) != set(indexed["provider"]):
-            only_buyer = sorted(set(indexed["buyer"]) - set(indexed["provider"]))
-            only_provider = sorted(set(indexed["provider"]) - set(indexed["buyer"]))
-            raise RuntimeError(
-                "the two memories disagree about what happened between these parties. "
-                f"Only the buyer holds {only_buyer or 'nothing extra'}; only the provider "
-                f"holds {only_provider or 'nothing extra'}. Replay the missing receipts "
-                "before quoting rather than pricing across the gap."
-            )
-
-        # Each side recalls the other. Both stores hold the same receipts; what differs is who
-        # each one is reading them about, and what it concludes.
-        recall = {
-            "buyer": stores["buyer"].recall(provider),
-            "provider": stores["provider"].recall(buyer),
-        }
-        # Each side reads its own ontology. They tend to agree, because both were shown the
-        # same public receipts, and that is different from sharing one database. A provider
-        # reading the buyer's dimensions would not be an independently held memory.
-        dimensions = {side: load_dimensions(stores[side].memory) for side in recall}
-        for side, recalled in recall.items():
-            missing = sorted({
-                event["event_type"]
-                for event in recalled.evidence
-                if not any(d.source_event_type == event["event_type"] for d in dimensions[side])
-            })
-            if missing:
-                raise RuntimeError(
-                    f"the {side} holds verified events with no dimension yet: {missing}"
-                )
+        quote = _bilateral_quote(
+            stores, buyer=buyer, provider=provider,
+            base_price_wei=args.base_price_wei, base_bond_bps=args.base_bond_bps,
+            base_service_window=args.service_window, base_payout_delay=args.payout_delay,
+        )
+        persona, recall = quote.persona, quote.recall
 
         basis = _resolve_time_basis(args)
         reference_timestamp, accept_by, observation = basis.reference, basis.accept_by, basis.observation
 
-        provider_terms = produce_provider_terms(
-            evidence=recall["provider"].evidence,
-            dimensions=dimensions["provider"],
-            persona=persona,
-            base_price_wei=args.base_price_wei,
-            base_payout_delay=args.payout_delay,
-        )
+        provider_terms = quote.provider_terms
         provider_commitment = evidence_hash(provider_terms.used_evidence_ids)
 
         profiles = {}
-        for name, profile in PROFILES.items():
-            terms = produce_terms(
-                evidence=recall["buyer"].evidence,
-                dimensions=dimensions["buyer"],
-                profile=profile,
-                base_price_wei=args.base_price_wei,
-                base_bond_bps=args.base_bond_bps,
-                base_service_window=args.service_window,
-            )
+        for name in PROFILES:
+            terms = quote.buyer_terms[name]
             # The bilateral moment. Bond and window come from what the buyer remembers; price
             # and payout delay from what the provider remembers. Negotiating between the two
             # is gate 7; here each side simply opens where its own memory puts it.

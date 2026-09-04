@@ -558,7 +558,13 @@ def _open_deal(both_roles, capsys, *, service_window=600, payout_delay=60) -> in
         "--output", str(output),
     ]) == 0
     capsys.readouterr()
-    assert main(["create-deal", "--policy", str(output), "--profile", "urgent"]) == 0
+    # The same baselines the quote was produced with. `create-deal` derives the terms again
+    # from the two memories and refuses a document it cannot reproduce, so a baseline it was
+    # not told about looks exactly like an edited price.
+    assert main([
+        "create-deal", "--policy", str(output), "--profile", "urgent",
+        "--service-window", str(service_window), "--payout-delay", str(payout_delay),
+    ]) == 0
     created = json.loads(capsys.readouterr().out)
     both_roles["web3"].eth.wait_for_transaction_receipt(created["tx_hash"])
     assert main(["tx-resolve"]) == 0
@@ -717,4 +723,143 @@ def test_a_quote_refuses_when_the_two_memories_disagree(both_roles, capsys):
             "policy", os.environ["WRASSE_PROVIDER_A_ADDRESS"],
             "--buyer", both_roles["buyer"].address, "--accept-window", "600",
             "--output", str(both_roles["tmp"] / "split.json"),
+        ])
+
+
+# --------------------------------------------------------------------------------------
+# The document is a display artifact; the memories are the authority
+# --------------------------------------------------------------------------------------
+
+
+def _forge(path: Path, mutate) -> Path:
+    """Edit a document and make every hash in it agree with the edit.
+
+    This is the attack that internal consistency cannot see. `policy_hash` is public and
+    unkeyed, so an editor who changes a term everywhere it appears and recomputes the
+    commitment produces a file that passes every self-consistency check in the validator.
+    """
+
+    from wrasse.policy_hash import PolicyPreimage, policy_hash
+
+    body = json.loads(path.read_text())
+    mutate(body)
+    for profile in body["buyer"]["profiles"].values():
+        preimage = PolicyPreimage(**profile["policy_preimage"])
+        profile["policy_hash"] = policy_hash(preimage)
+    path.write_text(json.dumps(body))
+    return path
+
+
+def test_a_forged_price_that_agrees_with_itself_is_still_not_signed(rehearsal, capsys, monkeypatch):
+    """The one that matters: a self-consistent edit changes what the wallet funds.
+
+    Every check inside the document passes. The displayed price matches the preimage, the
+    preimage hashes to the quoted hash, and the hash is the one the deployed contract would
+    compute. Nothing in the file is wrong about the file. It is wrong about where it came
+    from, and that is the only question the signer actually needs answered.
+    """
+
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    ninefold = 900_000_000_000_000
+
+    def raise_the_price(body):
+        body["provider"]["terms"]["price_wei"] = ninefold
+        for profile in body["buyer"]["profiles"].values():
+            profile["terms"]["price_wei"] = ninefold
+            profile["policy_preimage"]["price"] = ninefold
+
+    _forge(policy_path, raise_the_price)
+
+    # It passes validation, which is exactly why validation is not enough.
+    from wrasse.policy_document import load_policy
+
+    validated = load_policy(
+        policy_path, profile="urgent", chain_id=CHAIN_ID,
+        contract_address=rehearsal["address"], buyer=rehearsal["buyer"].address,
+        provider=PROVIDER,
+    )
+    assert validated.price_wei == ninefold
+
+    with pytest.raises(RuntimeError, match="commits price_wei=900000000000000"):
+        main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
+
+    ledger = chain.TransactionLedger(Path(os.environ["WRASSE_TX_DB"]))
+    assert ledger.rows() == [], "a refused document must not leave a signed transaction"
+
+
+def test_a_forged_reason_beside_a_genuine_price_is_refused(rehearsal, capsys, monkeypatch):
+    """The half a person reads has to be the half the memory holds.
+
+    The money would still follow the committed terms. What would not follow is the
+    explanation: a real receipt id beside an invented account of what happened is a false
+    reason for a true transaction, which is the claim this entry is built on.
+    """
+
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+
+    def invent_a_reason(body):
+        body["buyer"]["recalled_evidence"] = [{
+            "event_id": "0x" + "7a" * 32,
+            "event_type": "timeout_claimed_without_delivery",
+            "chain_id": CHAIN_ID,
+        }]
+        body["buyer"]["cold_start"] = False
+        body["buyer"]["verdict"] = "match"
+
+    _forge(policy_path, invent_a_reason)
+
+    with pytest.raises(RuntimeError, match="does not describe the same way"):
+        main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
+
+
+def test_a_receipt_landing_between_the_two_recalls_is_caught(rehearsal, capsys, monkeypatch):
+    """Comparing the two indexes before reading them is a different question from what was read.
+
+    Both indexes can be equal at the moment they are compared, and an ingest finishing a
+    moment later leaves one side pricing on a receipt the other has not seen. The document
+    would look complete on both halves. The comparison therefore has to be over what the terms
+    were actually computed from, not over what the stores looked like beforehand.
+    """
+
+    from wrasse.evidence import ChainEvent
+    from wrasse.store import WrasseStore
+
+    address = rehearsal["address"]
+    buyer = rehearsal["buyer"].address
+    late = ChainEvent(
+        chain_id=CHAIN_ID,
+        contract_address=address,
+        tx_hash="0x" + "e1" * 32,
+        log_index=0,
+        block_number=1,
+        event_type="timeout_claimed_without_delivery",
+        deal_id=99,
+        buyer=buyer,
+        provider=PROVIDER,
+        observed_at="2026-09-04T00:00:00+00:00",
+    )
+
+    original = WrasseStore.recall
+    landed = []
+
+    def recall_then_deliver(self, counterparty):
+        """Let the buyer read, then let a reconciliation finish before the provider reads."""
+        result = original(self, counterparty)
+        if self.identity.role == "buyer" and not landed:
+            landed.append(True)
+            provider = WrasseStore.open(
+                os.environ["WRASSE_PROVIDER_MEMORY_PATH"], role="provider",
+                owner_address=PROVIDER, chain_id=CHAIN_ID, escrow_address=address,
+            )
+            provider.ingest(late)
+        return result
+
+    monkeypatch.setattr(WrasseStore, "recall", recall_then_deliver)
+
+    with pytest.raises(RuntimeError, match="disagree about what happened"):
+        main([
+            "policy", PROVIDER, "--buyer", buyer, "--accept-window", "600",
+            "--output", str(rehearsal["tmp"] / "raced.json"),
         ])

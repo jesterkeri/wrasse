@@ -15,6 +15,7 @@ from typing import Any
 from web3 import Web3
 
 from . import chain, escrow
+from .chain import _as_hex
 from .evidence import ChainEvent
 
 TIMEOUT_SIGNATURE = Web3.keccak(text="TimeoutClaimed(uint256)")
@@ -95,7 +96,7 @@ def verify_outcome(
             "reverted transaction proves no outcome at all."
         )
 
-    # 2. The receipt itself.
+    # 2. The receipt itself, and the block it is in now.
     receipt = web3.eth.get_transaction_receipt(tx_hash)
     if int(_field(receipt, "status")) != 1:
         raise ChainVerificationError("transaction receipt is not successful")
@@ -103,6 +104,36 @@ def verify_outcome(
     if Web3.to_checksum_address(_field(transaction, "to")) != contract_address:
         raise ChainVerificationError("transaction target is not the configured contract")
     block_number = int(_field(receipt, "blockNumber"))
+    block_hash = _as_hex(_field(receipt, "blockHash"))
+
+    # 2a. The same block the ledger watched settle, and that block still on the canonical
+    #     chain. `confirmed_success` is terminal, so it survives a reorg that moves the
+    #     transaction: the row keeps saying confirmed while the transaction is back in a
+    #     block that nothing has waited on. Without this, memory takes a receipt that was
+    #     re-included seconds ago and records it as a settled fact, which is the one thing the
+    #     confirmed-only rule exists to prevent.
+    if row.block_number is None or row.block_hash is None:
+        raise ChainVerificationError(
+            f"{tx_hash} is recorded as {row.status} with no block, so there is nothing to "
+            "check the receipt against. Re-resolve it before reconciling."
+        )
+    if block_number != row.block_number or block_hash != row.block_hash:
+        raise ChainVerificationError(
+            f"{tx_hash} confirmed in block {row.block_number} but the chain now returns it in "
+            f"block {block_number}. It was reorged and re-included; run tx-resolve so it is "
+            "confirmed again on this fork before it becomes memory."
+        )
+    try:
+        canonical = web3.eth.get_block(block_number)
+    except Exception as error:  # noqa: BLE001
+        raise ChainVerificationError(
+            f"could not read block {block_number} to confirm it is still canonical: {error}"
+        ) from error
+    if _as_hex(_field(canonical, "hash")) != block_hash:
+        raise ChainVerificationError(
+            f"block {block_number} no longer has hash {block_hash}; the receipt this build "
+            "confirmed is on a fork the chain has abandoned"
+        )
 
     # 3. Exactly one recognised outcome. Two would mean the receipt describes more than one
     #    thing happening; none would mean it describes nothing this build understands.

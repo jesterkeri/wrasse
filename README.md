@@ -105,6 +105,30 @@ the artifact this build compiled and to the recorded deployment. `deploy-check` 
 same comparison, but reporting is not enough on the path that moves money: a contract can
 implement one matching pure function and still make `createDeal` do something else.
 
+It also **derives both sides' terms again, from the two memories, and refuses a document it
+cannot reproduce.** `policy.json` is checked against itself first, and everything in it agrees
+with everything else by construction: the displayed price matches the preimage, the preimage
+hashes to the quoted commitment, and that commitment is what the deployed contract would
+compute. None of that says where the numbers came from. The commitment is a public unkeyed
+hash of the document's own fields, so an edit applied consistently and re-hashed produces a
+file in which nothing disagrees with anything, funding a price no memory ever produced.
+Consistency is not provenance. The quote is therefore rebuilt from the stores at signing time
+and the document is accepted only if this machine reaches the same numbers, recalled evidence
+included.
+
+The baselines it rebuilds against are its own arguments rather than fields of the document,
+because a baseline read out of the file would be one more number an editor gets to choose. So
+**a non-default baseline has to be passed to both commands**, or set once in `.env` as
+`WRASSE_BASE_PRICE_WEI`, `WRASSE_BASE_BOND_BPS`, `WRASSE_SERVICE_WINDOW` and
+`WRASSE_PAYOUT_DELAY`, where both read it:
+
+```bash
+uv run wrasse policy <provider> --buyer <buyer> --accept-window 600 \
+    --service-window 600 --payout-delay 60 --output policy.json
+WRASSE_ALLOW_BROADCAST=1 uv run wrasse create-deal --policy policy.json --profile urgent \
+    --service-window 600 --payout-delay 60
+```
+
 It looks up the quote's stable identity first, before reading the chain or touching the
 keystore. `policy.json` carries a `request_id` minted before any transaction
 exists, and the execution identity is that id paired with the explicitly chosen profile.

@@ -30,6 +30,9 @@ _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 _DIRECTIONS = {"positive", "negative"}
 _CONTEXTS = {"deadline_sensitive", "cost_sensitive", "quality_sensitive"}
 
+#: The same cap the store enumerates under, and for the same reason: `list_entities` offers no
+#: cursor, so a full page is "there may be more I cannot see" rather than "this is all".
+ENUMERATION_LIMIT = 1_000
 
 #: Answers no retry can improve: a bad key, no credit, a refused or malformed request.
 _PERMANENT_STATUSES = frozenset({400, 401, 402, 403, 404, 422})
@@ -226,14 +229,43 @@ def create_dimension(
 
 
 def load_dimensions(memory: DimensionMemory) -> tuple[DimensionDefinition, ...]:
+    """Every active dimension, or a refusal to price against an ontology that is ambiguous.
+
+    Two active definitions for one outcome are not a richer reading of it. `_score` walks the
+    definitions and adds a contribution for each one that matches, so a duplicated row scores
+    the same receipt twice and inflates a bond or a price for a reason the policy document
+    cannot show: the evidence hash still names that receipt once. A reader given the document
+    could not reproduce the number from it.
+
+    The page is capped and there is no cursor, so a full page means there may be definitions
+    this cannot see. Silently truncating would set a price from part of an ontology.
+    """
+
+    rows = memory.list_entities(DIMENSION_CATEGORY, status="active", limit=ENUMERATION_LIMIT)
+    if len(rows) >= ENUMERATION_LIMIT:
+        raise DimensionError(
+            f"this store holds at least {ENUMERATION_LIMIT} active dimensions and the SDK "
+            "offers no way to page past that, so the ontology cannot be read completely"
+        )
+
     definitions = []
-    for entity in memory.list_entities(DIMENSION_CATEGORY, status="active", limit=100):
+    seen: dict[str, str] = {}
+    for entity in rows:
         body = entity["body"]
         source_event_type = str(body["source_event_type"])
         model_body = {key: body[key] for key in (
             "dimension_id", "signal_direction", "severity", "confidence", "applies_when"
         )}
-        definitions.append(DimensionDefinition.from_model(model_body, source_event_type))
+        definition = DimensionDefinition.from_model(model_body, source_event_type)
+        if source_event_type in seen:
+            raise DimensionError(
+                f"two active dimensions describe {source_event_type}: "
+                f"{seen[source_event_type]} and {definition.dimension_id}. Every receipt of "
+                "that kind would be scored twice, and the policy document would name it once. "
+                "Retire one with `learn-dimension --relearn` before quoting."
+            )
+        seen[source_event_type] = definition.dimension_id
+        definitions.append(definition)
     return tuple(definitions)
 
 

@@ -25,6 +25,7 @@ PROVIDER = Web3.to_checksum_address("0x" + "33" * 20)
 STRANGER = Web3.to_checksum_address("0x" + "99" * 20)
 TX = "0x" + "22" * 32
 BLOCK = 123_456
+BLOCK_HASH = "0x" + "ab" * 32
 
 _STATES = ("Offered", "Accepted", "Delivered", "Released", "TimedOut", "Cancelled")
 
@@ -43,11 +44,13 @@ def _release_log(deal_id=7, *, by_buyer=True, index=3):
 
 
 class FakeEth:
-    def __init__(self, *, logs, state="TimedOut", sender=BUYER, status=1, deal_readable=True):
+    def __init__(self, *, logs, state="TimedOut", sender=BUYER, status=1, deal_readable=True,
+                 block=BLOCK, block_hash=BLOCK_HASH, canonical_hash=None):
         self.chain_id = CHAIN_ID
         self.receipt = {
             "status": status,
-            "blockNumber": BLOCK,
+            "blockNumber": block,
+            "blockHash": block_hash,
             "transactionHash": bytes.fromhex(TX[2:]),
             "logs": logs,
         }
@@ -55,6 +58,7 @@ class FakeEth:
         self.state = state
         self.deal_readable = deal_readable
         self.block_asked_for = None
+        self.canonical_hash = block_hash if canonical_hash is None else canonical_hash
 
     def get_transaction_receipt(self, tx_hash):
         return self.receipt
@@ -63,7 +67,7 @@ class FakeEth:
         return self.transaction
 
     def get_block(self, number):
-        return {"timestamp": 1_788_000_000, "number": number}
+        return {"timestamp": 1_788_000_000, "number": number, "hash": self.canonical_hash}
 
     def contract(self, address, abi):
         return _FakeContract(self)
@@ -104,20 +108,25 @@ class FakeWeb3:
 class FakeLedger:
     """Stands in for the transaction ledger, which is check number one."""
 
-    def __init__(self, status=chain.CONFIRMED_SUCCESS, present=True):
+    def __init__(self, status=chain.CONFIRMED_SUCCESS, present=True,
+                 block_number=BLOCK, block_hash=BLOCK_HASH):
         self.status = status
         self.present = present
+        self.block_number = block_number
+        self.block_hash = block_hash
 
     def find_by_tx_hash(self, *, chain_id, tx_hash):
         if not self.present:
             return None
-        return _Row(self.status)
+        return _Row(self.status, self.block_number, self.block_hash)
 
 
 class _Row:
-    def __init__(self, status):
+    def __init__(self, status, block_number=BLOCK, block_hash=BLOCK_HASH):
         self.status = status
         self.intent_id = "deal:0:claimTimeout"
+        self.block_number = block_number
+        self.block_hash = block_hash
 
 
 @pytest.fixture(autouse=True)
@@ -209,3 +218,48 @@ def test_a_failed_historical_read_stops_rather_than_using_the_tip():
 def test_an_unsuccessful_receipt_is_refused():
     with pytest.raises(ChainVerificationError, match="not successful"):
         _verify(FakeWeb3(logs=[_timeout_log()], status=0))
+
+
+# --------------------------------------------------------------------------------------
+# A confirmation belongs to a fork, not to a transaction
+# --------------------------------------------------------------------------------------
+
+
+def test_a_receipt_reincluded_in_another_block_is_not_still_confirmed():
+    """`confirmed_success` is terminal, so it outlives the fork it was earned on.
+
+    A reorg puts the transaction back in the mempool and it is re-included in a newer block
+    that nothing has waited on. The ledger row still says confirmed. Taking the receipt at
+    that moment records a fact the chain has agreed to for seconds, under a rule that claims
+    to accept only what it has agreed to for a hundred blocks.
+    """
+
+    web3 = FakeWeb3(logs=[_timeout_log()], block=BLOCK + 4, block_hash="0x" + "cd" * 32)
+    with pytest.raises(ChainVerificationError, match="reorged and re-included"):
+        _verify(web3)
+
+
+def test_a_confirmation_on_an_abandoned_fork_is_refused():
+    """Same block number, different chain. The receipt is honest; the fork is gone."""
+
+    web3 = FakeWeb3(logs=[_timeout_log()], canonical_hash="0x" + "ef" * 32)
+    with pytest.raises(ChainVerificationError, match="abandoned"):
+        _verify(web3)
+
+
+def test_a_confirmed_row_with_no_block_has_nothing_to_check_against():
+    web3 = FakeWeb3(logs=[_timeout_log()])
+    ledger = FakeLedger(block_number=None, block_hash=None)
+    with pytest.raises(ChainVerificationError, match="no block"):
+        _verify(web3, ledger)
+
+
+def test_an_unreadable_block_stops_rather_than_assuming_it_is_canonical():
+    web3 = FakeWeb3(logs=[_timeout_log()])
+
+    def unavailable(number):
+        raise RuntimeError("archive node unavailable")
+
+    web3.eth.get_block = unavailable
+    with pytest.raises(ChainVerificationError, match="still canonical"):
+        _verify(web3)

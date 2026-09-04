@@ -904,12 +904,18 @@ READ_ATTEMPTS = 3
 READ_BASE_DELAY_SECONDS = 0.25
 READ_MAX_DELAY_SECONDS = 4.0
 
-#: The whole operation's patience, not just one wait's. Honouring a server's own number is
-#: courteous until the number is 86400, at which point the courtesy is a hang.
+#: The whole operation's patience, measured on the clock rather than in sleep. Honouring a
+#: server's own number is courteous until the number is 86400, at which point the courtesy is
+#: a hang; and a budget that counts only the waiting is no budget at all, because three calls
+#: that each stall until the provider's own timeout spend a minute without ever sleeping.
 READ_TOTAL_BUDGET_SECONDS = 15.0
 
 #: Replaced in tests. Nothing here should ever sleep for real during a suite run.
 _sleep = time.sleep
+
+#: Replaced in tests alongside `_sleep`, so a stalled call can be made to cost time without
+#: the suite spending any.
+_monotonic = time.monotonic
 
 
 def _retry_after(error: Exception) -> float | None:
@@ -947,7 +953,7 @@ def _read(call: Callable[[], Any], *, describe: str) -> Any:
     transaction appears.
     """
 
-    spent = 0.0
+    deadline = _monotonic() + READ_TOTAL_BUDGET_SECONDS
     for attempt in range(1, READ_ATTEMPTS + 1):
         try:
             return call()
@@ -965,12 +971,17 @@ def _read(call: Callable[[], Any], *, describe: str) -> Any:
                 # A hint, capped. An endpoint asking for a day gets what we can spare.
                 delay = min(named, READ_MAX_DELAY_SECONDS)
 
-            if spent + delay > READ_TOTAL_BUDGET_SECONDS:
+            # The clock, not the sum of the sleeps. The attempt that just failed may have sat
+            # on a socket for the provider's whole timeout, and a budget blind to that would
+            # let three of them run to a minute while reporting nothing spent.
+            remaining = deadline - _monotonic()
+            if delay > remaining:
+                spent = READ_TOTAL_BUDGET_SECONDS - max(0.0, remaining)
                 raise RpcUnavailable(
-                    f"{describe}: gave up after {spent:.1f}s of waiting; the endpoint asked "
-                    f"for {named if named is not None else delay:.0f}s more"
+                    f"{describe}: gave up {spent:.1f}s in, with {max(0.0, remaining):.1f}s of "
+                    f"the {READ_TOTAL_BUDGET_SECONDS:.0f}s budget left and "
+                    f"{named if named is not None else delay:.0f}s more to wait"
                 ) from error
-            spent += delay
             _sleep(delay)
     raise AssertionError("unreachable")
 
