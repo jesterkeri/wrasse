@@ -18,7 +18,7 @@ from web3 import HTTPProvider, Web3
 
 from . import chain, escrow
 from .chain_time import ChainObservation, observe_chain_time, past_lag, require_recent
-from .dimensions import get_or_create_dimension, load_dimensions
+from .dimensions import DIMENSION_CATEGORY, create_dimension, load_dimensions
 from .engine import PROFILES, produce_provider_terms, produce_terms
 from .memory_gate import recall_counterparty_evidence
 from .policy_document import PolicyDocumentError, ValidatedPolicy, load_policy
@@ -1163,17 +1163,40 @@ def main(argv: list[str] | None = None) -> int:
         if event is None:
             raise RuntimeError(f"{args.event_id} is not in either memory")
 
-        learned = {}
-        for side, store in stores.items():
-            definition, created = get_or_create_dimension(
-                store.memory,
+        # One model call, then the same definition into each side's own store. Asking twice
+        # would cost twice and, worse, let the two sides end up holding different readings of
+        # the same public receipt for no reason anybody could point at.
+        existing = {
+            side: next(
+                (d for d in load_dimensions(store.memory)
+                 if d.source_event_type == event["event_type"]),
+                None,
+            )
+            for side, store in stores.items()
+        }
+        definition = next((d for d in existing.values() if d is not None), None)
+        if definition is None:
+            definition = create_dimension(
                 event,
                 api_key=os.environ["OPENROUTER_API_KEY"],
                 model=os.getenv("WRASSE_LLM_MODEL", "openai/gpt-oss-20b"),
             )
-            learned[side] = {"created": created, "dimension": definition.body()}
-        print(json.dumps({"event_type": event["event_type"], "sides": learned},
-                         indent=2, sort_keys=True))
+
+        learned = {}
+        for side, store in stores.items():
+            if existing[side] is None:
+                store.memory.set_entity(
+                    DIMENSION_CATEGORY, definition.dimension_id, definition.body(),
+                    status="active",
+                )
+            learned[side] = existing[side] is None
+
+        print(json.dumps({
+            "event_type": event["event_type"],
+            "dimension": definition.body(),
+            "model_called": all(value is None for value in existing.values()),
+            "written_to": learned,
+        }, indent=2, sort_keys=True))
         return 0
     if args.command == "policy":
         chain_id = _chain_id()
