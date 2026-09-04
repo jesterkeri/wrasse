@@ -19,11 +19,19 @@ JOURNAL_MARKER_CATEGORY = "chain_event_journalled"
 
 #: Closed and ABI-derived. An event type outside this set never came from a log this build
 #: recognises, so it can never become evidence.
-EVENT_TYPES = frozenset({
-    "timeout_claimed_without_delivery",
-    "delivered_and_released_by_buyer",
-    "delivered_and_claimed_after_delay",
-})
+#:
+#: The value is **whose conduct the receipt is evidence about**, which the contract decides and
+#: no model is asked to guess. A timeout is a provider failing to deliver. A release withheld
+#: until the payout delay expired is a buyer making the provider wait. Without this, a
+#: provider's own failure would raise the price it charges, and a buyer's slowness would raise
+#: the bond that buyer demands, which is nonsense in both directions.
+SUBJECT_OF = {
+    "timeout_claimed_without_delivery": "provider",
+    "delivered_and_released_by_buyer": "buyer",
+    "delivered_and_claimed_after_delay": "buyer",
+}
+
+EVENT_TYPES = frozenset(SUBJECT_OF)
 
 
 class EventConflict(RuntimeError):

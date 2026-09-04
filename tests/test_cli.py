@@ -41,9 +41,9 @@ def test_cold_start_policy_is_emitted_as_json(tmp_path, monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     written = json.loads(output_path.read_text())
     assert output == written
-    assert output["cold_start"] is True
-    assert set(output["profiles"]) == {"urgent", "budget", "sensitive"}
-    assert all(value["policy_hash"].startswith("0x") for value in output["profiles"].values())
+    assert output["buyer"]["cold_start"] is True
+    assert set(output["buyer"]["profiles"]) == {"urgent", "budget", "sensitive"}
+    assert all(value["policy_hash"].startswith("0x") for value in output["buyer"]["profiles"].values())
 
 
 def test_cold_start_commits_an_empty_provider_evidence_set(tmp_path, monkeypatch, capsys):
@@ -54,7 +54,7 @@ def test_cold_start_commits_an_empty_provider_evidence_set(tmp_path, monkeypatch
     """
     _run(tmp_path, monkeypatch)
     output = json.loads(capsys.readouterr().out)
-    for value in output["profiles"].values():
+    for value in output["buyer"]["profiles"].values():
         preimage = value["policy_preimage"]
         assert preimage["provider_evidence_hash"] == EMPTY_EVIDENCE_HASH
         assert preimage["buyer"].lower() == BUYER.lower()
@@ -94,5 +94,5 @@ def test_same_inputs_produce_the_same_commitment(tmp_path, monkeypatch, capsys):
     first = json.loads(capsys.readouterr().out)
     _run(tmp_path, monkeypatch)
     second = json.loads(capsys.readouterr().out)
-    for name, value in first["profiles"].items():
-        assert value["policy_hash"] == second["profiles"][name]["policy_hash"]
+    for name, value in first["buyer"]["profiles"].items():
+        assert value["policy_hash"] == second["buyer"]["profiles"][name]["policy_hash"]

@@ -70,6 +70,9 @@ def _bounded_number(value: Any, name: str) -> float:
     return number
 
 
+#: Where learned dimensions live. Named here so callers stop repeating the literal.
+DIMENSION_CATEGORY = "behavior_dimension"
+
 DIMENSION_JSON_SCHEMA = {
     "name": "wrasse_dimension",
     "strict": True,
@@ -138,7 +141,7 @@ def create_dimension(
 
 def load_dimensions(memory: DimensionMemory) -> tuple[DimensionDefinition, ...]:
     definitions = []
-    for entity in memory.list_entities("behavior_dimension", status="active", limit=100):
+    for entity in memory.list_entities(DIMENSION_CATEGORY, status="active", limit=100):
         body = entity["body"]
         source_event_type = str(body["source_event_type"])
         model_body = {key: body[key] for key in (
@@ -163,13 +166,13 @@ def get_or_create_dimension(
 
     definition = create_dimension(event, api_key=api_key, model=model, post=post)
     try:
-        collision = memory.get_entity("behavior_dimension", definition.dimension_id)
+        collision = memory.get_entity(DIMENSION_CATEGORY, definition.dimension_id)
     except NotFoundError:
         collision = None
     if collision is not None and collision["body"].get("source_event_type") != event_type:
         raise DimensionError("model reused a dimension id for an incompatible event type")
     memory.set_entity(
-        "behavior_dimension",
+        DIMENSION_CATEGORY,
         definition.dimension_id,
         definition.body(),
         status="active",

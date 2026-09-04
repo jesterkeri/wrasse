@@ -23,6 +23,8 @@ import pytest
 from eth_account import Account
 from web3 import Web3
 
+from conftest import write_persona
+
 from wrasse import chain
 from wrasse.cli import main
 
@@ -128,6 +130,9 @@ def rehearsal(anvil_url, tmp_path, monkeypatch):
         "WRASSE_TX_DB": str(tmp_path / "state" / "transactions.db"),
         "WRASSE_DEPLOYMENT_RECORD": str(record),
         "WRASSE_MEMORY_PATH": str(tmp_path / "memory.db"),
+        "WRASSE_BUYER_MEMORY_PATH": str(tmp_path / "buyer-memory.db"),
+        "WRASSE_PROVIDER_MEMORY_PATH": str(tmp_path / "provider-memory.db"),
+        "WRASSE_PROVIDER_PERSONA": str(write_persona(tmp_path, PROVIDER)),
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv(chain.BROADCAST_ENV, raising=False)
@@ -536,6 +541,10 @@ def both_roles(rehearsal, monkeypatch):
 
     monkeypatch.setenv("WRASSE_PROVIDER_A_ADDRESS", provider.address)
     monkeypatch.setenv("WRASSE_PROVIDER_A_KEYSTORE", str(keystore))
+    monkeypatch.setenv(
+        "WRASSE_PROVIDER_PERSONA",
+        str(write_persona(rehearsal["tmp"], provider.address)),
+    )
     monkeypatch.setenv(chain.BROADCAST_ENV, "1")
     return {**rehearsal, "provider": provider}
 

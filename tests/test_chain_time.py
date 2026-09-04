@@ -89,7 +89,7 @@ def test_a_live_quote_derives_the_deadline_from_the_observed_block(tmp_path, mon
     assert executability["basis"] == "chain-observation"
     assert executability["executable"] is True
     assert executability["chain"] == {"chain_id": CHAIN_ID, "block_number": 4_242, "block_timestamp": now}
-    for value in output["profiles"].values():
+    for value in output["buyer"]["profiles"].values():
         assert value["policy_preimage"]["accept_by"] == now + 3_600
 
 
@@ -230,5 +230,5 @@ def test_an_absolute_deadline_can_be_checked_against_the_live_chain(tmp_path, mo
     assert output["executability"]["basis"] == "chain-observation"
     assert output["executability"]["executable"] is True
     assert output["executability"]["observed_lag_seconds"] == 0
-    for value in output["profiles"].values():
+    for value in output["buyer"]["profiles"].values():
         assert value["policy_preimage"]["accept_by"] == now + 3_600

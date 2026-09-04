@@ -19,9 +19,11 @@ from web3 import HTTPProvider, Web3
 from . import chain, escrow
 from .chain_time import ChainObservation, observe_chain_time, past_lag, require_recent
 from .dimensions import get_or_create_dimension, load_dimensions
-from .engine import PROFILES, produce_terms
+from .engine import PROFILES, produce_provider_terms, produce_terms
 from .memory_gate import recall_counterparty_evidence
 from .policy_document import PolicyDocumentError, ValidatedPolicy, load_policy
+from .providers import ProviderPersona
+from .store import WrasseStore, persona_digest
 from .policy_hash import (
     BPS_DENOMINATOR,
     ENGINE_VERSION,
@@ -40,7 +42,7 @@ from .reconciler import reconcile
 
 #: Bumped whenever the shape of policy.json changes. A consumer that does not recognise the
 #: version must refuse the document rather than guess which fields it is looking at.
-POLICY_SCHEMA_VERSION = 1
+POLICY_SCHEMA_VERSION = 2
 
 def _write_atomic(path: Path, text: str) -> None:
     """Replace a file in one step, or not at all.
@@ -151,6 +153,56 @@ def _stores() -> dict[str, MemoryClient]:
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
     return {role: MemoryClient.local(path) for role, path in paths.items()}
+
+
+def _persona_path() -> Path:
+    """Read at call time, not at import.
+
+    A module-level `getenv` is fixed before `load_dotenv` runs, so the `.env` file could never
+    have reached it. The same shape of bug as the failpoint, and worth fixing wherever it
+    appears rather than only where it was noticed.
+    """
+
+    return Path(os.getenv("WRASSE_PROVIDER_PERSONA", "personas/provider-a.json"))
+
+
+def _open_stores(*, buyer: str, provider: str) -> dict[str, WrasseStore]:
+    """One identified memory per side, and never the same file twice."""
+
+    paths = {role: _store_path(role) for role in ("buyer", "provider")}
+    if paths["buyer"].resolve() == paths["provider"].resolve():
+        raise RuntimeError(
+            f"both memory paths resolve to {paths['buyer'].resolve()}; one store cannot hold "
+            "two independently held memories"
+        )
+    owners = {"buyer": buyer, "provider": provider}
+    escrow_address = _required_env("WRASSE_ESCROW_ADDRESS")
+    return {
+        role: WrasseStore.open(
+            paths[role], role=role, owner_address=owners[role],
+            chain_id=_chain_id(), escrow_address=escrow_address,
+        )
+        for role in ("buyer", "provider")
+    }
+
+
+def _provider_persona(store: WrasseStore) -> ProviderPersona:
+    """Load the committed persona and bind it to this store, once and for all."""
+
+    path = _persona_path()
+    digest, document = persona_digest(path)
+    persona = ProviderPersona.from_document(document)
+    if not _same_address(persona.address, store.identity.owner_address):
+        raise RuntimeError(
+            f"{path} describes {persona.address}, but this provider store belongs to "
+            f"{store.identity.owner_address}"
+        )
+    store.commit_persona(name=persona.name, digest=digest)
+    return persona
+
+
+def _same_address(left: str, right: str) -> bool:
+    return Web3.to_checksum_address(left) == Web3.to_checksum_address(right)
 
 
 def _memory() -> MemoryClient:
@@ -1107,44 +1159,76 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"created": created, "dimension": definition.body()}, indent=2, sort_keys=True))
         return 0
     if args.command == "policy":
-        memory = _memory()
-        recalled = recall_counterparty_evidence(memory, args.provider)
-        dimensions = load_dimensions(memory)
-        missing = sorted({
-            event["event_type"]
-            for event in recalled.evidence
-            if not any(item.source_event_type == event["event_type"] for item in dimensions)
-        })
-        if missing:
-            raise RuntimeError(f"verified events need dimensions before policy generation: {missing}")
+        chain_id = _chain_id()
+        escrow_address = _escrow_address()
+        if escrow_address is None:
+            raise RuntimeError(
+                "WRASSE_ESCROW_ADDRESS is not set. A quote is bound to one deployment, and a "
+                "document that names none cannot be executed against any."
+            )
+        buyer = Web3.to_checksum_address(args.buyer)
+        provider = Web3.to_checksum_address(args.provider)
+
+        stores = _open_stores(buyer=buyer, provider=provider)
+        persona = _provider_persona(stores["provider"])
+
+        # Each side recalls the other. Both stores hold the same receipts; what differs is who
+        # each one is reading them about, and what it concludes.
+        recall = {
+            "buyer": stores["buyer"].recall(provider),
+            "provider": stores["provider"].recall(buyer),
+        }
+        dimensions = load_dimensions(stores["buyer"].memory)
+        for side, recalled in recall.items():
+            missing = sorted({
+                event["event_type"]
+                for event in recalled.evidence
+                if not any(item.source_event_type == event["event_type"] for item in dimensions)
+            })
+            if missing:
+                raise RuntimeError(
+                    f"the {side} holds verified events with no dimension yet: {missing}"
+                )
+
         basis = _resolve_time_basis(args)
         reference_timestamp, accept_by, observation = basis.reference, basis.accept_by, basis.observation
-        ids = tuple(str(item["event_id"]) for item in recalled.evidence)
-        evidence_commitment = evidence_hash(ids)
+
+        provider_terms = produce_provider_terms(
+            evidence=recall["provider"].evidence,
+            dimensions=dimensions,
+            persona=persona,
+            base_price_wei=args.base_price_wei,
+            base_payout_delay=args.payout_delay,
+        )
+        provider_commitment = evidence_hash(provider_terms.used_evidence_ids)
+
         profiles = {}
         for name, profile in PROFILES.items():
             terms = produce_terms(
-                evidence=recalled.evidence,
+                evidence=recall["buyer"].evidence,
                 dimensions=dimensions,
                 profile=profile,
                 base_price_wei=args.base_price_wei,
                 base_bond_bps=args.base_bond_bps,
                 base_service_window=args.service_window,
             )
+            # The bilateral moment. Bond and window come from what the buyer remembers; price
+            # and payout delay from what the provider remembers. Negotiating between the two
+            # is gate 7; here each side simply opens where its own memory puts it.
             preimage = PolicyPreimage(
-                buyer=args.buyer,
-                provider=args.provider,
-                price=terms.price_wei,
+                buyer=buyer,
+                provider=provider,
+                price=provider_terms.price_wei,
                 bond_bps=terms.provider_bond_bps,
                 accept_by=accept_by,
                 service_window=terms.service_window,
-                payout_delay=args.payout_delay,
+                payout_delay=provider_terms.payout_delay,
                 engine_version=ENGINE_VERSION,
-                buyer_evidence_hash=evidence_commitment,
-                # The provider recalls nothing about this buyer yet. Bilateral recall
-                # lands at gate 6; until then this side is honestly empty rather than
-                # borrowing the buyer's own evidence.
-                provider_evidence_hash=EMPTY_EVIDENCE_HASH,
+                # Each hash covers the receipts that moved that side's numbers, not everything
+                # it happens to hold. A commitment over unused evidence would describe the
+                # reading rather than the reasoning.
+                buyer_evidence_hash=evidence_hash(terms.used_evidence_ids),
+                provider_evidence_hash=provider_commitment,
             )
             # A quote the chain would refuse is not a quote. Checking here, rather than at
             # broadcast, keeps the displayed policy and the executable policy the same thing.
@@ -1158,30 +1242,53 @@ def main(argv: list[str] | None = None) -> int:
                 )
             profiles[name] = {
                 "terms": {
-                    "price_wei": terms.price_wei,
+                    "price_wei": preimage.price,
                     "provider_bond_bps": terms.provider_bond_bps,
                     "service_window": terms.service_window,
+                    "payout_delay": preimage.payout_delay,
                     "risk": str(terms.risk),
-                    "evidence_event_ids": list(terms.evidence_event_ids),
+                    "used_evidence_ids": list(terms.used_evidence_ids),
                 },
                 "policy_preimage": preimage.as_dict(),
                 "policy_hash": policy_hash(preimage),
             }
+
         output = {
             # Immutable identity, fixed before any transaction exists. `request_id` is what
             # makes a retry a retry: the committed terms move between attempts because the
             # deadline is re-derived from chain time, so action identity cannot come from them.
             "schema_version": POLICY_SCHEMA_VERSION,
             "request_id": secrets.token_hex(16),
-            "chain_id": _chain_id(),
-            "contract_address": _escrow_address(),
+            "chain_id": chain_id,
+            "contract_address": escrow_address,
             "engine_version": ENGINE_VERSION,
-            "counterparty": recalled.counterparty,
-            "memory_verdict": recalled.verdict,
-            "cold_start": recalled.is_cold_start,
             "executability": _executability(args, basis),
-            "profiles": profiles,
-            "evidence": list(recalled.evidence),
+            "buyer": {
+                "address": buyer,
+                "counterparty": provider,
+                "verdict": recall["buyer"].verdict,
+                "cold_start": recall["buyer"].is_cold_start,
+                "recalled_evidence": list(recall["buyer"].evidence),
+                "profiles": profiles,
+            },
+            "provider": {
+                "address": provider,
+                "counterparty": buyer,
+                "verdict": recall["provider"].verdict,
+                "cold_start": recall["provider"].is_cold_start,
+                "recalled_evidence": list(recall["provider"].evidence),
+                "persona": {
+                    "name": persona.name,
+                    "cashflow_sensitivity": str(persona.cashflow_sensitivity),
+                    "commitment": stores["provider"].persona_commitment()["sha256"],
+                },
+                "terms": {
+                    "price_wei": provider_terms.price_wei,
+                    "payout_delay": provider_terms.payout_delay,
+                    "risk": str(provider_terms.risk),
+                    "used_evidence_ids": list(provider_terms.used_evidence_ids),
+                },
+            },
         }
         rendered = json.dumps(output, indent=2, sort_keys=True)
         if args.output:

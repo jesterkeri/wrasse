@@ -1,0 +1,8 @@
+{
+  "_comment": "Committed to git before any receipt exists, and its hash is written into the provider's store when that store is created. Changing it after the store holds evidence is refused. This is what makes 'the provider did not tune itself to this counterparty' checkable rather than asserted.",
+  "name": "atlas",
+  "address": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+  "cashflow_sensitivity": "0.70",
+  "price_sensitivity_bps": 2500,
+  "delay_sensitivity_seconds": 1800
+}

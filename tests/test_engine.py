@@ -7,11 +7,11 @@ from wrasse.engine import PROFILES, produce_terms
 def test_same_history_changes_terms_by_task_profile():
     evidence = [{
         "event_id": "0x" + "11" * 32,
-        "event_type": "model_created_event_name",
+        "event_type": "timeout_claimed_without_delivery",
     }]
     dimensions = [DimensionDefinition(
         dimension_id="model_created_dimension",
-        source_event_type="model_created_event_name",
+        source_event_type="timeout_claimed_without_delivery",
         signal_direction="negative",
         severity=0.8,
         confidence=0.5,
@@ -32,12 +32,17 @@ def test_same_history_changes_terms_by_task_profile():
 
 
 def test_unknown_dimension_name_is_handled_without_code_changes():
+    """The dimension id comes from the model and is never hard-coded.
+
+    The *event type* it derives from is a different matter: that set is closed and derived from
+    the contract's own logs, because a name nobody can find in a receipt is not evidence.
+    """
     event_id = "0x" + "55" * 32
     terms = produce_terms(
-        evidence=[{"event_id": event_id, "event_type": "novel_signal"}],
+        evidence=[{"event_id": event_id, "event_type": "timeout_claimed_without_delivery"}],
         dimensions=[DimensionDefinition(
             dimension_id="surprise_dimension_from_model",
-            source_event_type="novel_signal",
+            source_event_type="timeout_claimed_without_delivery",
             signal_direction="negative",
             severity=1,
             confidence=1,
@@ -50,7 +55,7 @@ def test_unknown_dimension_name_is_handled_without_code_changes():
     )
     assert terms.risk == 1
     assert terms.provider_bond_bps == 2_500
-    assert terms.evidence_event_ids == (event_id,)
+    assert terms.recalled_event_ids == (event_id,)
 
 
 
@@ -60,10 +65,10 @@ def test_a_repeated_recall_does_not_count_twice():
     If the memory layer returned one receipt twice, doubling its weight would move terms
     against a counterparty on the strength of a single event counted twice.
     """
-    event = {"event_id": "0x" + "99" * 32, "event_type": "model_created_event_name"}
+    event = {"event_id": "0x" + "99" * 32, "event_type": "timeout_claimed_without_delivery"}
     dimensions = [DimensionDefinition(
         dimension_id="model_created_dimension",
-        source_event_type="model_created_event_name",
+        source_event_type="timeout_claimed_without_delivery",
         signal_direction="negative",
         severity=0.8,
         confidence=0.5,
@@ -84,7 +89,7 @@ def test_a_repeated_recall_does_not_count_twice():
 def _dimension():
     return DimensionDefinition(
         dimension_id="model_created_dimension",
-        source_event_type="model_created_event_name",
+        source_event_type="timeout_claimed_without_delivery",
         signal_direction="negative",
         severity=0.8,
         confidence=0.5,
@@ -111,12 +116,12 @@ def test_the_same_receipt_spelled_differently_is_one_receipt():
         base_service_window=3_600,
     )
     once = produce_terms(
-        evidence=[{"event_id": prefixed, "event_type": "model_created_event_name"}], **common
+        evidence=[{"event_id": prefixed, "event_type": "timeout_claimed_without_delivery"}], **common
     )
     spelled_twice = produce_terms(
         evidence=[
-            {"event_id": prefixed, "event_type": "model_created_event_name"},
-            {"event_id": bare_upper, "event_type": "model_created_event_name"},
+            {"event_id": prefixed, "event_type": "timeout_claimed_without_delivery"},
+            {"event_id": bare_upper, "event_type": "timeout_claimed_without_delivery"},
         ],
         **common,
     )
@@ -139,7 +144,7 @@ def test_two_different_stories_about_one_receipt_fail_closed():
     with pytest.raises(ValueError, match="conflicting records"):
         produce_terms(
             evidence=[
-                {"event_id": event_id, "event_type": "model_created_event_name"},
+                {"event_id": event_id, "event_type": "timeout_claimed_without_delivery"},
                 {"event_id": event_id, "event_type": "something_else"},
             ],
             **common,
