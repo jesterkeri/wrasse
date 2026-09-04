@@ -55,7 +55,7 @@ def produce_terms(
 
     if base_price_wei <= 0 or base_service_window <= 0:
         raise ValueError("base price and service window must be positive")
-    events = tuple(evidence)
+    events = _unique_by_event_id(evidence)
     definitions = tuple(dimensions)
     risk = Decimal("0")
     for event in events:
@@ -83,6 +83,25 @@ def produce_terms(
         risk=risk.quantize(Decimal("0.0001")),
         evidence_event_ids=identifiers,
     )
+
+
+def _unique_by_event_id(evidence: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Collapse repeated recalls of the same receipt.
+
+    Evidence is a set, and the commitment treats it as one. A memory layer that returned the
+    same receipt twice would otherwise double its weight in the risk sum, moving terms
+    against a counterparty on the strength of one event counted twice.
+    """
+
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for event in evidence:
+        identifier = str(event["event_id"])
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        unique.append(event)
+    return tuple(unique)
 
 
 def _round_decimal(value: Decimal) -> int:

@@ -59,6 +59,8 @@ def test_empty_evidence_set_has_a_canonical_hash():
         ("engine_version", "wrasse/0.2.0"),
         ("buyer", "0x5555555555555555555555555555555555555555"),
         ("provider", "0x6666666666666666666666666666666666666666"),
+        ("buyer_evidence_hash", "0x" + "77" * 32),
+        ("provider_evidence_hash", "0x" + "88" * 32),
     ],
 )
 def test_every_committed_field_changes_the_hash(field, value):
@@ -80,6 +82,18 @@ def test_swapping_the_two_evidence_sides_changes_the_hash():
     assert policy_hash(original) != policy_hash(swapped)
 
 
+def test_repeated_evidence_ids_collapse():
+    """The commitment is over a set.
+
+    Recalling the same receipt twice describes the same evidence. If it produced a different
+    commitment, the terms would depend on how the memory layer happened to page its results.
+    """
+    first = "0x" + "11" * 32
+    second = "0x" + "22" * 32
+    assert evidence_hash([first, second, first]) == evidence_hash([first, second])
+    assert evidence_hash([first, first]) == evidence_hash([first])
+
+
 def test_policy_hash_matches_solidity_fixture():
     preimage = _canonical()
     assert preimage.buyer_evidence_hash == CANONICAL_BUYER_EVIDENCE
@@ -95,3 +109,9 @@ def test_buyer_and_provider_must_differ():
 def test_non_address_is_rejected():
     with pytest.raises(ValueError, match="not an EVM address"):
         policy_hash(_canonical(buyer="not-an-address"))
+
+
+def test_zero_address_is_rejected():
+    """The contract refuses a zero provider, so a commitment naming one is unexecutable."""
+    with pytest.raises(ValueError, match="zero address"):
+        policy_hash(_canonical(provider="0x" + "00" * 20))

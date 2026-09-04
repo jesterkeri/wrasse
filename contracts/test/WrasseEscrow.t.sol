@@ -4,7 +4,15 @@ pragma solidity 0.8.30;
 import {WrasseEscrow} from "../src/WrasseEscrow.sol";
 
 interface Vm {
+    struct Log {
+        bytes32[] topics;
+        bytes data;
+        address emitter;
+    }
+
     function deal(address who, uint256 newBalance) external;
+    function recordLogs() external;
+    function getRecordedLogs() external returns (Log[] memory);
     function prank(address sender) external;
     function startPrank(address sender) external;
     function stopPrank() external;
@@ -40,11 +48,60 @@ contract ReentrantBuyer {
         escrow.cancelUnaccepted(dealId);
     }
 
+    function collect() external {
+        escrow.withdraw(payable(address(this)));
+    }
+
     receive() external payable {
         if (!attempted) {
             attempted = true;
-            (reentrySucceeded,) = address(escrow).call(abi.encodeCall(WrasseEscrow.cancelUnaccepted, (dealId)));
+            (reentrySucceeded,) =
+                address(escrow).call(abi.encodeCall(WrasseEscrow.withdraw, (payable(address(this)))));
         }
+    }
+}
+
+/// @dev Refuses every incoming transfer. Under a design that pushed value during settlement,
+/// this address could hold a deal in a non-terminal state forever and freeze the
+/// counterparty's deposit along with its own.
+contract RejectingParty {
+    WrasseEscrow private immutable escrow;
+
+    constructor(WrasseEscrow target) {
+        escrow = target;
+    }
+
+    function create(address provider, uint256 price, uint64 acceptBy) external returns (uint256) {
+        return escrow.createDeal{value: price}(
+            provider,
+            2_000,
+            acceptBy,
+            2 hours,
+            30 minutes,
+            keccak256("wrasse/0.1.0"),
+            keccak256("buyer-evidence"),
+            keccak256("provider-evidence")
+        );
+    }
+
+    function accept(uint256 dealId, uint256 bond) external {
+        escrow.acceptDeal{value: bond}(dealId);
+    }
+
+    function deliver(uint256 dealId) external {
+        escrow.markDelivered(dealId);
+    }
+
+    function claimTimeout(uint256 dealId) external {
+        escrow.claimTimeout(dealId);
+    }
+
+    function collect() external {
+        escrow.withdraw(payable(address(this)));
+    }
+
+    receive() external payable {
+        revert("refuses ETH");
     }
 }
 
@@ -102,6 +159,13 @@ contract WrasseEscrowTest {
         uint256 beforeBalance = BUYER.balance;
         vm.prank(BUYER);
         escrow.cancelUnaccepted(dealId);
+        // Settlement assigns; it does not send. The escrow still holds the refund.
+        _assertEq(BUYER.balance, beforeBalance);
+        _assertEq(escrow.withdrawable(BUYER), PRICE);
+        _assertEq(address(escrow).balance, PRICE);
+
+        vm.prank(BUYER);
+        escrow.withdraw(payable(BUYER));
         _assertEq(BUYER.balance, beforeBalance + PRICE);
         _assertEq(address(escrow).balance, 0);
     }
@@ -113,6 +177,11 @@ contract WrasseEscrowTest {
         uint256 beforeBalance = PROVIDER.balance;
         vm.prank(BUYER);
         escrow.releaseDeal(dealId);
+        _assertEq(PROVIDER.balance, beforeBalance);
+        _assertEq(escrow.withdrawable(PROVIDER), PRICE + BOND);
+
+        vm.prank(PROVIDER);
+        escrow.withdraw(payable(PROVIDER));
         _assertEq(PROVIDER.balance, beforeBalance + PRICE + BOND);
         _assertEq(address(escrow).balance, 0);
     }
@@ -129,6 +198,10 @@ contract WrasseEscrowTest {
         uint256 beforeBalance = PROVIDER.balance;
         vm.prank(PROVIDER);
         escrow.claimPayment(dealId);
+        _assertEq(escrow.withdrawable(PROVIDER), PRICE + BOND);
+
+        vm.prank(PROVIDER);
+        escrow.withdraw(payable(PROVIDER));
         _assertEq(PROVIDER.balance, beforeBalance + PRICE + BOND);
     }
 
@@ -148,6 +221,11 @@ contract WrasseEscrowTest {
         uint256 beforeBalance = BUYER.balance;
         vm.prank(BUYER);
         escrow.claimTimeout(dealId);
+        _assertEq(escrow.withdrawable(BUYER), PRICE + BOND);
+        _assertEq(address(escrow).balance, PRICE + BOND);
+
+        vm.prank(BUYER);
+        escrow.withdraw(payable(BUYER));
         _assertEq(BUYER.balance, beforeBalance + PRICE + BOND);
         _assertEq(address(escrow).balance, 0);
     }
@@ -163,14 +241,18 @@ contract WrasseEscrowTest {
         escrow.acceptDeal{value: BOND - 1}(dealId);
     }
 
-    function testRefundPathRejectsReentrancy() public {
+    /// @notice Withdrawal is the only place the contract calls out, so it is the only place
+    /// reentrancy can be attempted at all.
+    function testWithdrawRejectsReentrancy() public {
         ReentrantBuyer attacker = new ReentrantBuyer(escrow);
         attacker.create{value: PRICE}(PROVIDER, uint64(block.timestamp + ACCEPT_WINDOW));
         vm.warp(block.timestamp + ACCEPT_WINDOW + 1);
         attacker.cancel();
+        attacker.collect();
 
         require(!attacker.reentrySucceeded(), "reentrant call succeeded");
         _assertEq(address(attacker).balance, PRICE);
+        _assertEq(escrow.withdrawable(address(attacker)), 0);
         _assertEq(address(escrow).balance, 0);
     }
 
@@ -403,6 +485,396 @@ contract WrasseEscrowTest {
             BUYER_EVIDENCE_HASH,
             EMPTY_EVIDENCE_HASH
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Receipt reconstruction
+    // ---------------------------------------------------------------------------------
+
+    struct Decoded {
+        uint256 createdCount;
+        uint256 commitmentCount;
+        uint256 dealIdCreated;
+        address buyer;
+        address provider;
+        uint256 price;
+        uint256 bondBps;
+        uint64 acceptBy;
+        uint64 serviceWindow;
+        uint64 payoutDelay;
+        bytes32 policyHashCreated;
+        uint256 dealIdCommitment;
+        bytes32 engineVersionHash;
+        bytes32 buyerEvidenceHash;
+        bytes32 providerEvidenceHash;
+        bytes32 policyHashCommitment;
+    }
+
+    bytes32 private constant DEAL_CREATED_SIG =
+        keccak256("DealCreated(uint256,address,address,uint256,uint256,uint256,uint64,uint64,uint64,bytes32)");
+    bytes32 private constant DEAL_COMMITMENT_SIG = keccak256("DealCommitment(uint256,bytes32,bytes32,bytes32,bytes32)");
+
+    /// @notice The claim under review: someone holding only the creation receipt can rebuild
+    /// the commitment. Every input below is decoded from a log, never read from storage or
+    /// borrowed from a fixture, so dropping a field from an event fails this test.
+    function testCreationReceiptAloneRebuildsTheCommitment() public {
+        vm.recordLogs();
+        uint256 dealId = _create();
+        Decoded memory d = _decodeCreation(vm.getRecordedLogs());
+
+        require(d.createdCount == 1, "expected exactly one DealCreated from the escrow");
+        require(d.commitmentCount == 1, "expected exactly one DealCommitment from the escrow");
+        require(d.dealIdCreated == d.dealIdCommitment, "the two events describe different deals");
+        require(d.policyHashCreated == d.policyHashCommitment, "the two events disagree on the commitment");
+        _assertEq(d.dealIdCreated, dealId);
+
+        bytes32 rebuilt = escrow.computePolicyHash(
+            d.buyer,
+            d.provider,
+            d.price,
+            d.bondBps,
+            d.acceptBy,
+            d.serviceWindow,
+            d.payoutDelay,
+            d.engineVersionHash,
+            d.buyerEvidenceHash,
+            d.providerEvidenceHash
+        );
+        require(rebuilt == d.policyHashCreated, "the receipt does not rebuild its own commitment");
+
+        (,,,,,,,,,, bytes32 stored,) = escrow.deals(dealId);
+        _assertEq(uint256(stored), uint256(rebuilt));
+    }
+
+    function _decodeCreation(Vm.Log[] memory logs) private view returns (Decoded memory d) {
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter != address(escrow)) continue;
+            if (logs[i].topics[0] == DEAL_CREATED_SIG) {
+                d.createdCount++;
+                d.dealIdCreated = uint256(logs[i].topics[1]);
+                d.buyer = address(uint160(uint256(logs[i].topics[2])));
+                d.provider = address(uint160(uint256(logs[i].topics[3])));
+                (d.price, d.bondBps,, d.acceptBy, d.serviceWindow, d.payoutDelay, d.policyHashCreated) =
+                    abi.decode(logs[i].data, (uint256, uint256, uint256, uint64, uint64, uint64, bytes32));
+            } else if (logs[i].topics[0] == DEAL_COMMITMENT_SIG) {
+                d.commitmentCount++;
+                d.dealIdCommitment = uint256(logs[i].topics[1]);
+                (d.engineVersionHash, d.buyerEvidenceHash, d.providerEvidenceHash, d.policyHashCommitment) =
+                    abi.decode(logs[i].data, (bytes32, bytes32, bytes32, bytes32));
+            }
+        }
+    }
+
+    /// @notice Swapping the two evidence sides is not a sufficient test on its own: an
+    /// implementation that ignored one side entirely would still pass it. Each side is
+    /// therefore mutated alone.
+    function testMutatingEitherEvidenceSideAloneChangesTheCommitment() public view {
+        bytes32 other = keccak256("a different recalled set");
+        bytes32 base = _canonicalHash(BUYER_EVIDENCE_HASH, EMPTY_EVIDENCE_HASH);
+        bytes32 buyerSideChanged = _canonicalHash(other, EMPTY_EVIDENCE_HASH);
+        bytes32 providerSideChanged = _canonicalHash(BUYER_EVIDENCE_HASH, other);
+
+        require(base != buyerSideChanged, "buyer evidence is not committed");
+        require(base != providerSideChanged, "provider evidence is not committed");
+        require(buyerSideChanged != providerSideChanged, "the two sides are interchangeable");
+    }
+
+    function _canonicalHash(bytes32 buyerEvidence, bytes32 providerEvidence) private view returns (bytes32) {
+        return escrow.computePolicyHash(
+            CANON_BUYER,
+            CANON_PROVIDER,
+            1 ether,
+            2_000,
+            CANON_ACCEPT_BY,
+            7_200,
+            1_800,
+            ENGINE_VERSION_HASH,
+            buyerEvidence,
+            providerEvidence
+        );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Boundaries
+    // ---------------------------------------------------------------------------------
+
+    /// @notice The maximum acceptance horizon must itself be accepted, or the bound is an
+    /// off-by-one rather than a bound. The window fields already cover this; acceptBy did not.
+    function testAcceptByIsAcceptedAtExactlyTheMaximum() public {
+        uint64 maxDuration = escrow.MAX_DURATION();
+        vm.prank(BUYER);
+        escrow.createDeal{value: PRICE}(
+            PROVIDER,
+            2_000,
+            uint64(block.timestamp) + maxDuration,
+            SERVICE_WINDOW,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+    }
+
+    /// @notice A zero-length window is not a short deal, it is an unresolvable one.
+    function testZeroDurationsAreRejected() public {
+        uint64 validAcceptBy = uint64(block.timestamp + ACCEPT_WINDOW);
+
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.DurationOutOfRange.selector);
+        escrow.createDeal{value: PRICE}(
+            PROVIDER, 2_000, validAcceptBy, 0, PAYOUT_DELAY, ENGINE_VERSION_HASH, BUYER_EVIDENCE_HASH, EMPTY_EVIDENCE_HASH
+        );
+
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.DurationOutOfRange.selector);
+        escrow.createDeal{value: PRICE}(
+            PROVIDER, 2_000, validAcceptBy, SERVICE_WINDOW, 0, ENGINE_VERSION_HASH, BUYER_EVIDENCE_HASH, EMPTY_EVIDENCE_HASH
+        );
+
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.DurationOutOfRange.selector);
+        escrow.createDeal{value: PRICE}(
+            PROVIDER,
+            2_000,
+            uint64(block.timestamp),
+            SERVICE_WINDOW,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+    }
+
+    /// @notice acceptBy is the last instant acceptance works and the last instant cancellation
+    /// does not. The two must hand off with neither a gap nor an overlap.
+    function testAcceptanceAndCancellationHandOffExactlyAtAcceptBy() public {
+        uint256 first = _create();
+        vm.warp(lastAcceptBy);
+
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.AcceptanceStillOpen.selector);
+        escrow.cancelUnaccepted(first);
+        vm.prank(PROVIDER);
+        escrow.acceptDeal{value: BOND}(first);
+
+        uint256 second = _create();
+        vm.warp(uint256(lastAcceptBy) + 1);
+        vm.prank(PROVIDER);
+        vm.expectRevert(WrasseEscrow.AcceptanceClosed.selector);
+        escrow.acceptDeal{value: BOND}(second);
+        vm.prank(BUYER);
+        escrow.cancelUnaccepted(second);
+    }
+
+    /// @notice The service deadline hands off the same way: delivery is still open on the
+    /// deadline itself, and the timeout claim only opens the instant after it.
+    function testDeliveryAndTimeoutHandOffExactlyAtTheDeadline() public {
+        uint256 first = _acceptedDeal();
+        (,,,,,,, uint64 deadline,,,,) = escrow.deals(first);
+        vm.warp(deadline);
+
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.DeadlineNotPassed.selector);
+        escrow.claimTimeout(first);
+        vm.prank(PROVIDER);
+        escrow.markDelivered(first);
+
+        uint256 second = _acceptedDeal();
+        (,,,,,,, uint64 secondDeadline,,,,) = escrow.deals(second);
+        vm.warp(uint256(secondDeadline) + 1);
+        vm.prank(PROVIDER);
+        vm.expectRevert(WrasseEscrow.DeadlinePassed.selector);
+        escrow.markDelivered(second);
+        vm.prank(BUYER);
+        escrow.claimTimeout(second);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Liveness and solvency
+    // ---------------------------------------------------------------------------------
+
+    /// @notice The failure this design exists to remove. When settlement pushed value, a
+    /// provider that refuses ETH left the deal stuck in Delivered forever, freezing the
+    /// buyer's deposit alongside its own payout. Settlement must now complete regardless.
+    function testRejectingProviderCannotStrandTheBuyersDeposit() public {
+        RejectingParty rejecting = new RejectingParty(escrow);
+        vm.deal(address(rejecting), BOND);
+
+        lastAcceptBy = uint64(block.timestamp + ACCEPT_WINDOW);
+        vm.prank(BUYER);
+        uint256 dealId = escrow.createDeal{value: PRICE}(
+            address(rejecting),
+            2_000,
+            lastAcceptBy,
+            SERVICE_WINDOW,
+            PAYOUT_DELAY,
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
+        rejecting.accept(dealId, BOND);
+        rejecting.deliver(dealId);
+
+        vm.prank(BUYER);
+        escrow.releaseDeal(dealId);
+
+        (,,,,,,,,,,, WrasseEscrow.State state) = escrow.deals(dealId);
+        _assertEq(uint256(state), uint256(WrasseEscrow.State.Released));
+        _assertEq(escrow.withdrawable(address(rejecting)), PRICE + BOND);
+
+        // It can strand its own credit, and nothing else.
+        vm.expectRevert(WrasseEscrow.TransferFailed.selector);
+        rejecting.collect();
+    }
+
+    /// @notice The mirror image: a buyer that refuses ETH must not be able to hold a deal in
+    /// Accepted forever and freeze the provider's bond there.
+    function testRejectingBuyerCannotFreezeTheDealInAcceptedState() public {
+        RejectingParty rejecting = new RejectingParty(escrow);
+        vm.deal(address(rejecting), PRICE);
+        uint256 dealId = rejecting.create(PROVIDER, PRICE, uint64(block.timestamp + ACCEPT_WINDOW));
+
+        vm.prank(PROVIDER);
+        escrow.acceptDeal{value: BOND}(dealId);
+        vm.warp(block.timestamp + 2 hours + 1);
+        rejecting.claimTimeout(dealId);
+
+        (,,,,,,,,,,, WrasseEscrow.State state) = escrow.deals(dealId);
+        _assertEq(uint256(state), uint256(WrasseEscrow.State.TimedOut));
+        _assertEq(escrow.withdrawable(address(rejecting)), PRICE + BOND);
+        _assertEq(address(escrow).balance, PRICE + BOND);
+    }
+
+    /// @notice One address settling several deals holds a single summed balance, and one
+    /// withdrawal drains all of it.
+    function testCreditsFromSeveralDealsAggregateIntoOneBalance() public {
+        _releaseFreshDeal();
+        _releaseFreshDeal();
+        _assertEq(escrow.withdrawable(PROVIDER), 2 * (PRICE + BOND));
+
+        uint256 beforeBalance = PROVIDER.balance;
+        vm.prank(PROVIDER);
+        escrow.withdraw(payable(PROVIDER));
+        _assertEq(PROVIDER.balance, beforeBalance + 2 * (PRICE + BOND));
+        _assertEq(escrow.withdrawable(PROVIDER), 0);
+        _assertEq(address(escrow).balance, 0);
+    }
+
+    /// @notice Settling or draining one deal must never reach another deal's money.
+    function testConcurrentDealsAreFundedIndependently() public {
+        uint256 first = _acceptedDeal();
+        uint256 second = _acceptedDeal();
+        _assertEq(address(escrow).balance, 2 * (PRICE + BOND));
+
+        (,,,,,,, uint64 deadline,,,,) = escrow.deals(first);
+        vm.warp(uint256(deadline) + 1);
+        vm.prank(BUYER);
+        escrow.claimTimeout(first);
+
+        // Settling the first deal moves no ETH and leaves the second deal fully funded.
+        _assertEq(escrow.withdrawable(BUYER), PRICE + BOND);
+        _assertEq(address(escrow).balance, 2 * (PRICE + BOND));
+
+        vm.prank(BUYER);
+        escrow.withdraw(payable(BUYER));
+        // Draining the settled credit leaves exactly the open deal's liability behind.
+        _assertEq(address(escrow).balance, PRICE + BOND);
+
+        vm.prank(BUYER);
+        escrow.claimTimeout(second);
+        vm.prank(BUYER);
+        escrow.withdraw(payable(BUYER));
+        _assertEq(address(escrow).balance, 0);
+    }
+
+    /// @notice A terminal deal is finished for everyone, which is what makes a second payout
+    /// impossible rather than merely unlikely.
+    function testTerminalStateRejectsEveryFurtherTransition() public {
+        uint256 dealId = _releaseFreshDeal();
+
+        vm.prank(BUYER);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                WrasseEscrow.WrongState.selector, WrasseEscrow.State.Delivered, WrasseEscrow.State.Released
+            )
+        );
+        escrow.releaseDeal(dealId);
+
+        vm.prank(PROVIDER);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                WrasseEscrow.WrongState.selector, WrasseEscrow.State.Delivered, WrasseEscrow.State.Released
+            )
+        );
+        escrow.claimPayment(dealId);
+
+        vm.prank(BUYER);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                WrasseEscrow.WrongState.selector, WrasseEscrow.State.Accepted, WrasseEscrow.State.Released
+            )
+        );
+        escrow.claimTimeout(dealId);
+
+        vm.prank(BUYER);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                WrasseEscrow.WrongState.selector, WrasseEscrow.State.Offered, WrasseEscrow.State.Released
+            )
+        );
+        escrow.cancelUnaccepted(dealId);
+
+        vm.prank(PROVIDER);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                WrasseEscrow.WrongState.selector, WrasseEscrow.State.Offered, WrasseEscrow.State.Released
+            )
+        );
+        escrow.acceptDeal{value: BOND}(dealId);
+
+        _assertEq(escrow.withdrawable(PROVIDER), PRICE + BOND);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Withdrawal
+    // ---------------------------------------------------------------------------------
+
+    function testWithdrawRejectsEmptyBalanceAndZeroRecipient() public {
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.NothingToWithdraw.selector);
+        escrow.withdraw(payable(BUYER));
+
+        uint256 dealId = _create();
+        vm.warp(block.timestamp + ACCEPT_WINDOW + 1);
+        vm.prank(BUYER);
+        escrow.cancelUnaccepted(dealId);
+
+        vm.prank(BUYER);
+        vm.expectRevert(WrasseEscrow.InvalidRecipient.selector);
+        escrow.withdraw(payable(address(0)));
+    }
+
+    /// @notice The withdrawal destination is chosen at collection time and is deliberately not
+    /// part of any commitment. It is not a negotiated term of the deal.
+    function testCreditHolderMayNominateADifferentRecipient() public {
+        address nominee = address(0xBEEF);
+        uint256 dealId = _create();
+        vm.warp(block.timestamp + ACCEPT_WINDOW + 1);
+        vm.prank(BUYER);
+        escrow.cancelUnaccepted(dealId);
+
+        vm.prank(BUYER);
+        escrow.withdraw(payable(nominee));
+        _assertEq(nominee.balance, PRICE);
+        _assertEq(escrow.withdrawable(BUYER), 0);
+    }
+
+    function _releaseFreshDeal() private returns (uint256 dealId) {
+        dealId = _acceptedDeal();
+        vm.prank(PROVIDER);
+        escrow.markDelivered(dealId);
+        vm.prank(BUYER);
+        escrow.releaseDeal(dealId);
     }
 
     function _create() private returns (uint256) {

@@ -52,3 +52,30 @@ def test_unknown_dimension_name_is_handled_without_code_changes():
     assert terms.provider_bond_bps == 2_500
     assert terms.evidence_event_ids == (event_id,)
 
+
+
+def test_a_repeated_recall_does_not_count_twice():
+    """Evidence is a set.
+
+    If the memory layer returned one receipt twice, doubling its weight would move terms
+    against a counterparty on the strength of a single event counted twice.
+    """
+    event = {"event_id": "0x" + "99" * 32, "event_type": "model_created_event_name"}
+    dimensions = [DimensionDefinition(
+        dimension_id="model_created_dimension",
+        source_event_type="model_created_event_name",
+        signal_direction="negative",
+        severity=0.8,
+        confidence=0.5,
+        applies_when=("deadline_sensitive",),
+    )]
+    common = dict(
+        dimensions=dimensions,
+        profile=PROFILES["urgent"],
+        base_price_wei=10_000,
+        base_bond_bps=500,
+        base_service_window=3_600,
+    )
+    once = produce_terms(evidence=[event], **common)
+    twice = produce_terms(evidence=[event, dict(event)], **common)
+    assert once == twice

@@ -30,17 +30,24 @@ the exact ABI encoding.
 - A timeout returns both price and provider bond to the buyer.
 - A delivered deal pays price plus returned bond to the provider, either on
   early buyer release or after the payout delay.
-- State changes precede all ETH transfers, and payout/refund functions use a
-  reentrancy guard. A hostile receiver regression test attempts reentry.
-- Every terminal path has a tested fund exit.
+- No state transition sends ETH. Settlement assigns a withdrawable credit, and
+  `withdraw` is the contract's only external call site. It zeroes the balance
+  before calling out and is reentrancy-guarded; a hostile receiver regression
+  test attempts reentry through it.
+- Every terminal path has a tested fund exit, and terminal states reject every
+  further transition.
+- Credits from several deals aggregate into one balance per address, and a
+  regression test shows one deal cannot reach another deal's funds.
 
 ## Known limitations
 
 - Delivery is asserted by the provider; the contract does not prove service
   quality or arbitrate disputes.
-- A buyer or provider contract that permanently refuses ETH can prevent its own
-  payout. Failed transfers revert atomically, so another party cannot capture
-  those funds, but the MVP has no alternate withdrawal address.
+- A buyer or provider contract that permanently refuses ETH can strand its own
+  credit. It cannot strand the counterparty's deposit: settlement completes
+  without calling out, so no deal can be held in a non-terminal state, and the
+  credit holder may nominate any withdrawal address. An address that can neither
+  receive ETH nor nominate an alternative keeps its own funds locked.
 - ETH forcibly sent to the contract outside `createDeal` is not recoverable.
 - The contract is intentionally immutable and has no admin recovery function.
 

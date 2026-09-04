@@ -11,6 +11,9 @@ from wrasse.policy_hash import EMPTY_EVIDENCE_HASH
 BUYER = "0x4444444444444444444444444444444444444444"
 PROVIDER = "0x3333333333333333333333333333333333333333"
 ACCEPT_BY = 1_700_000_000
+# The fixture deadline is fixed in the past so the commitment never moves. Executability is
+# judged against a supplied reference time rather than the clock, so both stay deterministic.
+REFERENCE = ACCEPT_BY - 3_600
 
 
 def _run(tmp_path, monkeypatch, extra=()):
@@ -23,6 +26,8 @@ def _run(tmp_path, monkeypatch, extra=()):
         BUYER,
         "--accept-by",
         str(ACCEPT_BY),
+        "--reference-timestamp",
+        str(REFERENCE),
         "--output",
         str(output_path),
         *extra,
@@ -64,6 +69,24 @@ def test_acceptance_deadline_is_not_derived_from_the_clock(tmp_path, monkeypatch
     monkeypatch.setenv("WRASSE_MEMORY_PATH", str(tmp_path / "memory.db"))
     with pytest.raises(SystemExit):
         main(["policy", PROVIDER, "--buyer", BUYER])
+
+
+def test_a_deadline_the_contract_would_refuse_is_not_quoted(tmp_path, monkeypatch):
+    """A quote the chain rejects is worse than no quote: it looks executable and is not."""
+    from wrasse.policy_hash import PolicyNotCreatable
+
+    monkeypatch.setenv("WRASSE_MEMORY_PATH", str(tmp_path / "memory.db"))
+    with pytest.raises(PolicyNotCreatable, match="not in the future"):
+        main([
+            "policy",
+            PROVIDER,
+            "--buyer",
+            BUYER,
+            "--accept-by",
+            str(ACCEPT_BY),
+            "--reference-timestamp",
+            str(ACCEPT_BY + 1),
+        ])
 
 
 def test_same_inputs_produce_the_same_commitment(tmp_path, monkeypatch, capsys):

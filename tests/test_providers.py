@@ -13,6 +13,18 @@ def test_provider_bid_is_reproducible_from_logged_seed():
     assert first.seed == 42
 
 
+def test_the_bid_stream_is_pinned_to_a_recorded_value():
+    """Reproducibility across two runs of one build is not enough.
+
+    The seeded stream is namespaced by a package-name string, so a rename silently produces
+    different bids from identical inputs. Pinning the value turns that into a visible change
+    rather than an invisible one. Update it deliberately, never to make a test pass.
+    """
+    provider = Provider("Atlas", "0x" + "11" * 20, 200, 750)
+    bid = request_bid(provider, reference_price_wei=10_000, service_window=3_600, seed=42)
+    assert bid.price_wei == 10_148
+
+
 def test_exactly_one_counteroffer_is_allowed():
     provider = Provider("Atlas", "0x" + "11" * 20, 200, 750)
     bid = request_bid(provider, reference_price_wei=10_000, service_window=3_600, seed=42)

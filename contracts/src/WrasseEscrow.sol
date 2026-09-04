@@ -36,6 +36,10 @@ contract WrasseEscrow {
 
     uint256 public nextDealId;
     mapping(uint256 dealId => Deal) public deals;
+    /// @notice Settlement proceeds assigned to an address but not yet collected.
+    /// @dev Credits accumulate, so an address that settles several deals holds one summed
+    /// balance rather than a queue of per-deal entries.
+    mapping(address account => uint256 amount) public withdrawable;
     uint256 private _locked = 1;
 
     error InvalidProvider();
@@ -52,6 +56,8 @@ contract WrasseEscrow {
     error ReentrantCall();
     error DurationOutOfRange();
     error ZeroBond();
+    error NothingToWithdraw();
+    error InvalidRecipient();
 
     /// @notice The economic terms of a deal, in the form the commitment covers.
     /// @dev `providerBondBps` is emitted alongside the absolute `providerBond` because the
@@ -86,7 +92,17 @@ contract WrasseEscrow {
     event DealReleased(uint256 indexed dealId, bool releasedByBuyer);
     event TimeoutClaimed(uint256 indexed dealId);
     event DealCancelled(uint256 indexed dealId);
+    /// @notice Settlement has assigned `amount` to `recipient`, claimable via `withdraw`.
+    /// @dev Deliberately distinct from `Withdrawn`. Settling a deal and collecting the
+    /// proceeds are separate facts, and a receipt must never conflate them.
+    event PayoutCredited(uint256 indexed dealId, address indexed recipient, uint256 amount);
+    /// @notice A credited balance has left the contract.
+    event Withdrawn(address indexed account, address indexed recipient, uint256 amount);
 
+    /// @dev Kept on the settlement functions even though none of them calls out any more.
+    /// They share the lock with `withdraw`, so a recipient cannot re-enter a state transition
+    /// while its own withdrawal is in flight, and a future edit that reintroduces a call
+    /// inherits the guard rather than silently losing it.
     modifier nonReentrant() {
         if (_locked != 1) revert ReentrantCall();
         _locked = 2;
@@ -221,7 +237,7 @@ contract WrasseEscrow {
         deal.state = State.Cancelled;
         uint256 refund = deal.price;
         emit DealCancelled(dealId);
-        _sendValue(deal.buyer, refund);
+        _credit(dealId, deal.buyer, refund);
     }
 
     function markDelivered(uint256 dealId) external {
@@ -244,7 +260,7 @@ contract WrasseEscrow {
         deal.state = State.Released;
         uint256 payout = deal.price + deal.providerBond;
         emit DealReleased(dealId, true);
-        _sendValue(deal.provider, payout);
+        _credit(dealId, deal.provider, payout);
     }
 
     function claimPayment(uint256 dealId) external nonReentrant {
@@ -256,7 +272,7 @@ contract WrasseEscrow {
         deal.state = State.Released;
         uint256 payout = deal.price + deal.providerBond;
         emit DealReleased(dealId, false);
-        _sendValue(deal.provider, payout);
+        _credit(dealId, deal.provider, payout);
     }
 
     function claimTimeout(uint256 dealId) external nonReentrant {
@@ -268,15 +284,34 @@ contract WrasseEscrow {
         deal.state = State.TimedOut;
         uint256 refundAndBond = deal.price + deal.providerBond;
         emit TimeoutClaimed(dealId);
-        _sendValue(deal.buyer, refundAndBond);
+        _credit(dealId, deal.buyer, refundAndBond);
+    }
+
+    /// @notice Collect everything this caller has been credited, to an address of its choice.
+    /// @dev The only external call in the contract. No state transition sends value, so a
+    /// participant that refuses ETH can strand its own credit and nothing else. The
+    /// destination is chosen at collection time and is deliberately not part of any deal
+    /// commitment: it is not a negotiated term.
+    /// @param recipient where to send the balance; the caller may nominate any address.
+    function withdraw(address payable recipient) external nonReentrant returns (uint256 amount) {
+        if (recipient == address(0)) revert InvalidRecipient();
+        amount = withdrawable[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
+
+        withdrawable[msg.sender] = 0;
+        emit Withdrawn(msg.sender, recipient, amount);
+        (bool success,) = recipient.call{value: amount}("");
+        if (!success) revert TransferFailed();
     }
 
     function _requireState(Deal storage deal, State expected) private view {
         if (deal.state != expected) revert WrongState(expected, deal.state);
     }
 
-    function _sendValue(address recipient, uint256 amount) private {
-        (bool success,) = payable(recipient).call{value: amount}("");
-        if (!success) revert TransferFailed();
+    /// @dev Assigns proceeds without calling out. Keeping settlement free of external calls
+    /// is what makes a terminal transition impossible for a recipient to block.
+    function _credit(uint256 dealId, address recipient, uint256 amount) private {
+        withdrawable[recipient] += amount;
+        emit PayoutCredited(dealId, recipient, amount);
     }
 }

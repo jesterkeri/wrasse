@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,6 +20,7 @@ from .policy_hash import (
     PolicyPreimage,
     evidence_hash,
     policy_hash,
+    validate_creatable,
 )
 from .reconciler import reconcile_timeout_claim
 
@@ -51,6 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
             "absolute unix deadline for provider acceptance. Required rather than derived "
             "from the clock: a commitment that moves on every run is not a commitment. "
             "The orchestrator will supply this immediately before signing."
+        ),
+    )
+    policy.add_argument(
+        "--reference-timestamp",
+        type=int,
+        default=None,
+        help=(
+            "unix time that acceptance is measured against when checking the terms are "
+            "executable onchain. Defaults to now. Supply it to make a run reproducible."
         ),
     )
     policy.add_argument("--output", type=Path)
@@ -96,6 +107,9 @@ def main(argv: list[str] | None = None) -> int:
         })
         if missing:
             raise RuntimeError(f"verified events need dimensions before policy generation: {missing}")
+        reference_timestamp = (
+            args.reference_timestamp if args.reference_timestamp is not None else int(time.time())
+        )
         ids = tuple(str(item["event_id"]) for item in recalled.evidence)
         evidence_commitment = evidence_hash(ids)
         profiles = {}
@@ -123,6 +137,9 @@ def main(argv: list[str] | None = None) -> int:
                 # borrowing the buyer's own evidence.
                 provider_evidence_hash=EMPTY_EVIDENCE_HASH,
             )
+            # A quote the chain would refuse is not a quote. Checking here, rather than at
+            # broadcast, keeps the displayed policy and the executable policy the same thing.
+            validate_creatable(preimage, reference_timestamp=reference_timestamp)
             profiles[name] = {
                 "terms": {
                     "price_wei": terms.price_wei,

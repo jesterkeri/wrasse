@@ -49,8 +49,16 @@ The terminal interface currently exposes:
 uv run wrasse recall <provider-address>
 uv run wrasse reconcile-timeout <tx-hash> --deal-id <id> --provider <address>
 uv run wrasse learn-dimension <event-id>
-uv run wrasse policy <provider-address> --output policy.json
+uv run wrasse policy <provider-address> \
+  --buyer <buyer-address> \
+  --accept-by <unix-deadline> \
+  --output policy.json
 ```
+
+`--buyer` and `--accept-by` are required because the contract commits to both.
+`--accept-by` is an absolute deadline rather than a window, so that identical
+inputs always produce an identical commitment. Add `--reference-timestamp` to
+fix the time the deadline is judged against and make a run fully reproducible.
 
 Copy `.env.example` to the gitignored `.env` and add a project-specific
 `OPENROUTER_API_KEY`. `WRASSE_LLM_MODEL` is configurable and defaults to
@@ -58,15 +66,44 @@ Copy `.env.example` to the gitignored `.env` and add a project-specific
 
 ## Base contract
 
-`WrasseEscrow` derives `policyHash` onchain from the provider, actual
-`msg.value`, bond basis points, service window, payout delay, engine-version
-hash, and evidence hash. The Python and Solidity suites share an exact fixture
-to prevent encoding drift.
+`WrasseEscrow` derives `policyHash` onchain. The preimage is exactly this
+tuple, in this order, ABI-encoded and hashed:
+
+```text
+address buyer                 address provider
+uint256 price                 uint256 providerBondBps
+uint64  acceptBy              uint64  serviceWindow
+uint64  payoutDelay
+bytes32 engineVersionHash
+bytes32 buyerEvidenceHash     bytes32 providerEvidenceHash
+```
+
+Every field is a term the contract itself enforces, and every field is present
+in the creation receipt: `DealCreated` carries the economics and `DealCommitment`
+carries the memory half, both emitted in the same transaction and correlated by
+deal id and by the commitment itself. `providerBondBps` is emitted alongside the
+rounded absolute bond because integer division makes the rate unrecoverable from
+the amount. A test rebuilds the commitment using only values decoded from those
+two logs.
+
+`buyerEvidenceHash` commits to the receipts the buyer recalled about the
+provider; `providerEvidenceHash` commits to the reverse. Both are opaque. The
+contract fixes what each side committed to and proves neither side changed it
+afterwards. It does not prove either side assigned a truthful set to its role.
+
+The Python and Solidity suites share an exact fixture to prevent encoding drift,
+and `wrasse/policy_hash.py` refuses to quote terms `createDeal` would reject,
+so a displayed policy and an executable policy are the same thing.
 
 The provider asserts delivery before the deadline. The buyer may release early.
 Otherwise the provider may claim payment after the payout delay elapses.
 Dispute arbitration is outside the scope of this MVP. `payoutDelay` is not
 presented as a review or dispute period.
+
+Settling a deal assigns the proceeds; it never sends them. Each party then calls
+`withdraw` to collect, nominating any destination it likes. No state transition
+makes an external call, so a participant that refuses ETH can strand its own
+credit and nothing belonging to the other side.
 
 See `docs/contract-review.md` for the pre-deployment review and known
 limitations.
