@@ -624,3 +624,54 @@ def test_a_repeated_deal_action_sends_nothing(both_roles, capsys):
 def escrow_state(web3, address, deal_id):
     from wrasse import escrow
     return escrow.read_deal(web3, address, deal_id)["state"]
+
+
+def test_a_reconciled_receipt_is_findable_by_the_side_that_will_price_it(both_roles, capsys):
+    """Storing the record is only half of reconciliation.
+
+    A live run found this: reconcile wrote the canonical fact into both memories and never
+    indexed it, so both sides held the receipt and neither could find it when pricing. The
+    index is repairable, which is how that run recovered, but reconcile must not create the
+    damage in the first place.
+    """
+    from wrasse.store import WrasseStore
+
+    web3 = both_roles["web3"]
+    deal_id = _open_deal(both_roles, capsys, service_window=1)
+
+    assert main(["accept-deal", "--deal-id", str(deal_id)]) == 0
+    accepted = json.loads(capsys.readouterr().out)
+    web3.eth.wait_for_transaction_receipt(accepted["tx_hash"])
+    assert main(["tx-resolve", "--local-confirmation-blocks", "0"]) == 0
+    capsys.readouterr()
+
+    web3.provider.make_request("evm_increaseTime", [120])
+    web3.provider.make_request("evm_mine", [])
+
+    assert main(["claim-timeout", "--deal-id", str(deal_id)]) == 0
+    claimed = json.loads(capsys.readouterr().out)
+    web3.eth.wait_for_transaction_receipt(claimed["tx_hash"])
+
+    # Anvil pins its safe head at zero forever, so the rehearsal names its local policy.
+    assert main(["tx-resolve", "--local-confirmation-blocks", "0"]) == 0
+    capsys.readouterr()
+
+    assert main(["reconcile", "--tx", claimed["tx_hash"]]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["event_type"] == "timeout_claimed_without_delivery"
+    assert report["delivered_to"]["buyer"]["indexed_under"] == os.environ["WRASSE_PROVIDER_A_ADDRESS"]
+    assert report["delivered_to"]["provider"]["indexed_under"] == both_roles["buyer"].address
+
+    # The point: each side can now find it on the path that sets prices.
+    for role, counterparty in (
+        ("buyer", os.environ["WRASSE_PROVIDER_A_ADDRESS"]),
+        ("provider", both_roles["buyer"].address),
+    ):
+        owner = both_roles["buyer"].address if role == "buyer" else os.environ["WRASSE_PROVIDER_A_ADDRESS"]
+        store = WrasseStore.open(
+            os.environ[f"WRASSE_{role.upper()}_MEMORY_PATH"], role=role, owner_address=owner,
+            chain_id=CHAIN_ID, escrow_address=both_roles["address"],
+        )
+        recalled = store.recall(counterparty)
+        assert len(recalled.evidence) == 1, f"the {role} cannot find what it was just told"
+        assert recalled.evidence[0]["event_type"] == "timeout_claimed_without_delivery"

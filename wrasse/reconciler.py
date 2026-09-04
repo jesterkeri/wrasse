@@ -15,7 +15,7 @@ from typing import Any
 from web3 import Web3
 
 from . import chain, escrow
-from .evidence import ChainEvent, MemoryWriter, PersistResult, persist_verified_event
+from .evidence import ChainEvent
 
 TIMEOUT_SIGNATURE = Web3.keccak(text="TimeoutClaimed(uint256)")
 RELEASED_SIGNATURE = Web3.keccak(text="DealReleased(uint256,bool)")
@@ -161,11 +161,11 @@ def verify_outcome(
 
 
 def reconcile(
-    stores: dict[str, MemoryWriter],
+    stores: dict[str, Any],
     web3: Any,
     ledger: chain.TransactionLedger,
     **expected: Any,
-) -> dict[str, PersistResult]:
+) -> dict[str, dict[str, Any]]:
     """Verify once, then deliver the same neutral fact to every store.
 
     Both sides receive it. The receipt does not belong to one of them: a deal timed out, or a
@@ -173,9 +173,13 @@ def reconcile(
     Delivering it to only one would leave the other with a blind spot it has no way to know
     about, and would contradict the claim that the result teaches both memories.
 
+    Delivery goes through each store's own `ingest`, not through `persist_verified_event`
+    directly, because storing the record is only half of it: each side also has to index the
+    fact under its own view of the relationship, or the pricing path will never find it.
+
     Delivery is idempotent per store, so a partial write from an earlier crash converges when
     the same receipt is replayed rather than duplicating what already landed.
     """
 
     event = verify_outcome(web3, ledger, **expected)
-    return {name: persist_verified_event(store, event) for name, store in stores.items()}
+    return {name: store.ingest(event) for name, store in stores.items()}

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from dotenv import load_dotenv
-from sibyl_memory_client import MemoryClient
+from sibyl_memory_client import MemoryClient, NotFoundError
 from web3 import HTTPProvider, Web3
 
 from . import chain, escrow
@@ -1147,16 +1147,33 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2, sort_keys=True))
         return 0
     if args.command == "learn-dimension":
-        memory = _memory()
-        event = memory.get_entity("chain_event", args.event_id)["body"]
-        api_key = os.environ["OPENROUTER_API_KEY"]
-        definition, created = get_or_create_dimension(
-            memory,
-            event,
-            api_key=api_key,
-            model=os.getenv("WRASSE_LLM_MODEL", "openai/gpt-oss-20b"),
+        # One model call, then the same definition into each side's own store. They hold it
+        # separately because they are separate memories, not because they disagree.
+        stores = _open_stores(
+            buyer=_required_env("WRASSE_BUYER_ADDRESS"),
+            provider=_required_env("WRASSE_PROVIDER_A_ADDRESS"),
         )
-        print(json.dumps({"created": created, "dimension": definition.body()}, indent=2, sort_keys=True))
+        event = None
+        for store in stores.values():
+            try:
+                event = store.memory.get_entity("chain_event", args.event_id)["body"]
+                break
+            except NotFoundError:
+                continue
+        if event is None:
+            raise RuntimeError(f"{args.event_id} is not in either memory")
+
+        learned = {}
+        for side, store in stores.items():
+            definition, created = get_or_create_dimension(
+                store.memory,
+                event,
+                api_key=os.environ["OPENROUTER_API_KEY"],
+                model=os.getenv("WRASSE_LLM_MODEL", "openai/gpt-oss-20b"),
+            )
+            learned[side] = {"created": created, "dimension": definition.body()}
+        print(json.dumps({"event_type": event["event_type"], "sides": learned},
+                         indent=2, sort_keys=True))
         return 0
     if args.command == "policy":
         chain_id = _chain_id()
@@ -1178,12 +1195,15 @@ def main(argv: list[str] | None = None) -> int:
             "buyer": stores["buyer"].recall(provider),
             "provider": stores["provider"].recall(buyer),
         }
-        dimensions = load_dimensions(stores["buyer"].memory)
+        # Each side reads its own ontology. They tend to agree, because both were shown the
+        # same public receipts, and that is different from sharing one database. A provider
+        # reading the buyer's dimensions would not be an independently held memory.
+        dimensions = {side: load_dimensions(stores[side].memory) for side in recall}
         for side, recalled in recall.items():
             missing = sorted({
                 event["event_type"]
                 for event in recalled.evidence
-                if not any(item.source_event_type == event["event_type"] for item in dimensions)
+                if not any(d.source_event_type == event["event_type"] for d in dimensions[side])
             })
             if missing:
                 raise RuntimeError(
@@ -1195,7 +1215,7 @@ def main(argv: list[str] | None = None) -> int:
 
         provider_terms = produce_provider_terms(
             evidence=recall["provider"].evidence,
-            dimensions=dimensions,
+            dimensions=dimensions["provider"],
             persona=persona,
             base_price_wei=args.base_price_wei,
             base_payout_delay=args.payout_delay,
@@ -1206,7 +1226,7 @@ def main(argv: list[str] | None = None) -> int:
         for name, profile in PROFILES.items():
             terms = produce_terms(
                 evidence=recall["buyer"].evidence,
-                dimensions=dimensions,
+                dimensions=dimensions["buyer"],
                 profile=profile,
                 base_price_wei=args.base_price_wei,
                 base_bond_bps=args.base_bond_bps,
@@ -1311,21 +1331,27 @@ def main(argv: list[str] | None = None) -> int:
         return _rebind_policy(args)
     if args.command == "reconcile":
         results = reconcile(
-            _stores(),
+            _open_stores(
+                buyer=_required_env("WRASSE_BUYER_ADDRESS"),
+                provider=_required_env("WRASSE_PROVIDER_A_ADDRESS"),
+            ),
             _web3(),
             _ledger(),
             tx_hash=args.tx_hash,
             expected_chain_id=_chain_id(),
             expected_contract=_required_env("WRASSE_ESCROW_ADDRESS"),
         )
-        sample = next(iter(results.values()))
+        sample = next(iter(results.values()))["body"]
         print(json.dumps({
-            "event_id": sample.entity["body"]["event_id"],
-            "event_type": sample.entity["body"]["event_type"],
-            "deal_id": sample.entity["body"]["deal_id"],
-            "buyer": sample.entity["body"]["buyer"],
-            "provider": sample.entity["body"]["provider"],
-            "delivered_to": {name: result.created for name, result in results.items()},
+            "event_id": sample["event_id"],
+            "event_type": sample["event_type"],
+            "deal_id": sample["deal_id"],
+            "buyer": sample["buyer"],
+            "provider": sample["provider"],
+            "delivered_to": {
+                name: {"stored": result["created"], "indexed_under": result["counterparty"]}
+                for name, result in results.items()
+            },
             "note": "both memories receive the same neutral fact; each draws its own conclusion",
         }, indent=2, sort_keys=True))
         return 0
