@@ -44,22 +44,36 @@ class ChainObservation:
 def observe_chain_time(web3: Any, *, expected_chain_id: int) -> ChainObservation:
     """Read the latest block of the configured chain, or refuse."""
 
+    # Decoding stays inside the guard. A block missing a field, or carrying a null or a
+    # non-numeric one, is an unreliable RPC like any other, and must surface as this module's
+    # own error rather than as a KeyError from somewhere in the caller.
     try:
         chain_id = int(web3.eth.chain_id)
         block = web3.eth.get_block("latest")
-    except Exception as error:  # noqa: BLE001 - any transport failure means no live quote
-        raise ChainTimeUnavailable(f"could not read the latest block: {error}") from error
+        number = int(block["number"])
+        timestamp = int(block["timestamp"])
+    except Exception as error:  # noqa: BLE001 - any read or decode failure means no live quote
+        raise ChainTimeUnavailable(f"could not read a usable latest block: {error}") from error
 
     if chain_id != expected_chain_id:
         raise ChainTimeUnavailable(
             f"connected to chain {chain_id}, expected {expected_chain_id}; "
             "a deadline checked against the wrong chain is not checked at all"
         )
-    return ChainObservation(
-        chain_id=chain_id,
-        block_number=int(block["number"]),
-        timestamp=int(block["timestamp"]),
-    )
+    if number < 0 or timestamp <= 0:
+        raise ChainTimeUnavailable(f"block {number} reports an impossible timestamp {timestamp}")
+    return ChainObservation(chain_id=chain_id, block_number=number, timestamp=timestamp)
+
+
+def past_lag(observation: ChainObservation, *, local_now: int) -> int:
+    """How far behind local time the observed block sits, never negative.
+
+    A lagging node is the dangerous direction: the real chain tip is ahead of what was read,
+    so a deadline that looks comfortable against the observation may already have passed.
+    That lag has to be spent out of the inclusion margin rather than allowed alongside it.
+    """
+
+    return max(0, local_now - observation.timestamp)
 
 
 def require_recent(

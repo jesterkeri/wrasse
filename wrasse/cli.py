@@ -7,12 +7,13 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from dotenv import load_dotenv
 from sibyl_memory_client import MemoryClient
 from web3 import HTTPProvider, Web3
 
-from .chain_time import ChainObservation, observe_chain_time, require_recent
+from .chain_time import ChainObservation, observe_chain_time, past_lag, require_recent
 from .dimensions import get_or_create_dimension, load_dimensions
 from .engine import PROFILES, produce_terms
 from .memory_gate import recall_counterparty_evidence
@@ -99,13 +100,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_time_basis(args) -> tuple[int, int, ChainObservation | None]:
+class TimeBasis(NamedTuple):
+    """What "now" meant for one run, and how much it is worth."""
+
+    reference: int
+    accept_by: int
+    observation: ChainObservation | None
+    observed_lag: int
+
+
+def _resolve_time_basis(args) -> TimeBasis:
     """Decide what "now" means for this run, and refuse to guess.
 
-    Either the caller supplies a reference time, in which case the output is a reproducible
-    fixture and is labelled as one, or the chain is read and the quote is live. The local
-    clock is never the authority; it appears only as a sanity check that can refuse an
-    observation, never approve one.
+    Three explicit forms, no implicit fourth:
+
+    * ``--accept-window`` alone reads the chain and derives the deadline from it.
+    * ``--accept-by`` alone reads the chain and checks the supplied deadline against it.
+      This is the form a negotiated deadline arrives in.
+    * ``--accept-by`` with ``--reference-timestamp`` reads nothing and produces a fixture.
+
+    The local clock is never the authority. It appears only as a bound on how far the read
+    block may sit from now, and as lag spent out of the inclusion margin. Both can refuse a
+    quote; neither can approve one.
     """
 
     parser = build_parser()
@@ -115,25 +131,28 @@ def _resolve_time_basis(args) -> tuple[int, int, ChainObservation | None]:
     if args.reference_timestamp is not None:
         if args.accept_window is not None:
             parser.error("--accept-window needs chain time; use --accept-by with --reference-timestamp")
-        return args.reference_timestamp, args.accept_by, None
+        return TimeBasis(args.reference_timestamp, args.accept_by, None, 0)
 
     observation = observe_chain_time(_web3(), expected_chain_id=_chain_id())
-    require_recent(observation, local_now=int(time.time()))
+    local_now = int(time.time())
+    require_recent(observation, local_now=local_now)
+    lag = past_lag(observation, local_now=local_now)
     accept_by = (
         args.accept_by if args.accept_by is not None else observation.timestamp + args.accept_window
     )
-    return observation.timestamp, accept_by, observation
+    return TimeBasis(observation.timestamp, accept_by, observation, lag)
 
 
-def _executability(args, reference_timestamp: int, observation: ChainObservation | None) -> dict:
+def _executability(args, basis: TimeBasis) -> dict:
     """State plainly what the executability check was actually worth."""
 
-    if observation is None:
+    if basis.observation is None:
         return {
             "basis": "supplied-reference",
-            "reference_timestamp": reference_timestamp,
+            "reference_timestamp": basis.reference,
             "chain": None,
             "inclusion_margin_seconds": None,
+            "observed_lag_seconds": None,
             "executable": False,
             "note": (
                 "Judged against a supplied time, not against Base. Reproducible, but not a "
@@ -142,13 +161,15 @@ def _executability(args, reference_timestamp: int, observation: ChainObservation
         }
     return {
         "basis": "chain-observation",
-        "reference_timestamp": reference_timestamp,
-        "chain": observation.as_dict(),
+        "reference_timestamp": basis.reference,
+        "chain": basis.observation.as_dict(),
         "inclusion_margin_seconds": args.inclusion_margin,
+        "observed_lag_seconds": basis.observed_lag,
         "executable": True,
         "note": (
-            "Judged against the latest observed Base block, with an inclusion margin. "
-            "Re-validate immediately before signing; inclusion time is not guaranteed."
+            "Judged against the latest observed Base block, with an inclusion margin that "
+            "already absorbs the node's observed lag. Re-validate immediately before "
+            "signing; inclusion time is not guaranteed."
         ),
     }
 
@@ -188,7 +209,8 @@ def main(argv: list[str] | None = None) -> int:
         })
         if missing:
             raise RuntimeError(f"verified events need dimensions before policy generation: {missing}")
-        reference_timestamp, accept_by, observation = _resolve_time_basis(args)
+        basis = _resolve_time_basis(args)
+        reference_timestamp, accept_by, observation = basis.reference, basis.accept_by, basis.observation
         ids = tuple(str(item["event_id"]) for item in recalled.evidence)
         evidence_commitment = evidence_hash(ids)
         profiles = {}
@@ -223,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
                 require_inclusion_margin(
                     preimage,
                     chain_timestamp=observation.timestamp,
+                    observed_lag_seconds=basis.observed_lag,
                     margin_seconds=args.inclusion_margin,
                 )
             profiles[name] = {
@@ -240,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
             "counterparty": recalled.counterparty,
             "memory_verdict": recalled.verdict,
             "cold_start": recalled.is_cold_start,
-            "executability": _executability(args, reference_timestamp, observation),
+            "executability": _executability(args, basis),
             "profiles": profiles,
             "evidence": list(recalled.evidence),
         }

@@ -59,19 +59,29 @@ uv run wrasse policy <provider-address> \
 deadline is given either way round, and the choice decides what the run is:
 
 - `--accept-window <seconds>` reads the latest Base block and derives the
-  absolute deadline from it. This is a live quote.
-- `--accept-by <unix-deadline>` with `--reference-timestamp <unix-time>` judges
-  the terms against a supplied time instead of reading the chain. The result is
+  absolute deadline from it. A live quote.
+- `--accept-by <unix-deadline>` alone also reads the chain, and checks the
+  supplied deadline against it. This is the form a deadline agreed during
+  negotiation arrives in. Also a live quote.
+- `--accept-by` together with `--reference-timestamp <unix-time>` reads no chain
+  at all and judges the terms against the supplied time. The result is
   reproducible and is labelled **not executable**, because a supplied time is
   not the time Base will enforce.
 
+Supplying neither deadline form, or both, is an error rather than a default.
+
 Every deadline is enforced by the block that mines the transaction, so a live
 quote is checked against observed chain time plus an inclusion margin
-(`--inclusion-margin`, 120 seconds by default) and refuses a deadline too close
-to survive being mined. The local clock is never the authority. It appears only
-as a bound on how far the observed block may be from now, which can refuse a
-reading but never approve one. Each `policy.json` carries an `executability`
-block stating which basis was used and what it is worth.
+(`--inclusion-margin`, 120 seconds by default). The margin also absorbs how far
+behind the read block already was, because a lagging node and a pending
+transaction are the same distance from the real chain tip. Allowing both
+independently is what would let an already expired deadline look comfortable.
+
+The local clock is never the authority. It appears only as a bound on how far
+the observed block may sit from now, and as lag spent out of that margin. Both
+can refuse a quote; neither can approve one. Each `policy.json` carries an
+`executability` block naming the basis, the block observed, the margin and the
+lag, so a consumer never has to infer what the check was worth.
 
 Copy `.env.example` to the gitignored `.env` and add a project-specific
 `OPENROUTER_API_KEY`. `WRASSE_LLM_MODEL` is configurable and defaults to

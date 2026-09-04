@@ -21,6 +21,22 @@ contract SolvencyHandler {
     address[4] public actors;
     uint256[] public dealIds;
 
+    // Successful transitions only. Catching every revert keeps a campaign running, but it
+    // also means a regression that makes a transition always revert would leave the solvency
+    // assertions green. These counters are what distinguishes "held" from "never reached".
+    uint256 public created;
+    uint256 public accepted;
+    uint256 public delivered;
+    uint256 public released;
+    uint256 public paidOut;
+    uint256 public timedOut;
+    uint256 public cancelled;
+    uint256 public withdrawn;
+
+    function transitions() external view returns (uint256) {
+        return created + accepted + delivered + released + paidOut + timedOut + cancelled + withdrawn;
+    }
+
     constructor() {
         escrow = new WrasseEscrow();
         actors = [address(0xA1), address(0xA2), address(0xA3), address(0xA4)];
@@ -49,13 +65,16 @@ contract SolvencyHandler {
     }
 
     function createDeal(uint256 buyerSeed, uint256 priceSeed, uint256 bondSeed, uint256 windowSeed) external {
-        address buyer = actors[buyerSeed % actors.length];
-        address provider = actors[(buyerSeed + 1 + (priceSeed % (actors.length - 1))) % actors.length];
-        if (buyer == provider) return;
+        uint256 buyerIndex = buyerSeed % actors.length;
+        uint256 offset = 1 + (priceSeed % (actors.length - 1));
+        address buyer = actors[buyerIndex];
+        address provider = actors[(buyerIndex + offset) % actors.length];
 
         uint256 price = _bound(priceSeed, 1 ether, 100 ether);
         uint256 bondBps = _bound(bondSeed, 0, 10_000);
-        uint64 window = uint64(_bound(windowSeed, 1, 2 days));
+        // Short enough that deadlines are reachable inside a campaign, long enough that the
+        // acceptance and delivery windows are not trivially closed on the next call.
+        uint64 window = uint64(_bound(windowSeed, 1 hours, 4 hours));
 
         vm.deal(buyer, buyer.balance + price);
         vm.prank(buyer);
@@ -70,72 +89,82 @@ contract SolvencyHandler {
             keccak256("provider-evidence")
         ) returns (uint256 dealId) {
             dealIds.push(dealId);
+            created++;
         } catch {}
     }
 
     function acceptDeal(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pick(dealSeed);
+        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Offered);
         if (!ok) return;
         (, address provider,, uint256 bond,,,,,,,,) = escrow.deals(dealId);
         vm.deal(provider, provider.balance + bond);
         vm.prank(provider);
-        try escrow.acceptDeal{value: bond}(dealId) {} catch {}
+        try escrow.acceptDeal{value: bond}(dealId) { accepted++; } catch {}
     }
 
     function markDelivered(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pick(dealSeed);
+        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Accepted);
         if (!ok) return;
         (, address provider,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(provider);
-        try escrow.markDelivered(dealId) {} catch {}
+        try escrow.markDelivered(dealId) { delivered++; } catch {}
     }
 
     function releaseDeal(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pick(dealSeed);
+        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Delivered);
         if (!ok) return;
         (address buyer,,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(buyer);
-        try escrow.releaseDeal(dealId) {} catch {}
+        try escrow.releaseDeal(dealId) { released++; } catch {}
     }
 
     function claimPayment(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pick(dealSeed);
+        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Delivered);
         if (!ok) return;
         (, address provider,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(provider);
-        try escrow.claimPayment(dealId) {} catch {}
+        try escrow.claimPayment(dealId) { paidOut++; } catch {}
     }
 
     function claimTimeout(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pick(dealSeed);
+        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Accepted);
         if (!ok) return;
         (address buyer,,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(buyer);
-        try escrow.claimTimeout(dealId) {} catch {}
+        try escrow.claimTimeout(dealId) { timedOut++; } catch {}
     }
 
     function cancelUnaccepted(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pick(dealSeed);
+        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Offered);
         if (!ok) return;
         (address buyer,,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(buyer);
-        try escrow.cancelUnaccepted(dealId) {} catch {}
+        try escrow.cancelUnaccepted(dealId) { cancelled++; } catch {}
     }
 
     function withdraw(uint256 actorSeed) external {
         address actor = actors[actorSeed % actors.length];
         vm.prank(actor);
-        try escrow.withdraw(payable(actor)) {} catch {}
+        try escrow.withdraw(payable(actor)) returns (uint256) { withdrawn++; } catch {}
     }
 
     /// @notice Time has to move or no deadline is ever reachable.
     function passTime(uint256 secondsForward) external {
-        vm.warp(block.timestamp + _bound(secondsForward, 1, 3 days));
+        vm.warp(block.timestamp + _bound(secondsForward, 1, 2 hours));
     }
 
-    function _pick(uint256 seed) private view returns (uint256 dealId, bool ok) {
-        if (dealIds.length == 0) return (0, false);
-        return (dealIds[seed % dealIds.length], true);
+    /// @dev Choosing a deal already in the required state, rather than at random, is what
+    /// makes the campaign spend its depth on real transitions instead of on rejections.
+    function _pickInState(uint256 seed, WrasseEscrow.State wanted) private view returns (uint256, bool) {
+        uint256 count = dealIds.length;
+        if (count == 0) return (0, false);
+        uint256 start = seed % count;
+        for (uint256 i = 0; i < count; i++) {
+            uint256 candidate = dealIds[(start + i) % count];
+            (,,,,,,,,,,, WrasseEscrow.State state) = escrow.deals(candidate);
+            if (state == wanted) return (candidate, true);
+        }
+        return (0, false);
     }
 
     function _bound(uint256 value, uint256 low, uint256 high) private pure returns (uint256) {
@@ -149,6 +178,21 @@ contract WrasseEscrowSolvencyInvariant {
     function setUp() public {
         handler = new SolvencyHandler();
     }
+
+    /// @dev Without this the fuzzer also calls the escrow directly, where almost every call
+    /// is rejected on authorisation and the campaign's depth is spent on nothing.
+    function targetContracts() public view returns (address[] memory targets) {
+        targets = new address[](1);
+        targets[0] = address(handler);
+    }
+
+    /// @dev A coverage floor deliberately does NOT live here. `afterInvariant` participates
+    /// in shrinking, so any assertion of the form "the campaign reached state X" is satisfied
+    /// by shrinking the sequence to nothing and reporting that as the counterexample. It
+    /// reports a failure without ever describing a real one. The question it was meant to
+    /// answer, whether every lifecycle state is reachable through this handler at all, is
+    /// answered deterministically by `SolvencyHandlerReachabilityTest` below. The counters on
+    /// the handler remain, and a verbose run prints them.
 
     /// @notice The escrow must always hold enough to honour every deal still open and every
     /// credit not yet collected. Anything less means one deal can spend another's money.
@@ -164,5 +208,63 @@ contract WrasseEscrowSolvencyInvariant {
         require(
             handler.outstandingCredits() <= address(handler.escrow()).balance, "credits exceed the escrow balance"
         );
+    }
+}
+
+
+/// @notice Answers a question the fuzzing campaign cannot: is every lifecycle state actually
+/// reachable through the handler, or does the invariant hold only because some transition
+/// silently never fires?
+contract SolvencyHandlerReachabilityTest {
+    SolvencyHandler private handler;
+
+    function setUp() public {
+        handler = new SolvencyHandler();
+    }
+
+    function testEveryLifecycleStateIsReachableThroughTheHandler() public {
+        // Released, by the buyer.
+        handler.createDeal(0, 1, 1, 1);
+        handler.acceptDeal(0);
+        handler.markDelivered(0);
+        handler.releaseDeal(0);
+        require(handler.released() == 1, "release never fired");
+
+        // Released, by the provider after the payout delay.
+        handler.createDeal(1, 1, 1, 1);
+        handler.acceptDeal(0);
+        handler.markDelivered(0);
+        for (uint256 i = 0; i < 4; i++) {
+            handler.passTime(7199);
+        }
+        handler.claimPayment(0);
+        require(handler.paidOut() == 1, "claimPayment never fired");
+
+        // Timed out.
+        handler.createDeal(2, 1, 1, 1);
+        handler.acceptDeal(0);
+        for (uint256 i = 0; i < 4; i++) {
+            handler.passTime(7199);
+        }
+        handler.claimTimeout(0);
+        require(handler.timedOut() == 1, "claimTimeout never fired");
+
+        // Cancelled after an unaccepted offer expired.
+        handler.createDeal(3, 1, 1, 1);
+        for (uint256 i = 0; i < 4; i++) {
+            handler.passTime(7199);
+        }
+        handler.cancelUnaccepted(0);
+        require(handler.cancelled() == 1, "cancelUnaccepted never fired");
+
+        // And the credits those settlements produced can be collected.
+        for (uint256 i = 0; i < 4; i++) {
+            handler.withdraw(i);
+        }
+        require(handler.withdrawn() > 0, "withdraw never fired");
+        require(handler.created() == 4 && handler.accepted() == 3, "creation or acceptance never fired");
+        require(handler.delivered() == 2, "delivery never fired");
+        require(handler.outstandingCredits() == 0, "credits were left behind");
+        require(address(handler.escrow()).balance == handler.openLiabilities(), "balance does not match liabilities");
     }
 }

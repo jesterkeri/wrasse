@@ -1,8 +1,12 @@
 """Cross-language canonical policy commitments.
 
 The tuple encoded here must match `WrasseEscrow.computePolicyHash` exactly, in order.
-Every field is a term the contract itself enforces: committing to anything less would make
-the claim that the contract commits to the terms it enforces untrue.
+
+Every contract-enforced deal parameter is included, alongside the engine-version and
+evidence commitments, which the contract fixes but does not interpret. Leaving out an
+enforced parameter would make the claim that the contract commits to the terms it enforces
+untrue; the two evidence hashes and the engine version are opaque commitments, not terms the
+contract acts on.
 """
 
 from __future__ import annotations
@@ -185,21 +189,32 @@ def require_inclusion_margin(
     preimage: PolicyPreimage,
     *,
     chain_timestamp: int,
+    observed_lag_seconds: int,
     margin_seconds: int = DEFAULT_INCLUSION_MARGIN_SECONDS,
 ) -> None:
     """Refuse a deadline that is technically still open but will not survive inclusion.
 
     Kept separate from `validate_creatable` on purpose. That function answers exactly what
     the contract would do at a given instant, and must stay an exact mirror. This one adds
-    the operational margin between deciding to sign and actually being mined.
+    the operational distance between deciding to sign and actually being mined.
+
+    ``observed_lag_seconds`` is how far behind the read block already was. A lagging node and
+    an inclusion margin are the same kind of distance from the real chain tip, so the lag is
+    spent out of the margin rather than tolerated beside it. Allowing both independently is
+    what lets an already expired deadline look comfortable.
     """
 
     if margin_seconds < 0:
         raise ValueError("inclusion margin cannot be negative")
-    if preimage.accept_by <= chain_timestamp + margin_seconds:
+    if observed_lag_seconds < 0:
+        raise ValueError("observed lag cannot be negative")
+
+    earliest_safe = chain_timestamp + margin_seconds + observed_lag_seconds
+    if preimage.accept_by <= earliest_safe:
         raise PolicyNotCreatable(
-            f"accept_by leaves less than {margin_seconds}s after the observed chain time; "
-            "the deal would likely expire before the transaction is mined"
+            f"accept_by leaves at most {margin_seconds}s beyond the observed chain time once "
+            f"{observed_lag_seconds}s of node lag is spent; the deal would likely expire "
+            "before the transaction is mined"
         )
 
 

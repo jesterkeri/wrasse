@@ -20,15 +20,18 @@ CHAIN_ID = 84532
 
 
 class _Eth:
-    def __init__(self, chain_id, timestamp, number=1_000, error=None):
+    def __init__(self, chain_id, timestamp, number=1_000, error=None, block=None):
         self.chain_id = chain_id
         self._timestamp = timestamp
         self._number = number
         self._error = error
+        self._block = block
 
     def get_block(self, _which):
         if self._error is not None:
             raise self._error
+        if self._block is not None:
+            return self._block
         return {"number": self._number, "timestamp": self._timestamp}
 
 
@@ -48,7 +51,7 @@ def test_a_chain_on_the_wrong_id_is_refused():
 
 def test_an_unreachable_node_refuses_rather_than_guessing():
     web3 = _Web3(chain_id=CHAIN_ID, timestamp=1_000, error=ConnectionError("no route"))
-    with pytest.raises(ChainTimeUnavailable, match="could not read the latest block"):
+    with pytest.raises(ChainTimeUnavailable, match="could not read a usable latest block"):
         observe_chain_time(web3, expected_chain_id=CHAIN_ID)
 
 
@@ -99,7 +102,7 @@ def test_a_deadline_inside_the_inclusion_margin_is_refused(tmp_path, monkeypatch
     _stub_chain(monkeypatch, chain_id=CHAIN_ID, timestamp=now)
     monkeypatch.setattr("wrasse.cli.time.time", lambda: now)
 
-    with pytest.raises(PolicyNotCreatable, match="leaves less than 120s"):
+    with pytest.raises(PolicyNotCreatable, match="leaves at most 120s"):
         main(_policy_argv("--accept-window", "30"))
 
 
@@ -125,3 +128,107 @@ def test_the_time_basis_must_be_unambiguous(tmp_path, monkeypatch, capsys, extra
     with pytest.raises(SystemExit):
         main(_policy_argv(*extra))
     assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"number": 1},
+        {"number": 1, "timestamp": None},
+        {"number": 1, "timestamp": "not-a-number"},
+        {"number": 1, "timestamp": 0},
+        {"number": 1, "timestamp": -5},
+    ],
+)
+def test_a_malformed_block_surfaces_as_this_modules_own_error(block):
+    """Fail closed is not enough; it has to fail closed through the declared boundary.
+
+    A KeyError escaping from here would bypass the handling a caller writes for an
+    unreliable node.
+    """
+    web3 = _Web3(chain_id=CHAIN_ID, timestamp=0, block=block)
+    with pytest.raises(ChainTimeUnavailable):
+        observe_chain_time(web3, expected_chain_id=CHAIN_ID)
+
+
+def test_node_lag_is_spent_out_of_the_inclusion_margin():
+    """A lagging node and an inclusion margin are the same distance from the real tip.
+
+    Allowing the full skew bound alongside the full margin let an already expired deadline
+    be labelled executable, because each check passed on its own.
+    """
+    from wrasse.policy_hash import PolicyNotCreatable, PolicyPreimage, require_inclusion_margin
+
+    def _preimage(accept_by):
+        return PolicyPreimage(
+            buyer=BUYER,
+            provider=PROVIDER,
+            price=10**18,
+            bond_bps=2_000,
+            accept_by=accept_by,
+            service_window=7_200,
+            payout_delay=1_800,
+            engine_version="wrasse/0.1.0",
+            buyer_evidence_hash="0x" + "00" * 32,
+            provider_evidence_hash="0x" + "00" * 32,
+        )
+
+    block_time = 1_000
+
+    # No lag: the margin alone decides, and equality is rejected.
+    require_inclusion_margin(
+        _preimage(block_time + 121), chain_timestamp=block_time, observed_lag_seconds=0, margin_seconds=120
+    )
+    with pytest.raises(PolicyNotCreatable):
+        require_inclusion_margin(
+            _preimage(block_time + 120), chain_timestamp=block_time, observed_lag_seconds=0, margin_seconds=120
+        )
+
+    # The case the composition used to let through: the deadline is already in the past
+    # relative to local time, yet cleared the margin against a stale block.
+    with pytest.raises(PolicyNotCreatable, match="300s of node lag"):
+        require_inclusion_margin(
+            _preimage(block_time + 121), chain_timestamp=block_time, observed_lag_seconds=300, margin_seconds=120
+        )
+
+    # Lag is spent, not merely noticed: the deadline has to clear both.
+    require_inclusion_margin(
+        _preimage(block_time + 421), chain_timestamp=block_time, observed_lag_seconds=300, margin_seconds=120
+    )
+    with pytest.raises(PolicyNotCreatable):
+        require_inclusion_margin(
+            _preimage(block_time + 420), chain_timestamp=block_time, observed_lag_seconds=300, margin_seconds=120
+        )
+    with pytest.raises(PolicyNotCreatable):
+        require_inclusion_margin(
+            _preimage(block_time + 419), chain_timestamp=block_time, observed_lag_seconds=299, margin_seconds=120
+        )
+
+
+def test_a_lagging_node_cannot_produce_a_live_quote_for_a_short_window(tmp_path, monkeypatch):
+    """End to end, through the CLI, at the boundary the two checks used to miss together."""
+    from wrasse.policy_hash import PolicyNotCreatable
+
+    monkeypatch.setenv("WRASSE_MEMORY_PATH", str(tmp_path / "memory.db"))
+    block_time = 1_760_000_000
+    _stub_chain(monkeypatch, chain_id=CHAIN_ID, timestamp=block_time)
+    monkeypatch.setattr("wrasse.cli.time.time", lambda: block_time + 300)
+
+    with pytest.raises(PolicyNotCreatable, match="300s of node lag"):
+        main(_policy_argv("--accept-window", "121"))
+
+
+def test_an_absolute_deadline_can_be_checked_against_the_live_chain(tmp_path, monkeypatch, capsys):
+    """The third supported form: a deadline agreed during negotiation, verified live."""
+    monkeypatch.setenv("WRASSE_MEMORY_PATH", str(tmp_path / "memory.db"))
+    now = 1_760_000_000
+    _stub_chain(monkeypatch, chain_id=CHAIN_ID, timestamp=now, number=99)
+    monkeypatch.setattr("wrasse.cli.time.time", lambda: now)
+
+    assert main(_policy_argv("--accept-by", str(now + 3_600))) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["executability"]["basis"] == "chain-observation"
+    assert output["executability"]["executable"] is True
+    assert output["executability"]["observed_lag_seconds"] == 0
+    for value in output["profiles"].values():
+        assert value["policy_preimage"]["accept_by"] == now + 3_600

@@ -922,8 +922,21 @@ contract WrasseEscrowTest {
         uint256 payoutDelay,
         bool creatable
     ) private {
+        // A silent narrowing cast would let this harness exercise a truncated value while
+        // Python exercised the original, so both suites could report the same verdict for
+        // different reasons. An unrepresentable vector is a rejected producer input, and is
+        // never handed to createDeal in a form the contract could accept.
+        uint256 acceptByWide = block.timestamp + acceptByOffset;
+        if (
+            acceptByOffset > type(uint64).max || serviceWindow > type(uint64).max
+                || payoutDelay > type(uint64).max || acceptByWide > type(uint64).max
+        ) {
+            require(!creatable, "a vector outside uint64 cannot be creatable");
+            return;
+        }
+
         vm.deal(BUYER, price);
-        uint64 acceptBy = uint64(block.timestamp + acceptByOffset);
+        uint64 acceptBy = uint64(acceptByWide);
 
         vm.prank(BUYER);
         if (!creatable) {
