@@ -76,10 +76,24 @@ class PolicyPreimage:
 
 
 def _bytes32(value: str) -> bytes:
-    raw = bytes.fromhex(value.removeprefix("0x"))
+    text = value.strip()
+    if text[:2].lower() == "0x":
+        text = text[2:]
+    raw = bytes.fromhex(text)
     if len(raw) != 32:
         raise ValueError("expected bytes32")
     return raw
+
+
+def canonical_event_id(value: str) -> str:
+    """One spelling for one receipt.
+
+    The same 32 bytes can be written prefixed or bare, upper case or lower. Two components
+    that disagree on which spellings are equal will disagree on how many receipts they are
+    looking at, so both the commitment and the engine normalise through here first.
+    """
+
+    return "0x" + _bytes32(value).hex()
 
 
 def evidence_hash(event_ids: Iterable[str]) -> str:
@@ -92,7 +106,7 @@ def evidence_hash(event_ids: Iterable[str]) -> str:
     twice describes the same evidence and must not produce a different commitment.
     """
 
-    ordered = sorted({_bytes32(item) for item in event_ids})
+    ordered = sorted({_bytes32(item) for item in event_ids})  # canonical bytes, so spelling cannot split a set
     return "0x" + bytes(Web3.keccak(encode(["bytes32[]"], [ordered]))).hex()
 
 
@@ -146,12 +160,46 @@ def validate_creatable(preimage: PolicyPreimage, *, reference_timestamp: int) ->
         if duration > MAX_DURATION:
             raise PolicyNotCreatable(f"{label} exceeds the {MAX_DURATION} second bound")
 
+    # Solidity computes this product under checked arithmetic and reverts on overflow.
+    # Python's integers are unbounded, so without this the mirror is not exact.
+    if preimage.bond_bps > 0 and preimage.price > _UINT256_MAX // preimage.bond_bps:
+        raise PolicyNotCreatable(
+            "price multiplied by bond_bps overflows uint256; the contract reverts in checked arithmetic"
+        )
+
     # ZeroBond
     bond_wei = (preimage.price * preimage.bond_bps) // BPS_DENOMINATOR
     if preimage.bond_bps > 0 and bond_wei == 0:
         raise PolicyNotCreatable(
             "a nonzero bond rate rounds to zero wei at this price; the contract refuses to "
             "sell unbonded protection"
+        )
+
+
+#: How much later than the observed chain time a deal may realistically be mined. An
+#: acceptance deadline closer than this is already too late to be worth signing.
+DEFAULT_INCLUSION_MARGIN_SECONDS = 120
+
+
+def require_inclusion_margin(
+    preimage: PolicyPreimage,
+    *,
+    chain_timestamp: int,
+    margin_seconds: int = DEFAULT_INCLUSION_MARGIN_SECONDS,
+) -> None:
+    """Refuse a deadline that is technically still open but will not survive inclusion.
+
+    Kept separate from `validate_creatable` on purpose. That function answers exactly what
+    the contract would do at a given instant, and must stay an exact mirror. This one adds
+    the operational margin between deciding to sign and actually being mined.
+    """
+
+    if margin_seconds < 0:
+        raise ValueError("inclusion margin cannot be negative")
+    if preimage.accept_by <= chain_timestamp + margin_seconds:
+        raise PolicyNotCreatable(
+            f"accept_by leaves less than {margin_seconds}s after the observed chain time; "
+            "the deal would likely expire before the transaction is mined"
         )
 
 

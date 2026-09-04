@@ -6,6 +6,7 @@ failure only surfaces after both sides have already agreed terms.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
@@ -25,7 +26,9 @@ BUYER = "0x4444444444444444444444444444444444444444"
 PROVIDER = "0x3333333333333333333333333333333333333333"
 REFERENCE = 1_700_000_000
 
-CONTRACT = pathlib.Path(__file__).resolve().parents[1] / "contracts" / "src" / "WrasseEscrow.sol"
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+CONTRACT = ROOT / "contracts" / "src" / "WrasseEscrow.sol"
+VECTORS = ROOT / "contracts" / "test" / "fixtures" / "policy-vectors.json"
 
 
 def _preimage(**overrides) -> PolicyPreimage:
@@ -50,7 +53,11 @@ def _check(**overrides) -> None:
 
 
 def test_the_bounds_match_the_deployed_contract():
-    """Duplicated constants drift silently. Read the Solidity and fail loudly if they do."""
+    """A cheap alarm on drifting constants, not a proof of equivalence.
+
+    It reads text, so it cannot see behaviour. The differential vectors below are what
+    actually establish that the two implementations agree.
+    """
     source = CONTRACT.read_text(encoding="utf-8")
     assert re.search(r"MAX_DURATION\s*=\s*30 days;", source)
     assert MAX_DURATION == 30 * 24 * 60 * 60
@@ -123,3 +130,45 @@ def test_the_verdict_does_not_depend_on_the_clock():
     validate_creatable(preimage, reference_timestamp=REFERENCE)
     with pytest.raises(PolicyNotCreatable, match="not in the future"):
         validate_creatable(preimage, reference_timestamp=REFERENCE + 10)
+
+
+def _vectors():
+    doc = json.loads(VECTORS.read_text(encoding="utf-8"))
+    columns = ("label", "price", "bondBps", "acceptByOffset", "serviceWindow", "payoutDelay", "creatable")
+    rows = list(zip(*(doc[name] for name in columns), strict=True))
+    assert rows, "no vectors loaded"
+    return rows
+
+
+@pytest.mark.parametrize("row", _vectors(), ids=lambda row: row[0])
+def test_python_reaches_the_same_verdict_as_the_contract(row):
+    """The same terms, through both implementations.
+
+    `contracts/test/WrasseEscrow.t.sol` runs this identical file through `createDeal`.
+    Agreeing on constants proves nothing; agreeing on verdicts is the actual claim.
+    """
+    label, price, bond_bps, accept_by_offset, service_window, payout_delay, creatable = row
+    preimage = _preimage(
+        price=int(price, 16),
+        bond_bps=int(bond_bps, 16),
+        accept_by=REFERENCE + int(accept_by_offset, 16),
+        service_window=int(service_window, 16),
+        payout_delay=int(payout_delay, 16),
+    )
+    if creatable:
+        validate_creatable(preimage, reference_timestamp=REFERENCE)
+        return
+    with pytest.raises(PolicyNotCreatable):
+        validate_creatable(preimage, reference_timestamp=REFERENCE)
+
+
+def test_the_overflow_vector_is_the_one_unbounded_python_would_have_missed():
+    """Python integers do not overflow; Solidity's checked multiplication does.
+
+    Without an explicit check the two implementations disagree only at the extreme, which is
+    exactly where nobody looks.
+    """
+    ceiling = (2**256 - 1) // 10_000
+    validate_creatable(_preimage(price=ceiling, bond_bps=10_000), reference_timestamp=REFERENCE)
+    with pytest.raises(PolicyNotCreatable, match="overflows uint256"):
+        validate_creatable(_preimage(price=ceiling + 1, bond_bps=10_000), reference_timestamp=REFERENCE)

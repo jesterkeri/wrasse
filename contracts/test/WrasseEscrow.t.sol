@@ -17,8 +17,12 @@ interface Vm {
     function startPrank(address sender) external;
     function stopPrank() external;
     function warp(uint256 newTimestamp) external;
+    function expectRevert() external;
     function expectRevert(bytes4 selector) external;
     function expectRevert(bytes calldata revertData) external;
+    function readFile(string calldata path) external view returns (string memory);
+    function parseJsonUintArray(string calldata json, string calldata key) external pure returns (uint256[] memory);
+    function parseJsonBoolArray(string calldata json, string calldata key) external pure returns (bool[] memory);
 }
 
 contract ReentrantBuyer {
@@ -725,6 +729,10 @@ contract WrasseEscrowTest {
         // It can strand its own credit, and nothing else.
         vm.expectRevert(WrasseEscrow.TransferFailed.selector);
         rejecting.collect();
+
+        // The failed withdrawal reverted whole: the credit is still owed and still held.
+        _assertEq(escrow.withdrawable(address(rejecting)), PRICE + BOND);
+        _assertEq(address(escrow).balance, PRICE + BOND);
     }
 
     /// @notice The mirror image: a buyer that refuses ETH must not be able to hold a deal in
@@ -875,6 +883,64 @@ contract WrasseEscrowTest {
         escrow.markDelivered(dealId);
         vm.prank(BUYER);
         escrow.releaseDeal(dealId);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Cross-language agreement
+    // ---------------------------------------------------------------------------------
+
+    /// @notice The Python producer claims to mirror this contract's creation rules. Matching
+    /// constants would not show that; only running the same terms through both does. The same
+    /// file drives `tests/test_policy_rules.py`.
+    function testEveryPolicyVectorAgreesWithThePythonValidator() public {
+        string memory json = vm.readFile("test/fixtures/policy-vectors.json");
+        uint256[] memory price = vm.parseJsonUintArray(json, ".price");
+        uint256[] memory bondBps = vm.parseJsonUintArray(json, ".bondBps");
+        uint256[] memory acceptByOffset = vm.parseJsonUintArray(json, ".acceptByOffset");
+        uint256[] memory serviceWindow = vm.parseJsonUintArray(json, ".serviceWindow");
+        uint256[] memory payoutDelay = vm.parseJsonUintArray(json, ".payoutDelay");
+        bool[] memory creatable = vm.parseJsonBoolArray(json, ".creatable");
+
+        require(price.length > 0, "no vectors loaded");
+        require(
+            bondBps.length == price.length && acceptByOffset.length == price.length
+                && serviceWindow.length == price.length && payoutDelay.length == price.length
+                && creatable.length == price.length,
+            "vector columns are ragged"
+        );
+
+        for (uint256 i = 0; i < price.length; i++) {
+            _runVector(price[i], bondBps[i], acceptByOffset[i], serviceWindow[i], payoutDelay[i], creatable[i]);
+        }
+    }
+
+    function _runVector(
+        uint256 price,
+        uint256 bondBps,
+        uint256 acceptByOffset,
+        uint256 serviceWindow,
+        uint256 payoutDelay,
+        bool creatable
+    ) private {
+        vm.deal(BUYER, price);
+        uint64 acceptBy = uint64(block.timestamp + acceptByOffset);
+
+        vm.prank(BUYER);
+        if (!creatable) {
+            // The rejection reason varies, including an arithmetic panic on the overflow
+            // vector, so only the verdict is compared.
+            vm.expectRevert();
+        }
+        escrow.createDeal{value: price}(
+            PROVIDER,
+            bondBps,
+            acceptBy,
+            uint64(serviceWindow),
+            uint64(payoutDelay),
+            ENGINE_VERSION_HASH,
+            BUYER_EVIDENCE_HASH,
+            EMPTY_EVIDENCE_HASH
+        );
     }
 
     function _create() private returns (uint256) {

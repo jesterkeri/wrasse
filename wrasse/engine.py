@@ -7,6 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable
 
 from .dimensions import DimensionDefinition
+from .policy_hash import canonical_event_id
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,7 @@ def produce_terms(
     service_window = base_service_window + _round_decimal(
         risk * profile.window_buffer_seconds
     )
-    identifiers = tuple(sorted(str(event["event_id"]) for event in events))
+    identifiers = tuple(sorted(canonical_event_id(str(event["event_id"])) for event in events))
     return DealTerms(
         profile=profile.name,
         price_wei=price,
@@ -93,14 +94,22 @@ def _unique_by_event_id(evidence: Iterable[dict[str, Any]]) -> tuple[dict[str, A
     against a counterparty on the strength of one event counted twice.
     """
 
-    seen: set[str] = set()
+    seen: dict[str, dict[str, Any]] = {}
     unique: list[dict[str, Any]] = []
     for event in evidence:
-        identifier = str(event["event_id"])
-        if identifier in seen:
+        identifier = canonical_event_id(str(event["event_id"]))
+        # Compare the normalised record, so a differently spelled id is the same record and
+        # only a genuinely different body counts as a conflict.
+        normalised = {**event, "event_id": identifier}
+        previous = seen.get(identifier)
+        if previous is not None:
+            if previous != normalised:
+                # Same receipt, two different stories. Keeping whichever arrived first would
+                # make the terms depend on result ordering while the commitment stayed put.
+                raise ValueError(f"conflicting records share event id {identifier}")
             continue
-        seen.add(identifier)
-        unique.append(event)
+        seen[identifier] = normalised
+        unique.append(normalised)
     return tuple(unique)
 
 

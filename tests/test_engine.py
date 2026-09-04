@@ -79,3 +79,68 @@ def test_a_repeated_recall_does_not_count_twice():
     once = produce_terms(evidence=[event], **common)
     twice = produce_terms(evidence=[event, dict(event)], **common)
     assert once == twice
+
+
+def _dimension():
+    return DimensionDefinition(
+        dimension_id="model_created_dimension",
+        source_event_type="model_created_event_name",
+        signal_direction="negative",
+        severity=0.8,
+        confidence=0.5,
+        applies_when=("deadline_sensitive",),
+    )
+
+
+def test_the_same_receipt_spelled_differently_is_one_receipt():
+    """The commitment and the engine must agree on what counts as one piece of evidence.
+
+    The same 32 bytes can be written prefixed or bare, upper case or lower. If the two
+    components disagreed, one receipt would move the terms while the commitment recorded a
+    single member, and the hash would no longer describe the evidence that priced the deal.
+    """
+    from wrasse.policy_hash import evidence_hash
+
+    prefixed = "0x" + "ab" * 32
+    bare_upper = ("AB" * 32)
+    common = dict(
+        dimensions=[_dimension()],
+        profile=PROFILES["urgent"],
+        base_price_wei=10_000,
+        base_bond_bps=500,
+        base_service_window=3_600,
+    )
+    once = produce_terms(
+        evidence=[{"event_id": prefixed, "event_type": "model_created_event_name"}], **common
+    )
+    spelled_twice = produce_terms(
+        evidence=[
+            {"event_id": prefixed, "event_type": "model_created_event_name"},
+            {"event_id": bare_upper, "event_type": "model_created_event_name"},
+        ],
+        **common,
+    )
+    assert once == spelled_twice
+    assert evidence_hash([prefixed, bare_upper]) == evidence_hash([prefixed])
+
+
+def test_two_different_stories_about_one_receipt_fail_closed():
+    """Silently keeping whichever arrived first makes terms depend on result ordering."""
+    import pytest
+
+    event_id = "0x" + "cd" * 32
+    common = dict(
+        dimensions=[_dimension()],
+        profile=PROFILES["urgent"],
+        base_price_wei=10_000,
+        base_bond_bps=500,
+        base_service_window=3_600,
+    )
+    with pytest.raises(ValueError, match="conflicting records"):
+        produce_terms(
+            evidence=[
+                {"event_id": event_id, "event_type": "model_created_event_name"},
+                {"event_id": event_id, "event_type": "something_else"},
+            ],
+            **common,
+        )

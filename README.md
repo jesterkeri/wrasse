@@ -51,14 +51,27 @@ uv run wrasse reconcile-timeout <tx-hash> --deal-id <id> --provider <address>
 uv run wrasse learn-dimension <event-id>
 uv run wrasse policy <provider-address> \
   --buyer <buyer-address> \
-  --accept-by <unix-deadline> \
+  --accept-window 3600 \
   --output policy.json
 ```
 
-`--buyer` and `--accept-by` are required because the contract commits to both.
-`--accept-by` is an absolute deadline rather than a window, so that identical
-inputs always produce an identical commitment. Add `--reference-timestamp` to
-fix the time the deadline is judged against and make a run fully reproducible.
+`--buyer` is required because the contract commits to it. The acceptance
+deadline is given either way round, and the choice decides what the run is:
+
+- `--accept-window <seconds>` reads the latest Base block and derives the
+  absolute deadline from it. This is a live quote.
+- `--accept-by <unix-deadline>` with `--reference-timestamp <unix-time>` judges
+  the terms against a supplied time instead of reading the chain. The result is
+  reproducible and is labelled **not executable**, because a supplied time is
+  not the time Base will enforce.
+
+Every deadline is enforced by the block that mines the transaction, so a live
+quote is checked against observed chain time plus an inclusion margin
+(`--inclusion-margin`, 120 seconds by default) and refuses a deadline too close
+to survive being mined. The local clock is never the authority. It appears only
+as a bound on how far the observed block may be from now, which can refuse a
+reading but never approve one. Each `policy.json` carries an `executability`
+block stating which basis was used and what it is worth.
 
 Copy `.env.example` to the gitignored `.env` and add a project-specific
 `OPENROUTER_API_KEY`. `WRASSE_LLM_MODEL` is configurable and defaults to
@@ -78,8 +91,9 @@ bytes32 engineVersionHash
 bytes32 buyerEvidenceHash     bytes32 providerEvidenceHash
 ```
 
-Every field is a term the contract itself enforces, and every field is present
-in the creation receipt: `DealCreated` carries the economics and `DealCommitment`
+Every contract-enforced deal parameter is included, alongside the engine-version
+and evidence commitments, which the contract fixes but does not interpret. Every
+field is present in the creation receipt: `DealCreated` carries the economics and `DealCommitment`
 carries the memory half, both emitted in the same transaction and correlated by
 deal id and by the commitment itself. `providerBondBps` is emitted alongside the
 rounded absolute bond because integer division makes the rate unrecoverable from
@@ -91,9 +105,10 @@ provider; `providerEvidenceHash` commits to the reverse. Both are opaque. The
 contract fixes what each side committed to and proves neither side changed it
 afterwards. It does not prove either side assigned a truthful set to its role.
 
-The Python and Solidity suites share an exact fixture to prevent encoding drift,
-and `wrasse/policy_hash.py` refuses to quote terms `createDeal` would reject,
-so a displayed policy and an executable policy are the same thing.
+The Python and Solidity suites share an exact fixture to prevent encoding drift.
+They also share one file of policy vectors: Solidity runs each through
+`createDeal` and Python runs the same through `validate_creatable`, so the claim
+that the producer mirrors the contract is tested rather than asserted.
 
 The provider asserts delivery before the deadline. The buyer may release early.
 Otherwise the provider may claim payment after the payout delay elapses.

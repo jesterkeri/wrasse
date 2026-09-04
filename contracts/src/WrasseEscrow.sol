@@ -99,10 +99,12 @@ contract WrasseEscrow {
     /// @notice A credited balance has left the contract.
     event Withdrawn(address indexed account, address indexed recipient, uint256 amount);
 
-    /// @dev Kept on the settlement functions even though none of them calls out any more.
-    /// They share the lock with `withdraw`, so a recipient cannot re-enter a state transition
-    /// while its own withdrawal is in flight, and a future edit that reintroduces a call
-    /// inherits the guard rather than silently losing it.
+    /// @dev Kept on the credit-producing terminal transitions even though none of them calls
+    /// out any more. They share the lock with `withdraw`, so a recipient cannot re-enter a
+    /// settlement while its own withdrawal is in flight, and a future edit that reintroduces
+    /// a call inherits the guard rather than silently losing it. `createDeal`, `acceptDeal`
+    /// and `markDelivered` are deliberately unguarded: they produce no credit, and both
+    /// payable ones add funded liability equal to the value they receive.
     modifier nonReentrant() {
         if (_locked != 1) revert ReentrantCall();
         _locked = 2;

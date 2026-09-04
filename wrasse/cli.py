@@ -12,17 +12,28 @@ from dotenv import load_dotenv
 from sibyl_memory_client import MemoryClient
 from web3 import HTTPProvider, Web3
 
+from .chain_time import ChainObservation, observe_chain_time, require_recent
 from .dimensions import get_or_create_dimension, load_dimensions
 from .engine import PROFILES, produce_terms
 from .memory_gate import recall_counterparty_evidence
 from .policy_hash import (
+    DEFAULT_INCLUSION_MARGIN_SECONDS,
     EMPTY_EVIDENCE_HASH,
     PolicyPreimage,
     evidence_hash,
     policy_hash,
+    require_inclusion_margin,
     validate_creatable,
 )
 from .reconciler import reconcile_timeout_claim
+
+
+def _web3() -> Web3:
+    return Web3(HTTPProvider(os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")))
+
+
+def _chain_id() -> int:
+    return int(os.getenv("BASE_SEPOLIA_CHAIN_ID", "84532"))
 
 
 def _memory() -> MemoryClient:
@@ -48,11 +59,20 @@ def build_parser() -> argparse.ArgumentParser:
     policy.add_argument(
         "--accept-by",
         type=int,
-        required=True,
+        default=None,
         help=(
-            "absolute unix deadline for provider acceptance. Required rather than derived "
-            "from the clock: a commitment that moves on every run is not a commitment. "
-            "The orchestrator will supply this immediately before signing."
+            "absolute unix deadline for provider acceptance. Fixed rather than derived from "
+            "a clock at hash time: a commitment that moves on every run is not a commitment."
+        ),
+    )
+    policy.add_argument(
+        "--accept-window",
+        type=int,
+        default=None,
+        help=(
+            "seconds of acceptance time, converted to an absolute deadline using the "
+            "observed chain time. Live quotes only; there is no chain time to derive from "
+            "when a reference timestamp is supplied."
         ),
     )
     policy.add_argument(
@@ -60,9 +80,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "unix time that acceptance is measured against when checking the terms are "
-            "executable onchain. Defaults to now. Supply it to make a run reproducible."
+            "judge the terms against this unix time instead of reading the chain. Produces a "
+            "reproducible fixture, NOT a live quote: the result is labelled not executable, "
+            "because a supplied time is not the time Base will enforce."
         ),
+    )
+    policy.add_argument(
+        "--inclusion-margin",
+        type=int,
+        default=DEFAULT_INCLUSION_MARGIN_SECONDS,
+        help="seconds a live quote must still have left after the observed chain time",
     )
     policy.add_argument("--output", type=Path)
     reconcile = sub.add_parser("reconcile-timeout", help="verify a timeout receipt and persist it")
@@ -70,6 +97,60 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--deal-id", type=int, required=True)
     reconcile.add_argument("--provider", required=True)
     return parser
+
+
+def _resolve_time_basis(args) -> tuple[int, int, ChainObservation | None]:
+    """Decide what "now" means for this run, and refuse to guess.
+
+    Either the caller supplies a reference time, in which case the output is a reproducible
+    fixture and is labelled as one, or the chain is read and the quote is live. The local
+    clock is never the authority; it appears only as a sanity check that can refuse an
+    observation, never approve one.
+    """
+
+    parser = build_parser()
+    if (args.accept_by is None) == (args.accept_window is None):
+        parser.error("supply exactly one of --accept-by or --accept-window")
+
+    if args.reference_timestamp is not None:
+        if args.accept_window is not None:
+            parser.error("--accept-window needs chain time; use --accept-by with --reference-timestamp")
+        return args.reference_timestamp, args.accept_by, None
+
+    observation = observe_chain_time(_web3(), expected_chain_id=_chain_id())
+    require_recent(observation, local_now=int(time.time()))
+    accept_by = (
+        args.accept_by if args.accept_by is not None else observation.timestamp + args.accept_window
+    )
+    return observation.timestamp, accept_by, observation
+
+
+def _executability(args, reference_timestamp: int, observation: ChainObservation | None) -> dict:
+    """State plainly what the executability check was actually worth."""
+
+    if observation is None:
+        return {
+            "basis": "supplied-reference",
+            "reference_timestamp": reference_timestamp,
+            "chain": None,
+            "inclusion_margin_seconds": None,
+            "executable": False,
+            "note": (
+                "Judged against a supplied time, not against Base. Reproducible, but not a "
+                "live quote: re-derive the deadline from chain time before signing."
+            ),
+        }
+    return {
+        "basis": "chain-observation",
+        "reference_timestamp": reference_timestamp,
+        "chain": observation.as_dict(),
+        "inclusion_margin_seconds": args.inclusion_margin,
+        "executable": True,
+        "note": (
+            "Judged against the latest observed Base block, with an inclusion margin. "
+            "Re-validate immediately before signing; inclusion time is not guaranteed."
+        ),
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,9 +188,7 @@ def main(argv: list[str] | None = None) -> int:
         })
         if missing:
             raise RuntimeError(f"verified events need dimensions before policy generation: {missing}")
-        reference_timestamp = (
-            args.reference_timestamp if args.reference_timestamp is not None else int(time.time())
-        )
+        reference_timestamp, accept_by, observation = _resolve_time_basis(args)
         ids = tuple(str(item["event_id"]) for item in recalled.evidence)
         evidence_commitment = evidence_hash(ids)
         profiles = {}
@@ -127,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
                 provider=args.provider,
                 price=terms.price_wei,
                 bond_bps=terms.provider_bond_bps,
-                accept_by=args.accept_by,
+                accept_by=accept_by,
                 service_window=terms.service_window,
                 payout_delay=args.payout_delay,
                 engine_version="wrasse/0.1.0",
@@ -140,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:
             # A quote the chain would refuse is not a quote. Checking here, rather than at
             # broadcast, keeps the displayed policy and the executable policy the same thing.
             validate_creatable(preimage, reference_timestamp=reference_timestamp)
+            if observation is not None:
+                require_inclusion_margin(
+                    preimage,
+                    chain_timestamp=observation.timestamp,
+                    margin_seconds=args.inclusion_margin,
+                )
             profiles[name] = {
                 "terms": {
                     "price_wei": terms.price_wei,
@@ -155,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
             "counterparty": recalled.counterparty,
             "memory_verdict": recalled.verdict,
             "cold_start": recalled.is_cold_start,
+            "executability": _executability(args, reference_timestamp, observation),
             "profiles": profiles,
             "evidence": list(recalled.evidence),
         }
@@ -165,13 +251,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "reconcile-timeout":
         contract = os.environ["WRASSE_ESCROW_ADDRESS"]
-        chain_id = int(os.getenv("BASE_SEPOLIA_CHAIN_ID", "84532"))
-        web3 = Web3(HTTPProvider(os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")))
         result = reconcile_timeout_claim(
             _memory(),
-            web3,
+            _web3(),
             tx_hash=args.tx_hash,
-            expected_chain_id=chain_id,
+            expected_chain_id=_chain_id(),
             expected_contract=contract,
             expected_deal_id=args.deal_id,
             expected_provider=args.provider,

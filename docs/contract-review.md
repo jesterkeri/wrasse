@@ -38,6 +38,14 @@ the exact ABI encoding.
   further transition.
 - Credits from several deals aggregate into one balance per address, and a
   regression test shows one deal cannot reach another deal's funds.
+- A handler-driven invariant suite fuzzes arbitrary interleavings and asserts the
+  escrow balance always covers open liabilities plus uncollected credits. Both
+  invariants were confirmed to fail against a double-credit mutation and against
+  a settlement that skips its state change.
+- `contracts/test/fixtures/policy-vectors.json` is run through `createDeal` here
+  and through `validate_creatable` in the Python suite, so the producer's claim
+  to mirror the creation rules is differentially tested, including the
+  multiplication overflow that unbounded Python integers would otherwise miss.
 
 ## Known limitations
 
