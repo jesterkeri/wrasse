@@ -1,12 +1,14 @@
 {
-  "_comment": "Written by the deployment run, not by hand. deploy-check reads this and the compiled artifact, and refuses an address whose runtime bytecode is not the build recorded here. Empty until the contract is deployed.",
   "chain_id": 84532,
-  "address": null,
-  "deployment_tx": null,
-  "block_number": null,
-  "block_hash": null,
-  "runtime_bytecode_hash": null,
-  "commit": null,
+  "address": "0x5525653f05990DA1479578893b5a624183AFa22E",
+  "deployment_tx": "0x598e3f5bcd81432577233276aa2b3b0963efc0f0740d6f878dd4fccf0aa51394",
+  "block_number": 46385173,
+  "block_hash": "0x77387ff0a3de427f8a3098e0ca1771215be02a437148e9701f2b80e0ff9cce34",
+  "runtime_bytecode_hash": "0xbb318c30bf85b053ec3587f1e6ec072cf73d4bedf65c1f1b4f9a899262c45608",
+  "commit": "7e37c8e62ed773fe61d36f8b1df07c1aa7a8ee7d",
   "solc_version": "0.8.30",
-  "optimizer": { "enabled": true, "runs": 200 }
+  "optimizer": {
+    "enabled": true,
+    "runs": 200
+  }
 }
