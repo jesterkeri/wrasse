@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+import secrets
+import tempfile
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -13,13 +16,18 @@ from dotenv import load_dotenv
 from sibyl_memory_client import MemoryClient
 from web3 import HTTPProvider, Web3
 
+from . import chain, escrow
 from .chain_time import ChainObservation, observe_chain_time, past_lag, require_recent
 from .dimensions import get_or_create_dimension, load_dimensions
 from .engine import PROFILES, produce_terms
 from .memory_gate import recall_counterparty_evidence
+from .policy_document import PolicyDocumentError, ValidatedPolicy, load_policy
 from .policy_hash import (
+    BPS_DENOMINATOR,
     DEFAULT_INCLUSION_MARGIN_SECONDS,
     EMPTY_EVIDENCE_HASH,
+    MAX_DURATION,
+    MAX_PROVIDER_BOND_BPS,
     PolicyPreimage,
     evidence_hash,
     policy_hash,
@@ -29,12 +37,78 @@ from .policy_hash import (
 from .reconciler import reconcile_timeout_claim
 
 
+#: Bumped whenever the shape of policy.json changes. A consumer that does not recognise the
+#: version must refuse the document rather than guess which fields it is looking at.
+POLICY_SCHEMA_VERSION = 1
+
+#: Hashed into every commitment, so it is a term of the deal and not a label.
+ENGINE_VERSION = "wrasse/0.1.0"
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace a file in one step, or not at all.
+
+    A policy document is read later by something that will sign against it. A half-written
+    one must never be parseable, so the content lands under a temporary name and is moved
+    into place only once it is complete and flushed.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+    )
+    try:
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, path)
+    except BaseException:
+        Path(handle.name).unlink(missing_ok=True)
+        raise
+
+
+def _escrow_address() -> str | None:
+    """The deployment this document is bound to, or None before there is one."""
+
+    configured = (os.getenv("WRASSE_ESCROW_ADDRESS") or "").strip()
+    return Web3.to_checksum_address(configured) if configured else None
+
+
 def _web3() -> Web3:
     return Web3(HTTPProvider(os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")))
 
 
 def _chain_id() -> int:
     return int(os.getenv("BASE_SEPOLIA_CHAIN_ID", "84532"))
+
+
+def _ledger() -> chain.TransactionLedger:
+    return chain.TransactionLedger(os.getenv("WRASSE_TX_DB", ".wrasse/transactions.db"))
+
+
+def _fallback_web3() -> Web3 | None:
+    """A second opinion, used only before abandoning a transaction as replaced."""
+
+    url = (os.getenv("BASE_SEPOLIA_FALLBACK_RPC_URL") or "").strip()
+    return Web3(HTTPProvider(url)) if url else None
+
+
+def _required_env(name: str) -> str:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is not set")
+    return value
+
+
+def _deployment_record() -> dict:
+    path = Path(os.getenv("WRASSE_DEPLOYMENT_RECORD", "deployments/base-sepolia.json"))
+    if not path.exists():
+        raise RuntimeError(
+            f"{path} is missing. A deployment is not finished until it is recorded, or an "
+            "interrupted run leaves two addresses and no way to say which one the demo used."
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _memory() -> MemoryClient:
@@ -105,6 +179,44 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("tx_hash")
     reconcile.add_argument("--deal-id", type=int, required=True)
     reconcile.add_argument("--provider", required=True)
+
+    check = sub.add_parser("deploy-check", help="prove the configured address is this build")
+    check.add_argument(
+        "--require-fresh",
+        action="store_true",
+        help="also require that no deal has been created yet; off by default so the identity "
+        "check keeps working after the first deal",
+    )
+
+    create = sub.add_parser("create-deal", help="sign and broadcast one createDeal")
+    create.add_argument("--policy", type=Path, required=True)
+    create.add_argument("--profile", required=True, help="chosen explicitly, never inferred")
+    create.add_argument("--accept-window", type=int, default=3_600)
+    create.add_argument("--inclusion-margin", type=int, default=DEFAULT_INCLUSION_MARGIN_SECONDS)
+
+    status = sub.add_parser("tx-status", help="read-only view of the transaction ledger")
+    status.add_argument("--intent", help="limit to one intent id")
+
+    resolve_cmd = sub.add_parser("tx-resolve", help="apply the resolved state; the only writer")
+    resolve_cmd.add_argument("--intent", help="limit to one intent id")
+    resolve_cmd.add_argument(
+        "--local-confirmation-blocks",
+        type=int,
+        default=None,
+        help="REHEARSAL ONLY. Count blocks instead of reading the chain's safe head, for a "
+        "local chain that has none. Not a finality claim, and named in every result it "
+        "produces. Never pass this against a real network.",
+    )
+    resolve_cmd.add_argument(
+        "--rebroadcast",
+        action="store_true",
+        help="resend the identical recorded bytes when the chain has no record of them; "
+        f"needs {chain.BROADCAST_ENV}=1",
+    )
+
+    rebind = sub.add_parser("rebind-policy", help="bind a pre-deployment quote to a deployment")
+    rebind.add_argument("--policy", type=Path, required=True)
+    rebind.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -182,7 +294,395 @@ def _executability(args, basis: TimeBasis) -> dict:
     }
 
 
+#: The same preimage the Solidity suite pins. Running it through the deployed contract moves
+#: the cross-language check from a test fixture to the address the demo will actually use.
+CANONICAL_FIXTURE = PolicyPreimage(
+    buyer="0x4444444444444444444444444444444444444444",
+    provider="0x3333333333333333333333333333333333333333",
+    price=10**18,
+    bond_bps=2_000,
+    accept_by=1_700_000_000,
+    service_window=7_200,
+    payout_delay=1_800,
+    engine_version=ENGINE_VERSION,
+    buyer_evidence_hash=evidence_hash(["0x" + "11" * 32, "0x" + "22" * 32]),
+    provider_evidence_hash=EMPTY_EVIDENCE_HASH,
+)
+
+
+def _deploy_check(args) -> int:
+    """Prove the address in `.env` is the contract this build compiled and reviewed."""
+
+    record = _deployment_record()
+    address = Web3.to_checksum_address(_required_env("WRASSE_ESCROW_ADDRESS"))
+    chain_id = _chain_id()
+    web3 = _web3()
+    checks: list[dict] = []
+
+    def check(name: str, produce, expected) -> None:
+        """Every check reports; none of them aborts the report.
+
+        A wrong address makes several of these fail at once, and seeing all of them is what
+        tells you whether you are looking at the wrong contract or the wrong build.
+        """
+
+        try:
+            actual = produce()
+        except Exception as error:  # noqa: BLE001 - a failing call IS the finding
+            actual = f"error: {error}"
+        checks.append({"check": name, "ok": actual == expected, "expected": expected, "actual": actual})
+
+    check("record names this chain", lambda: int(record["chain_id"]), chain_id)
+    check("record names this address", lambda: Web3.to_checksum_address(record["address"]), address)
+    check("node reports this chain", lambda: int(web3.eth.chain_id), chain_id)
+
+    # Constants and one pure function can be imitated. The bytecode hash cannot.
+    check(
+        "runtime bytecode is this build",
+        lambda: escrow.deployed_runtime_hash(web3, address),
+        escrow.artifact_runtime_hash(),
+    )
+    check(
+        "runtime bytecode matches the record",
+        lambda: escrow.deployed_runtime_hash(web3, address),
+        record["runtime_bytecode_hash"],
+    )
+
+    deployed_contract = escrow.contract(web3, address)
+    check("MAX_DURATION", lambda: int(deployed_contract.functions.MAX_DURATION().call()), MAX_DURATION)
+    check(
+        "BPS_DENOMINATOR",
+        lambda: int(deployed_contract.functions.BPS_DENOMINATOR().call()),
+        BPS_DENOMINATOR,
+    )
+    check(
+        "MAX_PROVIDER_BOND_BPS",
+        lambda: int(deployed_contract.functions.MAX_PROVIDER_BOND_BPS().call()),
+        MAX_PROVIDER_BOND_BPS,
+    )
+    check(
+        "the deployed contract reproduces the canonical fixture",
+        lambda: escrow.compute_policy_hash_onchain(web3, address, CANONICAL_FIXTURE),
+        policy_hash(CANONICAL_FIXTURE),
+    )
+
+    if args.require_fresh:
+        check(
+            "no deal has been created yet",
+            lambda: int(deployed_contract.functions.nextDealId().call()),
+            0,
+        )
+
+    ok = all(item["ok"] for item in checks)
+    print(json.dumps({"address": address, "ok": ok, "checks": checks}, indent=2, sort_keys=True))
+    return 0 if ok else 1
+
+
+def _fee_fields(web3: Web3) -> tuple[int, int]:
+    """A priority fee the chain will accept, and a ceiling that survives a fee rise."""
+
+    latest = web3.eth.get_block("latest")
+    base = int(latest.get("baseFeePerGas") or 0)
+    try:
+        priority = int(web3.eth.max_priority_fee)
+    except Exception:  # noqa: BLE001 - not every node exposes it
+        priority = 10**6
+    priority = max(priority, 10**6)
+    return priority, base * 2 + priority
+
+
+def _create_deal(args) -> int:
+    chain_id = _chain_id()
+    address = Web3.to_checksum_address(_required_env("WRASSE_ESCROW_ADDRESS"))
+    buyer = Web3.to_checksum_address(_required_env("WRASSE_BUYER_ADDRESS"))
+    provider = Web3.to_checksum_address(_required_env("WRASSE_PROVIDER_A_ADDRESS"))
+    ledger = _ledger()
+    web3 = _web3()
+
+    policy = load_policy(
+        args.policy,
+        profile=args.profile,
+        chain_id=chain_id,
+        contract_address=address,
+        buyer=buyer,
+        provider=provider,
+    )
+
+    # Look the intent up before touching the chain or the keystore. The terms move between
+    # attempts; the identity does not, which is what makes this a retry rather than a new deal.
+    existing = ledger.find(
+        chain_id=chain_id, wallet=buyer, contract_address=address, intent_id=policy.intent_id
+    )
+    if existing is not None:
+        chain.verify_row_integrity(existing)
+        print(json.dumps({
+            "intent_id": existing.intent_id,
+            "already_signed": True,
+            "tx_hash": existing.tx_hash,
+            "status": existing.status,
+            "note": "this quote and profile already produced a transaction. Nothing was built "
+                    "or sent. Run tx-resolve to find out what became of it.",
+        }, indent=2, sort_keys=True))
+        return 0
+
+    account = chain.load_signer(
+        _required_env("WRASSE_KEYSTORE"),
+        _required_env("WRASSE_KEYSTORE_PASSWORD_FILE"),
+        expected_address=buyer,
+    )
+    engine_version_hash = "0x" + bytes(Web3.keccak(text=policy.engine_version)).hex()
+
+    def calldata_for(accept_by: int) -> str:
+        return escrow.create_deal_calldata(
+            web3,
+            address,
+            provider=policy.provider,
+            bond_bps=policy.bond_bps,
+            accept_by=accept_by,
+            service_window=policy.service_window,
+            payout_delay=policy.payout_delay,
+            engine_version_hash=engine_version_hash,
+            buyer_evidence_hash=policy.buyer_evidence_hash,
+            provider_evidence_hash=policy.provider_evidence_hash,
+        )
+
+    # Everything expensive happens here, outside the write lock and before the deadline that
+    # will actually be committed is chosen. Gas does not depend on the timestamp's value, so
+    # an estimate taken against a provisional deadline is still the right estimate.
+    provisional = observe_chain_time(web3, expected_chain_id=chain_id)
+    require_recent(provisional, local_now=int(time.time()))
+    estimate = web3.eth.estimate_gas({
+        "from": buyer,
+        "to": address,
+        "value": policy.price_wei,
+        "data": calldata_for(provisional.timestamp + args.accept_window),
+    })
+    gas_limit = chain.bounded_gas_limit(int(estimate))
+    max_priority, max_fee = _fee_fields(web3)
+    worst_case = chain.require_affordable(
+        int(web3.eth.get_balance(buyer)),
+        value_wei=policy.price_wei,
+        gas_limit=gas_limit,
+        max_fee_wei=max_fee,
+    )
+    chain_nonce = int(web3.eth.get_transaction_count(buyer, "pending"))
+    committed: dict = {}
+
+    def sign(nonce: int) -> chain.SignedIntent:
+        """Runs inside the write lock, immediately before the signature.
+
+        This is the last moment the deadline can be judged, so it is judged here rather than
+        before gas estimation, which can take long enough to eat the margin.
+        """
+
+        final = observe_chain_time(web3, expected_chain_id=chain_id)
+        local_now = int(time.time())
+        require_recent(final, local_now=local_now)
+        accept_by = final.timestamp + args.accept_window
+        preimage = policy.preimage_for(accept_by)
+
+        validate_creatable(preimage, reference_timestamp=final.timestamp)
+        require_inclusion_margin(
+            preimage,
+            chain_timestamp=final.timestamp,
+            observed_lag_seconds=past_lag(final, local_now=local_now),
+            margin_seconds=args.inclusion_margin,
+        )
+
+        local_hash = policy_hash(preimage)
+        onchain_hash = escrow.compute_policy_hash_onchain(web3, address, preimage)
+        if local_hash != onchain_hash:
+            raise RuntimeError(
+                f"this build hashes the terms to {local_hash}, the deployed contract to "
+                f"{onchain_hash}; refusing to commit to terms the chain reads differently"
+            )
+
+        transaction = {
+            "chainId": chain_id,
+            "nonce": nonce,
+            "to": address,
+            "data": calldata_for(accept_by),
+            "value": policy.price_wei,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": max_priority,
+            "gas": gas_limit,
+            "type": 2,
+        }
+        committed.update({
+            "accept_by": accept_by,
+            "policy_hash": local_hash,
+            "observed_block": final.block_number,
+        })
+        return chain.with_intent_context(
+            chain.sign_transaction(account, transaction),
+            accept_by=accept_by,
+            preimage=preimage.as_dict(),
+        )
+
+    row, created = ledger.record_signed(
+        chain_id=chain_id,
+        wallet=buyer,
+        contract_address=address,
+        intent_id=policy.intent_id,
+        chain_nonce=chain_nonce,
+        sign=sign,
+    )
+    if not created:
+        print(json.dumps({"intent_id": row.intent_id, "already_signed": True,
+                          "tx_hash": row.tx_hash, "status": row.status}, indent=2, sort_keys=True))
+        return 0
+
+    # Durably recorded before the RPC is called, so a crash here lands in the window the
+    # resolver exists for rather than losing the transaction entirely.
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+    try:
+        outcome = chain.broadcast(web3, row)
+    except chain.DeterministicRejection as error:
+        ledger.set_status(row, chain.REJECTED, last_error=str(error))
+        print(json.dumps({"intent_id": row.intent_id, "status": chain.REJECTED,
+                          "error": str(error)}, indent=2, sort_keys=True))
+        return 1
+
+    row = ledger.set_status(
+        row,
+        outcome.status,
+        last_error=None if outcome.status == chain.PENDING else outcome.detail,
+    )
+    print(json.dumps({
+        "intent_id": row.intent_id,
+        "status": row.status,
+        "detail": outcome.detail,
+        "tx_hash": row.tx_hash,
+        "nonce": row.nonce,
+        "quoted": {"accept_by": policy.quoted_accept_by, "policy_hash": policy.quoted_policy_hash},
+        "signed": committed,
+        "moved_fields": ["accept_by"],
+        "gas": {"estimate": int(estimate), "limit": gas_limit, "max_fee_wei": max_fee,
+                "max_priority_wei": max_priority, "worst_case_wei": worst_case},
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+def _rows_for(args, ledger: chain.TransactionLedger) -> list[chain.LedgerRow]:
+    rows = ledger.rows(chain_id=_chain_id())
+    intent = getattr(args, "intent", None)
+    return [row for row in rows if intent is None or row.intent_id == intent]
+
+
+def _tx_status(args) -> int:
+    """Read-only. It may ask the chain; it never writes and never sends.
+
+    The command you run after a crash should not be the command that can spend.
+    """
+
+    ledger = _ledger()
+    web3 = _web3()
+    fallback = _fallback_web3()
+    report = []
+    for row in _rows_for(args, ledger):
+        entry = {"intent_id": row.intent_id, "status": row.status, "nonce": row.nonce,
+                 "tx_hash": row.tx_hash, "attempts": row.attempts}
+        if row.is_terminal:
+            entry["verdict"] = {"status": row.status, "detail": "terminal"}
+        else:
+            try:
+                verdict = chain.resolve(web3, row, fallback_web3=fallback)
+                entry["verdict"] = {"status": verdict.status, "detail": verdict.detail,
+                                    "may_rebroadcast": verdict.may_rebroadcast}
+            except chain.RpcUnavailable as error:
+                entry["verdict"] = {"status": "unreadable", "detail": str(error)}
+        report.append(entry)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _tx_resolve(args) -> int:
+    """The only writer. Applies what the chain says, and can resend identical bytes."""
+
+    ledger = _ledger()
+    web3 = _web3()
+    fallback = _fallback_web3()
+    report = []
+
+    policy = (
+        chain.local_depth_policy(args.local_confirmation_blocks)
+        if args.local_confirmation_blocks is not None
+        else chain.safe_head_policy()
+    )
+    if args.local_confirmation_blocks is not None:
+        print(
+            f"!! confirming by {policy.name}, not by the chain's safe head. Rehearsal only.",
+            file=sys.stderr,
+        )
+
+    for row in _rows_for(args, ledger):
+        if row.is_terminal:
+            report.append({"intent_id": row.intent_id, "status": row.status, "action": "none"})
+            continue
+
+        verdict = chain.resolve(web3, row, fallback_web3=fallback)
+
+        if verdict.status == chain.UNKNOWN:
+            if not args.rebroadcast:
+                report.append({"intent_id": row.intent_id, "status": row.status,
+                               "verdict": verdict.status, "detail": verdict.detail,
+                               "action": "pass --rebroadcast to resend the identical bytes"})
+                continue
+            row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+            outcome = chain.broadcast(web3, row)
+            row = ledger.set_status(row, outcome.status,
+                                    last_error=None if outcome.status == chain.PENDING else outcome.detail)
+            report.append({"intent_id": row.intent_id, "status": row.status,
+                           "action": "resent the identical recorded bytes"})
+            continue
+
+        if verdict.status != row.status:
+            row = ledger.set_status(row, verdict.status, block_number=verdict.block_number,
+                                    block_hash=verdict.block_hash, last_error=None)
+
+        if row.status in (chain.INCLUDED_SUCCESS, chain.INCLUDED_REVERTED):
+            settled = chain.confirm(web3, row, policy=policy)
+            if settled.status != row.status:
+                row = ledger.set_status(row, settled.status, block_number=settled.block_number,
+                                        block_hash=settled.block_hash)
+            report.append({"intent_id": row.intent_id, "status": row.status,
+                           "confirmation_basis": policy.name,
+                           "detail": settled.detail, "action": "resolved"})
+            continue
+
+        report.append({"intent_id": row.intent_id, "status": row.status,
+                       "detail": verdict.detail, "action": "resolved"})
+
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _rebind_policy(args) -> int:
+    """Bind a quote written before deployment to the deployment it will execute against.
+
+    A new `request_id` is minted deliberately. A rebound quote is a different action, and
+    reusing the old identity would let the pre-deployment document and the bound one both
+    claim to be the same deal.
+    """
+
+    document = json.loads(args.policy.read_text(encoding="utf-8"))
+    address = Web3.to_checksum_address(_required_env("WRASSE_ESCROW_ADDRESS"))
+    previous = document.get("request_id")
+    document["chain_id"] = _chain_id()
+    document["contract_address"] = address
+    document["request_id"] = secrets.token_hex(16)
+
+    _write_atomic(args.output, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({"output": str(args.output), "contract_address": address,
+                      "previous_request_id": previous,
+                      "request_id": document["request_id"]}, indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Read before dotenv can populate the environment from a file. A crash simulation that a
+    # stale `.env` could arm would eventually fire during a real run.
+    chain.arm_failpoint(os.environ.get(chain.FAILPOINT_ENV))
     load_dotenv()
     args = build_parser().parse_args(argv)
     if args.command == "recall":
@@ -239,7 +739,7 @@ def main(argv: list[str] | None = None) -> int:
                 accept_by=accept_by,
                 service_window=terms.service_window,
                 payout_delay=args.payout_delay,
-                engine_version="wrasse/0.1.0",
+                engine_version=ENGINE_VERSION,
                 buyer_evidence_hash=evidence_commitment,
                 # The provider recalls nothing about this buyer yet. Bilateral recall
                 # lands at gate 6; until then this side is honestly empty rather than
@@ -268,6 +768,14 @@ def main(argv: list[str] | None = None) -> int:
                 "policy_hash": policy_hash(preimage),
             }
         output = {
+            # Immutable identity, fixed before any transaction exists. `request_id` is what
+            # makes a retry a retry: the committed terms move between attempts because the
+            # deadline is re-derived from chain time, so action identity cannot come from them.
+            "schema_version": POLICY_SCHEMA_VERSION,
+            "request_id": secrets.token_hex(16),
+            "chain_id": _chain_id(),
+            "contract_address": _escrow_address(),
+            "engine_version": ENGINE_VERSION,
             "counterparty": recalled.counterparty,
             "memory_verdict": recalled.verdict,
             "cold_start": recalled.is_cold_start,
@@ -277,9 +785,19 @@ def main(argv: list[str] | None = None) -> int:
         }
         rendered = json.dumps(output, indent=2, sort_keys=True)
         if args.output:
-            args.output.write_text(rendered + "\n", encoding="utf-8")
+            _write_atomic(args.output, rendered + "\n")
         print(rendered)
         return 0
+    if args.command == "deploy-check":
+        return _deploy_check(args)
+    if args.command == "create-deal":
+        return _create_deal(args)
+    if args.command == "tx-status":
+        return _tx_status(args)
+    if args.command == "tx-resolve":
+        return _tx_resolve(args)
+    if args.command == "rebind-policy":
+        return _rebind_policy(args)
     if args.command == "reconcile-timeout":
         contract = os.environ["WRASSE_ESCROW_ADDRESS"]
         result = reconcile_timeout_claim(

@@ -83,6 +83,68 @@ can refuse a quote; neither can approve one. Each `policy.json` carries an
 `executability` block naming the basis, the block observed, the margin and the
 lag, so a consumer never has to infer what the check was worth.
 
+## Sending transactions
+
+Four commands sit between a quote and a settled deal.
+
+```bash
+uv run wrasse deploy-check [--require-fresh]
+WRASSE_ALLOW_BROADCAST=1 uv run wrasse create-deal --policy policy.json --profile urgent
+uv run wrasse tx-status
+uv run wrasse tx-resolve [--rebroadcast]
+```
+
+`deploy-check` proves the address in `.env` is this build. Identity is the hash of the
+deployed runtime bytecode compared against the compiled artifact and the record in
+`deployments/base-sepolia.json`, because matching constants can be imitated by different
+bytecode. It also runs the canonical policy fixture through the deployed contract, which
+moves the cross-language check from a test to the address the demo will use.
+
+`create-deal` looks up the quote's stable identity first, before reading the chain or
+touching the keystore. `policy.json` carries a `request_id` minted before any transaction
+exists, and the execution identity is that id paired with the explicitly chosen profile.
+Nothing about it depends on the terms, which is what makes a retry a retry: the acceptance
+deadline is re-derived from chain time immediately before signing, so the committed hash
+differs from the quoted one on every attempt. The output names both and says which field
+moved.
+
+**Broadcasting requires `WRASSE_ALLOW_BROADCAST=1` on the command that sends.** The barrier
+is at the send rather than the signature, because a signed transaction already moves funds
+without the key being decrypted again. The same gate covers resending identical bytes. Never
+set it in `.env`.
+
+`tx-status` is read-only. It may query the chain, but it never writes a row and never sends.
+`tx-resolve` owns every persisted transition, and `--rebroadcast` is the only path that can
+resend, and only ever the identical recorded bytes.
+
+Settlement records live in `.wrasse/transactions.db`, deliberately separate from the Sibyl
+memory store. A row is a claim about some signed bytes; the bytes are the authority, so every
+load decodes them and checks the sender, chain, nonce, destination, calldata, value and fees
+against the row before anything acts on it.
+
+### Inclusion, confirmation and what `safe` means
+
+A receipt means a transaction was included in a block. It does not mean that block is
+permanent. A row only reaches `confirmed_success` or `confirmed_reverted` when its recorded
+block hash is still canonical at that height and the block is at or below the chain's `safe`
+head. On Base, `safe` is the point past which a reorg would require a fault on the underlying
+L1, which is a much stronger statement than inclusion and a weaker one than finality. If a
+node cannot report a safe head at all, confirmation fails closed rather than quietly falling
+back to the latest block.
+
+Local chains have no meaningful safe head. Anvil pins it at block zero forever, so the
+rehearsal passes `--local-confirmation-blocks` to count blocks instead. That is a rehearsal
+affordance, not a finality claim, it has to be typed on the command, and it is named in every
+result it produces.
+
+### The deliberate crash
+
+`WRASSE_FAILPOINT=crash-after-send-i-mean-it` makes the process exit after a broadcast
+returns and before the ledger records that it went. That is the window a second funded offer
+used to appear in. It is read before any `.env` file is loaded, so a value left in a dotfile
+cannot arm it, and arming it prints a warning. A fresh process must then resolve the same
+intent without rebuilding or re-signing anything.
+
 Copy `.env.example` to the gitignored `.env` and add a project-specific
 `OPENROUTER_API_KEY`. `WRASSE_LLM_MODEL` is configurable and defaults to
 `openai/gpt-oss-20b`.
