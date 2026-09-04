@@ -91,15 +91,25 @@ class FakeWeb3:
 # --------------------------------------------------------------------------------------
 
 
-def _signed(nonce: int = 0, *, key: str = BUYER_KEY, calldata: str = "0xdeadbeef",
+def _signed(nonce: int = 0, *, key: str = BUYER_KEY, deal_id: int = 0,
             accept_by: int = 1_800_000_000, policy_hash: str = "0xaa") -> tuple[object, chain.SignedIntent]:
+    """A real `claimTimeout` transaction.
+
+    The ledger binds every row to the call its bytes actually make, so a fixture built on
+    invented calldata would be rejected as a transaction this build never makes. Varying the
+    deal id is how these tests get distinguishable transactions.
+    """
+
+    from wrasse import escrow
+
     account = Account.from_key(key)
+    calldata = escrow.deal_action_calldata(Web3(), ESCROW, "claimTimeout", deal_id)
     transaction = {
         "chainId": CHAIN_ID,
         "nonce": nonce,
         "to": ESCROW,
         "data": calldata,
-        "value": 10**14,
+        "value": 0,
         "maxFeePerGas": 10**9,
         "maxPriorityFeePerGas": 10**6,
         "gas": 250_000,
@@ -108,7 +118,8 @@ def _signed(nonce: int = 0, *, key: str = BUYER_KEY, calldata: str = "0xdeadbeef
     intent = chain.with_intent_context(
         chain.sign_transaction(account, transaction),
         accept_by=accept_by,
-        preimage={"policy_hash": policy_hash},
+        preimage={"action": "claimTimeout", "deal_id": deal_id, "role": "buyer",
+                  "policy_hash": policy_hash},
     )
     return account, intent
 
@@ -735,7 +746,7 @@ def test_a_nonce_that_never_reached_a_mempool_is_given_back(tmp_path):
 
     # A genuinely new intent, so different bytes and a different hash.
     reused, created, calls = _record(
-        ledger, intent_id="next:urgent", nonce=0, chain_nonce=0, calldata="0xcafebabe"
+        ledger, intent_id="next:urgent", nonce=0, chain_nonce=0, deal_id=11
     )
     assert created is True
     assert calls == [0], "the released nonce must be offered again, not skipped"
@@ -1016,7 +1027,7 @@ def test_confirmation_checks_the_bytes_before_promoting_a_row(tmp_path):
     web3.eth.blocks["safe"] = {"number": 9}
     assert chain.confirm(web3, row).status == chain.CONFIRMED_SUCCESS
 
-    corrupted = dataclasses.replace(row, calldata="0xdeadbeef")
+    corrupted = dataclasses.replace(row, calldata="0x" + "00" * 36)
     with pytest.raises(chain.LedgerCorrupt):
         chain.confirm(web3, corrupted)
 
@@ -1044,3 +1055,156 @@ def test_a_resent_transaction_can_never_release_its_nonce(tmp_path):
 
     with pytest.raises(chain.IllegalTransition, match="after 2 attempts"):
         ledger.mark_unbroadcast(row, "refused on resend")
+
+
+def test_a_wallet_is_freed_by_inclusion_not_by_confirmation(tmp_path):
+    """These are different questions and conflating them deadlocks a lifecycle.
+
+    Base Sepolia's safe head trails the tip by roughly a minute. A provider must clear its
+    acceptance before it can deliver, so holding the wallet until confirmation would let a
+    short service window expire while waiting for a fact only reconciliation needs.
+    """
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED)
+    row = ledger.set_status(row, chain.INCLUDED_SUCCESS, block_number=8, block_hash="0x" + "0e" * 32)
+    assert row.is_terminal is False, "the row is still watched for a reorg"
+
+    following, created, calls = _record(
+        ledger, intent_id="next:deliver", nonce=1, chain_nonce=1, deal_id=12
+    )
+    assert created is True and calls == [1]
+
+
+@pytest.mark.parametrize("settled", [chain.INCLUDED_SUCCESS, chain.INCLUDED_REVERTED])
+def test_a_reverted_inclusion_also_spends_its_nonce(tmp_path, settled):
+    """A transaction that mined and reverted still consumed the nonce it was signed with."""
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED)
+    ledger.set_status(row, settled, block_number=8, block_hash="0x" + "0e" * 32)
+
+    _, created, _ = _record(ledger, intent_id="next:deliver", nonce=1, chain_nonce=1,
+                            deal_id=13)
+    assert created is True
+
+
+# --------------------------------------------------------------------------------------
+# Deal actions and withdrawals
+# --------------------------------------------------------------------------------------
+
+
+def _action_row(ledger, *, action="claimTimeout", deal_id=3, role=None, value=0,
+                recipient=None, intent="act:1"):
+    from wrasse import escrow
+
+    account = Account.from_key(BUYER_KEY)
+    if action == "withdraw":
+        recipient = recipient or account.address
+        calldata = escrow.withdraw_calldata(Web3(), ESCROW, recipient)
+        preimage = {"action": "withdraw", "role": role or "buyer",
+                    "recipient": Web3.to_checksum_address(recipient)}
+    else:
+        calldata = escrow.deal_action_calldata(Web3(), ESCROW, action, deal_id)
+        preimage = {"action": action, "deal_id": deal_id,
+                    "role": role or escrow.DEAL_ACTIONS[action]["role"]}
+
+    signed = account.sign_transaction({
+        "chainId": CHAIN_ID, "nonce": 0, "to": ESCROW, "data": calldata, "value": value,
+        "maxFeePerGas": 10**9, "maxPriorityFeePerGas": 10**6, "gas": 250_000, "type": 2,
+    })
+    raw = "0x" + bytes(signed.raw_transaction).hex()
+    row, _ = ledger.record_signed(
+        chain_id=CHAIN_ID, wallet=account.address, contract_address=ESCROW, intent_id=intent,
+        read_chain_nonce=lambda: 0,
+        sign=lambda nonce: chain.SignedIntent(
+            nonce=nonce, calldata=calldata, value_wei=value, max_fee_wei=10**9,
+            max_priority_wei=10**6, gas_limit=250_000, accept_by=0, preimage=preimage,
+            tx_hash="0x" + bytes(Web3.keccak(hexstr=raw)).hex(), raw=raw,
+        ),
+    )
+    return row
+
+
+@pytest.mark.parametrize(
+    "action", ["acceptDeal", "markDelivered", "releaseDeal", "claimPayment", "claimTimeout",
+               "cancelUnaccepted"]
+)
+def test_every_deal_action_is_bound_to_its_own_calldata(tmp_path, action):
+    row = _action_row(_ledger(tmp_path), action=action, deal_id=5)
+    chain.verify_row_integrity(row)
+
+
+def test_a_row_claiming_a_different_deal_is_corrupt(tmp_path):
+    """The failure this binding exists for: a row that says timeout on deal 1 while its bytes
+    release deal 4."""
+    import dataclasses
+
+    row = _action_row(_ledger(tmp_path), action="claimTimeout", deal_id=1)
+    with pytest.raises(chain.LedgerCorrupt, match="the row says"):
+        chain.verify_row_integrity(
+            dataclasses.replace(row, preimage={**row.preimage, "deal_id": 4})
+        )
+
+
+def test_a_row_claiming_the_wrong_role_is_corrupt(tmp_path):
+    """`claimTimeout` is the buyer's. A row asserting otherwise is describing a different act."""
+    import dataclasses
+
+    row = _action_row(_ledger(tmp_path), action="claimTimeout")
+    with pytest.raises(chain.LedgerCorrupt, match="is a buyer action"):
+        chain.verify_row_integrity(
+            dataclasses.replace(row, preimage={**row.preimage, "role": "provider"})
+        )
+
+
+def test_a_non_payable_action_carrying_value_is_corrupt(tmp_path):
+    """Consistently signed, so the envelope check passes and only the action objects.
+
+    Only `acceptDeal` is payable. Value attached to any other one is either a mistake or a
+    transaction doing something other than what the row says.
+    """
+    row = _action_row(_ledger(tmp_path), action="claimTimeout", value=1)
+    with pytest.raises(chain.LedgerCorrupt, match="carries value"):
+        chain.verify_row_integrity(row)
+
+
+def test_a_withdrawal_is_bound_to_its_destination(tmp_path):
+    """The amount cannot be bound, because `withdraw(recipient)` collects everything the caller
+    is owed at execution time and the amount is not calldata. The destination can be, and is."""
+    import dataclasses
+
+    row = _action_row(_ledger(tmp_path), action="withdraw", intent="wd:1")
+    chain.verify_row_integrity(row)
+
+    elsewhere = Web3.to_checksum_address("0x" + "ee" * 20)
+    with pytest.raises(chain.LedgerCorrupt, match="the withdrawal pays"):
+        chain.verify_row_integrity(
+            dataclasses.replace(row, preimage={**row.preimage, "recipient": elsewhere})
+        )
+
+
+def test_calldata_this_build_never_produces_is_refused(tmp_path):
+    """An unrecognised call is not something to shrug at and carry on with.
+
+    Signed consistently, so the row and its bytes agree and the only objection left is that
+    nothing in this build makes that call.
+    """
+    stranger = "0x" + "ab" * 36
+    account = Account.from_key(BUYER_KEY)
+    signed = account.sign_transaction({
+        "chainId": CHAIN_ID, "nonce": 0, "to": ESCROW, "data": stranger, "value": 0,
+        "maxFeePerGas": 10**9, "maxPriorityFeePerGas": 10**6, "gas": 250_000, "type": 2,
+    })
+    raw = "0x" + bytes(signed.raw_transaction).hex()
+    row, _ = _ledger(tmp_path).record_signed(
+        chain_id=CHAIN_ID, wallet=account.address, contract_address=ESCROW, intent_id="odd:1",
+        read_chain_nonce=lambda: 0,
+        sign=lambda nonce: chain.SignedIntent(
+            nonce=nonce, calldata=stranger, value_wei=0, max_fee_wei=10**9,
+            max_priority_wei=10**6, gas_limit=250_000, accept_by=0, preimage={},
+            tx_hash="0x" + bytes(Web3.keccak(hexstr=raw)).hex(), raw=raw,
+        ),
+    )
+    with pytest.raises(chain.LedgerCorrupt, match="not a call this build makes"):
+        chain.verify_row_integrity(row)

@@ -521,3 +521,97 @@ def test_a_deadline_that_expires_during_resolution_stops_the_resend(
     assert report[0]["status"] == chain.STUCK
     assert "passed while resolving" in report[0]["action"]
     assert web3.eth.get_transaction_count(rehearsal["buyer"].address, "latest") == before
+
+
+@pytest.fixture
+def both_roles(rehearsal, monkeypatch):
+    """A funded provider with its own keystore, so role separation is real rather than named."""
+    web3 = rehearsal["web3"]
+    provider = Account.create()
+    web3.eth.send_transaction(
+        {"from": web3.eth.accounts[0], "to": provider.address, "value": Web3.to_wei(1, "ether")}
+    )
+    keystore = rehearsal["tmp"] / "provider-keystore"
+    keystore.write_text(json.dumps(Account.encrypt(provider.key, PASSWORD, kdf="pbkdf2")))
+
+    monkeypatch.setenv("WRASSE_PROVIDER_A_ADDRESS", provider.address)
+    monkeypatch.setenv("WRASSE_PROVIDER_A_KEYSTORE", str(keystore))
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    return {**rehearsal, "provider": provider}
+
+
+def _open_deal(both_roles, capsys, *, service_window=600, payout_delay=60) -> int:
+    output = both_roles["tmp"] / "policy.json"
+    assert main([
+        "policy", os.environ["WRASSE_PROVIDER_A_ADDRESS"],
+        "--buyer", both_roles["buyer"].address, "--accept-window", "600",
+        "--service-window", str(service_window), "--payout-delay", str(payout_delay),
+        "--output", str(output),
+    ]) == 0
+    capsys.readouterr()
+    assert main(["create-deal", "--policy", str(output), "--profile", "urgent"]) == 0
+    created = json.loads(capsys.readouterr().out)
+    both_roles["web3"].eth.wait_for_transaction_receipt(created["tx_hash"])
+    assert main(["tx-resolve"]) == 0
+    capsys.readouterr()
+    return 0 if "deal_id" not in created else created["deal_id"]
+
+
+def test_the_delivered_lifecycle_settles_and_both_sides_collect(both_roles, capsys):
+    """create, accept, deliver, release, and both parties collect what they are owed."""
+    web3 = both_roles["web3"]
+    deal_id = _open_deal(both_roles, capsys)
+
+    for command in (["accept-deal", "--deal-id", str(deal_id)],
+                    ["mark-delivered", "--deal-id", str(deal_id)],
+                    ["release-deal", "--deal-id", str(deal_id)]):
+        assert main(command) == 0
+        sent = json.loads(capsys.readouterr().out)
+        web3.eth.wait_for_transaction_receipt(sent["tx_hash"])
+        assert main(["tx-resolve"]) == 0
+        capsys.readouterr()
+
+    state = escrow_state(web3, both_roles["address"], deal_id)
+    assert state == "Released"
+
+    assert main(["withdraw", "--role", "provider", "--to", os.environ["WRASSE_PROVIDER_A_ADDRESS"]]) == 0
+    collected = json.loads(capsys.readouterr().out)
+    web3.eth.wait_for_transaction_receipt(collected["tx_hash"])
+    assert "an estimate" in collected["note"]
+
+
+def test_a_role_cannot_perform_the_other_roles_action(both_roles, capsys):
+    """`markDelivered` is the provider's. The buyer's wallet is refused on identity."""
+    deal_id = _open_deal(both_roles, capsys)
+    assert main(["accept-deal", "--deal-id", str(deal_id)]) == 0
+    sent = json.loads(capsys.readouterr().out)
+    both_roles["web3"].eth.wait_for_transaction_receipt(sent["tx_hash"])
+    assert main(["tx-resolve"]) == 0
+    capsys.readouterr()
+
+    # Point the provider role at the buyer's keystore: the derived address will not match.
+    os.environ["WRASSE_PROVIDER_A_KEYSTORE"] = os.environ["WRASSE_KEYSTORE"]
+    with pytest.raises(chain.RoleMismatch):
+        main(["mark-delivered", "--deal-id", str(deal_id)])
+
+
+def test_an_action_the_deal_is_not_ready_for_is_refused_before_signing(both_roles, capsys):
+    deal_id = _open_deal(both_roles, capsys)
+    with pytest.raises(RuntimeError, match="is Offered, and markDelivered needs it Accepted"):
+        main(["mark-delivered", "--deal-id", str(deal_id)])
+
+
+def test_a_repeated_deal_action_sends_nothing(both_roles, capsys):
+    deal_id = _open_deal(both_roles, capsys)
+    assert main(["accept-deal", "--deal-id", str(deal_id)]) == 0
+    first = json.loads(capsys.readouterr().out)
+    both_roles["web3"].eth.wait_for_transaction_receipt(first["tx_hash"])
+
+    assert main(["accept-deal", "--deal-id", str(deal_id)]) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["already_signed"] is True and second["tx_hash"] == first["tx_hash"]
+
+
+def escrow_state(web3, address, deal_id):
+    from wrasse import escrow
+    return escrow.read_deal(web3, address, deal_id)["state"]

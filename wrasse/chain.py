@@ -79,6 +79,25 @@ TERMINAL_STATUSES = frozenset(
     {CONFIRMED_SUCCESS, CONFIRMED_REVERTED, NONCE_CONSUMED_OR_REPLACED, REJECTED, UNBROADCAST}
 )
 
+#: The wallet's question is "is this nonce spent", and a transaction in a block has spent it.
+#: Whether that block is permanent is a different question, and it belongs to memory rather than
+#: to the wallet.
+#:
+#: Measured on Base Sepolia, the safe head trails the tip by roughly 66 seconds. Holding the
+#: wallet until confirmation would mean a provider could not deliver until well after it
+#: accepted, and a short service window would expire while waiting for a fact that only
+#: reconciliation cares about. A reorg puts both transactions back in the mempool in nonce
+#: order, which is ordinary rather than a gap.
+NONCE_SETTLED_STATUSES = frozenset(
+    {
+        INCLUDED_SUCCESS,
+        INCLUDED_REVERTED,
+        CONFIRMED_SUCCESS,
+        CONFIRMED_REVERTED,
+        NONCE_CONSUMED_OR_REPLACED,
+    }
+)
+
 #: `unbroadcast` is the only terminal state that gives its nonce back.
 #:
 #: A node that refuses a transaction during pre-validation, for insufficient funds or too
@@ -406,14 +425,22 @@ class TransactionLedger:
 
     @staticmethod
     def _blocking_row(connection: sqlite3.Connection, chain_id: int, wallet: str) -> LedgerRow | None:
+        """The row, if any, whose nonce is neither spent nor given back.
+
+        Deliberately not "not terminal". A transaction sitting at `included_success` is still
+        being watched for a reorg, but its nonce is gone, and blocking the wallet on it would
+        deadlock a lifecycle where one party has to act twice inside a service window.
+        """
+
         cursor = connection.execute(
             "SELECT * FROM transactions WHERE chain_id = ? AND wallet = ?",
             (chain_id, canonical_address(wallet)),
         )
         for record in cursor.fetchall():
             row = _row_from(record)
-            if not row.is_terminal:
-                return row
+            if row.status in NONCE_SETTLED_STATUSES or row.status in NONCE_RELEASING_STATUSES:
+                continue
+            return row
         return None
 
     # -- the one write that matters --------------------------------------------------------
@@ -718,7 +745,7 @@ def _verify_committed_terms(row: LedgerRow) -> None:
 
     arguments = escrow.decode_create_deal(row.calldata)
     if arguments is None:
-        # Later gates add other calls. Their terms are bound where they are introduced.
+        _verify_action_terms(row)
         return
 
     if arguments["accept_by"] != row.accept_by:
@@ -757,6 +784,59 @@ def _verify_committed_terms(row: LedgerRow) -> None:
     # Self-consistency: the stored preimage must still hash, so an audit trail can never quote
     # a commitment that its own fields cannot produce.
     _policy_hash(preimage)
+
+
+def _verify_action_terms(row: LedgerRow) -> None:
+    """Bind the deal actions and the withdrawal to what their calldata actually says.
+
+    Each of these is a single argument, so the binding is small: the action, and either the
+    deal id or the destination. Small, but the alternative is a row that claims to be a
+    timeout claim on deal 1 while carrying a release of deal 4.
+
+    Note what is deliberately *not* bound. The deal state an action expects is a signing-time
+    precondition, not calldata and not part of any commitment. It can change before inclusion,
+    and the contract reverts safely when it does. Checking it early turns a wasted transaction
+    into a refusal; it does not make the transaction carry the state it assumed.
+    """
+
+    from . import escrow
+
+    stored = row.preimage if isinstance(row.preimage, dict) else {}
+
+    action = escrow.decode_deal_action(row.calldata)
+    if action is not None:
+        for name in ("action", "deal_id"):
+            if stored.get(name) != action[name]:
+                raise LedgerCorrupt(
+                    f"{row.intent_id}: calldata is {action['action']}({action['deal_id']}), "
+                    f"the row says {stored.get('action')}({stored.get('deal_id')})"
+                )
+        expected_role = escrow.DEAL_ACTIONS[action["action"]]["role"]
+        if stored.get("role") != expected_role:
+            raise LedgerCorrupt(
+                f"{row.intent_id}: {action['action']} is a {expected_role} action, the row "
+                f"claims the {stored.get('role')} role"
+            )
+        if not escrow.DEAL_ACTIONS[action["action"]]["payable"] and row.value_wei != 0:
+            raise LedgerCorrupt(f"{row.intent_id}: {action['action']} carries value")
+        return
+
+    withdrawal = escrow.decode_withdraw(row.calldata)
+    if withdrawal is not None:
+        if stored.get("action") != "withdraw":
+            raise LedgerCorrupt(f"{row.intent_id}: calldata is a withdrawal, the row is not")
+        if canonical_address(stored.get("recipient", ZERO_ADDRESS)) != canonical_address(
+            withdrawal["recipient"]
+        ):
+            raise LedgerCorrupt(
+                f"{row.intent_id}: the withdrawal pays {withdrawal['recipient']}, the row "
+                f"says {stored.get('recipient')}"
+            )
+        if row.value_wei != 0:
+            raise LedgerCorrupt(f"{row.intent_id}: a withdrawal carries value")
+        return
+
+    raise LedgerCorrupt(f"{row.intent_id}: calldata is not a call this build makes")
 
 
 def _decode_transaction(raw: bytes) -> dict[str, Any]:
@@ -803,6 +883,8 @@ UNKNOWN = "unknown"
 
 #: Reads are idempotent, so a flaky node is worth a second attempt. Bounded and jittered, so
 #: a rate-limited endpoint is not hammered into refusing harder.
+ZERO_ADDRESS = "0x" + "00" * 20
+
 READ_ATTEMPTS = 3
 READ_BASE_DELAY_SECONDS = 0.25
 READ_MAX_DELAY_SECONDS = 4.0
@@ -1314,6 +1396,7 @@ __all__: Sequence[str] = (
     "RpcUnavailable",
     "SafeHeadUnavailable",
     "SignedIntent",
+    "NONCE_SETTLED_STATUSES",
     "TERMINAL_STATUSES",
     "TransactionLedger",
     "UNKNOWN",

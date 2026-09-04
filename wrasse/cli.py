@@ -10,7 +10,7 @@ import secrets
 import tempfile
 import time
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from dotenv import load_dotenv
 from sibyl_memory_client import MemoryClient
@@ -230,6 +230,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="resend the identical recorded bytes when the chain has no record of them; "
         f"needs {chain.BROADCAST_ENV}=1",
     )
+
+    for action, meta in escrow.DEAL_ACTIONS.items():
+        command = sub.add_parser(
+            _COMMAND_NAMES[action],
+            help=f"{meta['role']} action; the deal must be {meta['expects']}",
+        )
+        command.add_argument("--deal-id", type=int, required=True)
+        command.set_defaults(deal_action=action)
+
+    collect = sub.add_parser("withdraw", help="collect everything this role is owed")
+    collect.add_argument("--role", choices=("buyer", "provider"), required=True)
+    collect.add_argument("--to", required=True, help="destination; chosen at collection time")
 
     rebind = sub.add_parser("rebind-policy", help="bind a pre-deployment quote to a deployment")
     rebind.add_argument("--policy", type=Path, required=True)
@@ -653,6 +665,225 @@ def _chain_now(web3: Web3) -> int | None:
         return None
 
 
+_COMMAND_NAMES = {
+    "acceptDeal": "accept-deal",
+    "markDelivered": "mark-delivered",
+    "releaseDeal": "release-deal",
+    "claimPayment": "claim-payment",
+    "claimTimeout": "claim-timeout",
+    "cancelUnaccepted": "cancel-unaccepted",
+}
+
+
+def _role_signer(role: str) -> Any:
+    """The wallet allowed to play this role, proved by deriving it from the key."""
+
+    address = Web3.to_checksum_address(
+        _required_env("WRASSE_BUYER_ADDRESS" if role == "buyer" else "WRASSE_PROVIDER_A_ADDRESS")
+    )
+    keystore = _required_env("WRASSE_KEYSTORE" if role == "buyer" else "WRASSE_PROVIDER_A_KEYSTORE")
+    account = chain.load_signer(
+        keystore, _required_env("WRASSE_KEYSTORE_PASSWORD_FILE"), expected_address=address
+    )
+    return account, address
+
+
+def _next_attempt_intent(ledger, *, chain_id, wallet, contract_address, base: str) -> tuple[str, Any]:
+    """The intent to use now, and the row already under it if there is one.
+
+    A deal action's identity is permanent, which would make an action that mined and reverted
+    impossible to ever attempt again. A confirmed revert, and only that, opens a fresh attempt
+    under a numbered identity. Anything successful or still in flight keeps its uniqueness.
+    """
+
+    attempt = 1
+    while True:
+        intent = base if attempt == 1 else f"{base}#{attempt}"
+        row = ledger.find(
+            chain_id=chain_id, wallet=wallet, contract_address=contract_address, intent_id=intent
+        )
+        if row is None:
+            return intent, None
+        if row.status != chain.CONFIRMED_REVERTED:
+            return intent, row
+        attempt += 1
+
+
+def _send(args, *, role, action, calldata, value_wei, preimage, intent_id, note=None) -> int:
+    """One signed action, through the same orchestrator `create-deal` uses."""
+
+    chain_id = _chain_id()
+    address = Web3.to_checksum_address(_required_env("WRASSE_ESCROW_ADDRESS"))
+    ledger = _ledger()
+    web3 = _web3()
+    _require_deployment_identity(web3, address, _deployment_record())
+    account, wallet = _role_signer(role)
+
+    existing = ledger.find(
+        chain_id=chain_id, wallet=wallet, contract_address=address, intent_id=intent_id
+    )
+    if existing is not None:
+        chain.verify_row_integrity(existing)
+        print(json.dumps({"intent_id": intent_id, "already_signed": True,
+                          "tx_hash": existing.tx_hash, "status": existing.status,
+                          "note": "already sent. Nothing was built. Run tx-resolve."},
+                         indent=2, sort_keys=True))
+        return 0
+
+    estimate = web3.eth.estimate_gas(
+        {"from": wallet, "to": address, "value": value_wei, "data": calldata}
+    )
+    gas_limit = chain.bounded_gas_limit(int(estimate))
+    max_priority, max_fee = _fee_fields(web3)
+    chain.require_affordable(
+        int(web3.eth.get_balance(wallet)),
+        value_wei=value_wei, gas_limit=gas_limit, max_fee_wei=max_fee,
+    )
+
+    def sign(nonce: int) -> chain.SignedIntent:
+        transaction = {
+            "chainId": chain_id, "nonce": nonce, "to": address, "data": calldata,
+            "value": value_wei, "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": max_priority, "gas": gas_limit, "type": 2,
+        }
+        return chain.with_intent_context(
+            chain.sign_transaction(account, transaction), accept_by=0, preimage=preimage
+        )
+
+    row, created = ledger.record_signed(
+        chain_id=chain_id, wallet=wallet, contract_address=address, intent_id=intent_id,
+        read_chain_nonce=lambda: int(web3.eth.get_transaction_count(wallet, "pending")),
+        sign=sign,
+    )
+    if not created:
+        print(json.dumps({"intent_id": row.intent_id, "already_signed": True,
+                          "tx_hash": row.tx_hash, "status": row.status}, indent=2, sort_keys=True))
+        return 0
+
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+    try:
+        outcome = chain.broadcast(web3, row)
+    except chain.DeterministicRejection as error:
+        ledger.mark_unbroadcast(row, str(error))
+        print(json.dumps({"intent_id": row.intent_id, "status": chain.UNBROADCAST,
+                          "nonce_released": row.nonce, "error": str(error)},
+                         indent=2, sort_keys=True))
+        return 1
+
+    row = ledger.set_status(
+        row, outcome.status, last_error=None if outcome.status == chain.PENDING else outcome.detail
+    )
+    report = {"intent_id": row.intent_id, "action": action, "role": role, "status": row.status,
+              "tx_hash": row.tx_hash, "nonce": row.nonce, "detail": outcome.detail}
+    if note:
+        report["note"] = note
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _deal_action(args) -> int:
+    action = args.deal_action
+    meta = escrow.DEAL_ACTIONS[action]
+    role = meta["role"]
+    chain_id = _chain_id()
+    address = Web3.to_checksum_address(_required_env("WRASSE_ESCROW_ADDRESS"))
+    web3 = _web3()
+    ledger = _ledger()
+
+    # Identity is resolved before anything else, and before the keystore is touched. A retry
+    # after a crash has to return the transaction it already sent, not a complaint that the
+    # deal has since moved on: the state check is for new actions, not for retries.
+    wallet = Web3.to_checksum_address(
+        _required_env("WRASSE_BUYER_ADDRESS" if role == "buyer" else "WRASSE_PROVIDER_A_ADDRESS")
+    )
+    base = f"deal:{chain_id}:{chain.canonical_address(address)}:{args.deal_id}:{action}"
+    intent_id, existing = _next_attempt_intent(
+        ledger, chain_id=chain_id, wallet=wallet, contract_address=address, base=base
+    )
+    if existing is not None:
+        chain.verify_row_integrity(existing)
+        print(json.dumps({"intent_id": existing.intent_id, "already_signed": True,
+                          "tx_hash": existing.tx_hash, "status": existing.status,
+                          "note": "already sent. Nothing was built. Run tx-resolve."},
+                         indent=2, sort_keys=True))
+        return 0
+
+    # A signing-time precondition, not a binding. The state can change before inclusion and the
+    # contract reverts safely if it does; checking here turns a wasted transaction into a
+    # refusal that explains itself.
+    deal = escrow.read_deal(web3, address, args.deal_id)
+    if deal["state"] != meta["expects"]:
+        raise RuntimeError(
+            f"deal {args.deal_id} is {deal['state']}, and {action} needs it {meta['expects']}"
+        )
+    if chain.canonical_address(deal[role]) != chain.canonical_address(wallet):
+        raise RuntimeError(
+            f"deal {args.deal_id} names {deal[role]} as its {role}, this wallet is {wallet}"
+        )
+
+    # The bond is re-read here rather than carried from an earlier look. A bond that moved
+    # between the two reads means this is not the deal we thought it was.
+    value = deal["provider_bond"] if meta["payable"] else 0
+    return _send(
+        args, role=role, action=action,
+        calldata=escrow.deal_action_calldata(web3, address, action, args.deal_id),
+        value_wei=value,
+        preimage={"action": action, "deal_id": args.deal_id, "role": role},
+        intent_id=intent_id,
+    )
+
+
+def _withdraw(args) -> int:
+    """Collect this role's credit.
+
+    The amount is deliberately not part of the intent. `withdraw(recipient)` takes everything
+    the caller is owed at execution time, the amount is not calldata, and another settlement can
+    raise it between signing and mining. The observed credit is recorded as a snapshot for the
+    audit trail and the collected amount may legitimately be larger.
+    """
+
+    chain_id = _chain_id()
+    address = Web3.to_checksum_address(_required_env("WRASSE_ESCROW_ADDRESS"))
+    recipient = Web3.to_checksum_address(args.to)
+    web3 = _web3()
+    _, wallet = _role_signer(args.role)
+    ledger = _ledger()
+
+    credit = int(escrow.contract(web3, address).functions.withdrawable(
+        Web3.to_checksum_address(wallet)
+    ).call())
+    if credit == 0:
+        raise RuntimeError(f"{wallet} has nothing to collect")
+
+    # Identity persists in the ledger itself, which is the only durable atomic store here. A
+    # crash before the row commits signed nothing, so a fresh id is harmless; a crash after it
+    # commits finds this row and resolves it rather than starting a second withdrawal.
+    intent_id = None
+    for row in ledger.rows(chain_id=chain_id):
+        preimage = row.preimage if isinstance(row.preimage, dict) else {}
+        if (
+            row.wallet == chain.canonical_address(wallet)
+            and preimage.get("action") == "withdraw"
+            and chain.canonical_address(preimage.get("recipient", chain.ZERO_ADDRESS))
+            == chain.canonical_address(recipient)
+            and row.status not in chain.TERMINAL_STATUSES
+        ):
+            intent_id = row.intent_id
+            break
+    intent_id = intent_id or f"withdraw:{chain_id}:{chain.canonical_address(address)}:{secrets.token_hex(8)}"
+
+    return _send(
+        args, role=args.role, action="withdraw",
+        calldata=escrow.withdraw_calldata(web3, address, recipient),
+        value_wei=0,
+        preimage={"action": "withdraw", "role": args.role, "recipient": recipient,
+                  "credit_snapshot_wei": str(credit)},
+        intent_id=intent_id,
+        note="the snapshot is an estimate; withdraw collects everything owed at execution, "
+             "which may be more",
+    )
+
+
 def _rows_for(args, ledger: chain.TransactionLedger) -> list[chain.LedgerRow]:
     rows = ledger.rows(chain_id=_chain_id())
     intent = getattr(args, "intent", None)
@@ -932,6 +1163,10 @@ def main(argv: list[str] | None = None) -> int:
             _write_atomic(args.output, rendered + "\n")
         print(rendered)
         return 0
+    if getattr(args, "deal_action", None) is not None:
+        return _deal_action(args)
+    if args.command == "withdraw":
+        return _withdraw(args)
     if args.command == "deploy-check":
         return _deploy_check(args)
     if args.command == "create-deal":

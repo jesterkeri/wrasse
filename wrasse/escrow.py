@@ -77,6 +77,75 @@ ESCROW_ABI: list[dict[str, Any]] = [
         "type": "function",
     },
     {
+        "inputs": [{"name": "dealId", "type": "uint256"}],
+        "name": "acceptDeal",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "dealId", "type": "uint256"}],
+        "name": "markDelivered",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "dealId", "type": "uint256"}],
+        "name": "releaseDeal",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "dealId", "type": "uint256"}],
+        "name": "claimPayment",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "dealId", "type": "uint256"}],
+        "name": "claimTimeout",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "dealId", "type": "uint256"}],
+        "name": "cancelUnaccepted",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "recipient", "type": "address"}],
+        "name": "withdraw",
+        "outputs": [{"name": "amount", "type": "uint256"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "name": "deals",
+        "outputs": [
+            {"name": "buyer", "type": "address"},
+            {"name": "provider", "type": "address"},
+            {"name": "price", "type": "uint256"},
+            {"name": "providerBond", "type": "uint256"},
+            {"name": "acceptBy", "type": "uint64"},
+            {"name": "acceptedAt", "type": "uint64"},
+            {"name": "serviceWindow", "type": "uint64"},
+            {"name": "deadline", "type": "uint64"},
+            {"name": "payoutDelay", "type": "uint64"},
+            {"name": "payoutAvailableAt", "type": "uint64"},
+            {"name": "policyHash", "type": "bytes32"},
+            {"name": "state", "type": "uint8"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
         "inputs": [{"name": "account", "type": "address"}],
         "name": "withdrawable",
         "outputs": [{"name": "", "type": "uint256"}],
@@ -188,6 +257,82 @@ def decode_create_deal(calldata: str) -> dict[str, Any] | None:
         "engine_version_hash": "0x" + values[5].hex(),
         "buyer_evidence_hash": "0x" + values[6].hex(),
         "provider_evidence_hash": "0x" + values[7].hex(),
+    }
+
+
+#: Every deal action the loop performs, with the role allowed to send it and the deal state
+#: the contract requires. State is a signing-time precondition, never part of the commitment:
+#: it can change before inclusion, and the contract reverts safely if it does.
+DEAL_ACTIONS: dict[str, dict[str, Any]] = {
+    "acceptDeal": {"role": "provider", "expects": "Offered", "payable": True},
+    "markDelivered": {"role": "provider", "expects": "Accepted", "payable": False},
+    "releaseDeal": {"role": "buyer", "expects": "Delivered", "payable": False},
+    "claimPayment": {"role": "provider", "expects": "Delivered", "payable": False},
+    "claimTimeout": {"role": "buyer", "expects": "Accepted", "payable": False},
+    "cancelUnaccepted": {"role": "buyer", "expects": "Offered", "payable": False},
+}
+
+#: `WrasseEscrow.State`, in declaration order.
+DEAL_STATES = ("Offered", "Accepted", "Delivered", "Released", "TimedOut", "Cancelled")
+
+_DEAL_ACTION_SELECTORS = {
+    "0x" + bytes(Web3.keccak(text=f"{name}(uint256)"))[:4].hex(): name for name in DEAL_ACTIONS
+}
+WITHDRAW_SELECTOR = "0x" + bytes(Web3.keccak(text="withdraw(address)"))[:4].hex()
+
+
+def deal_action_calldata(web3: Any, address: str, action: str, deal_id: int) -> str:
+    if action not in DEAL_ACTIONS:
+        raise DeploymentMismatch(f"{action} is not a deal action")
+    return contract(web3, address).encode_abi(action, args=[deal_id])
+
+
+def withdraw_calldata(web3: Any, address: str, recipient: str) -> str:
+    return contract(web3, address).encode_abi(
+        "withdraw", args=[Web3.to_checksum_address(recipient)]
+    )
+
+
+def decode_deal_action(calldata: str) -> dict[str, Any] | None:
+    """Recover the action and deal id from calldata, or None if it is not a deal action."""
+
+    from eth_abi import decode
+
+    raw = bytes.fromhex(calldata.removeprefix("0x"))
+    if len(raw) != 36:
+        return None
+    action = _DEAL_ACTION_SELECTORS.get("0x" + raw[:4].hex())
+    if action is None:
+        return None
+    return {"action": action, "deal_id": int(decode(["uint256"], raw[4:])[0])}
+
+
+def decode_withdraw(calldata: str) -> dict[str, Any] | None:
+    from eth_abi import decode
+
+    raw = bytes.fromhex(calldata.removeprefix("0x"))
+    if len(raw) != 36 or "0x" + raw[:4].hex() != WITHDRAW_SELECTOR:
+        return None
+    return {"action": "withdraw", "recipient": Web3.to_checksum_address(decode(["address"], raw[4:])[0])}
+
+
+def read_deal(web3: Any, address: str, deal_id: int, block: Any = "latest") -> dict[str, Any]:
+    """The deal as the contract holds it, named rather than positional."""
+
+    values = contract(web3, address).functions.deals(deal_id).call(block_identifier=block)
+    return {
+        "buyer": Web3.to_checksum_address(values[0]),
+        "provider": Web3.to_checksum_address(values[1]),
+        "price": int(values[2]),
+        "provider_bond": int(values[3]),
+        "accept_by": int(values[4]),
+        "accepted_at": int(values[5]),
+        "service_window": int(values[6]),
+        "deadline": int(values[7]),
+        "payout_delay": int(values[8]),
+        "payout_available_at": int(values[9]),
+        "policy_hash": "0x" + bytes(values[10]).hex(),
+        "state": DEAL_STATES[int(values[11])],
     }
 
 
