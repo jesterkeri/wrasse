@@ -10,6 +10,20 @@ from typing import Any, Callable, Protocol
 import requests
 from sibyl_memory_client import NotFoundError
 
+from .evidence import SUBJECTS_OF, VALENCE_OF
+
+#: What each outcome actually means, in the words a person would use. The model is shown this
+#: rather than being left to infer intent from an identifier.
+_MEANINGS = {
+    "timeout_claimed_without_delivery":
+        "a provider accepted a paid deal, never delivered, and the deadline passed",
+    "delivered_and_released_by_buyer":
+        "a provider delivered and the buyer released payment straight away",
+    "delivered_and_claimed_after_delay":
+        "a provider delivered, the buyer did not release payment, and the provider had to "
+        "wait out the full payout delay before it could collect",
+}
+
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 _DIRECTIONS = {"positive", "negative"}
@@ -37,11 +51,24 @@ class DimensionDefinition:
 
     @classmethod
     def from_model(cls, value: dict[str, Any], source_event_type: str) -> "DimensionDefinition":
+        """Build a dimension from a model answer, with the direction supplied by the contract.
+
+        `signal_direction` is accepted here only because stored definitions carry it. A fresh
+        model answer never provides it: which way an outcome points is decided by what the
+        contract says happened, not by a sentence a model produced.
+        """
+
         allowed = {"dimension_id", "signal_direction", "severity", "confidence", "applies_when"}
         if set(value) != allowed:
             raise DimensionError("model output has missing or unknown fields")
         identifier = value["dimension_id"]
         direction = value["signal_direction"]
+        expected = VALENCE_OF.get(source_event_type)
+        if expected is not None and direction != expected:
+            raise DimensionError(
+                f"{source_event_type} is {expected} by the contract's own account, and a "
+                f"dimension claiming {direction!r} would price it backwards"
+            )
         applies_when = value["applies_when"]
         if not isinstance(identifier, str) or not _IDENTIFIER.fullmatch(identifier):
             raise DimensionError("dimension_id must be lower snake case")
@@ -51,6 +78,10 @@ class DimensionDefinition:
             raise DimensionError("applies_when must be a non-empty list")
         if any(item not in _CONTEXTS for item in applies_when):
             raise DimensionError("applies_when contains an unsupported context")
+        if len(set(applies_when)) != len(applies_when):
+            # The JSON schema says uniqueItems, and a real model call returned a duplicate
+            # anyway. A schema the provider does not enforce is a request, not a guarantee.
+            raise DimensionError("applies_when repeats a context")
         severity = _bounded_number(value["severity"], "severity")
         confidence = _bounded_number(value["confidence"], "confidence")
         return cls(identifier, source_event_type, direction, severity, confidence, tuple(applies_when))
@@ -79,10 +110,9 @@ DIMENSION_JSON_SCHEMA = {
     "schema": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["dimension_id", "signal_direction", "severity", "confidence", "applies_when"],
+        "required": ["dimension_id", "severity", "confidence", "applies_when"],
         "properties": {
             "dimension_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{2,63}$"},
-            "signal_direction": {"type": "string", "enum": sorted(_DIRECTIONS)},
             "severity": {"type": "number", "minimum": 0, "maximum": 1},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "applies_when": {
@@ -108,11 +138,42 @@ def create_dimension(
     event_type = str(event.get("event_type", ""))
     if not event_type:
         raise DimensionError("event_type is required")
-    prompt = (
-        "Infer one reusable behavioural dimension from this neutral, verified event. "
-        "Do not make moral judgments or output executable expressions. Event: "
-        + json.dumps(event, sort_keys=True)
-    )
+
+    subjects = SUBJECTS_OF.get(event_type)
+    if subjects is None:
+        raise DimensionError(f"{event_type!r} is not an outcome this build recognises")
+    subject = " and ".join(sorted(subjects))
+
+    # The first live call returned `positive` for a provider that never delivered, and a
+    # severity of zero, because the prompt never said whose conduct was being judged or what
+    # the direction meant. The model was answering a question nobody had asked it.
+    prompt = "\n".join([
+        "You are describing one reusable behavioural dimension implied by a single verified "
+        "onchain outcome, so that a future counterparty can price it.",
+        "",
+        f"The outcome is: {_MEANINGS[event_type]}",
+        f"It is evidence about the conduct of the {subject.upper()}, and about nobody else.",
+        "",
+        f"It is already established that this outcome is {VALENCE_OF[event_type]} for a "
+        "counterparty. Do not restate that or argue with it. Say what the behaviour is and "
+        "how much it should matter.",
+        "severity is how much this outcome should move terms, from 0 for not at all to 1 for "
+        "as much as anything could. confidence is how strongly this single outcome supports "
+        "that reading.",
+        "applies_when lists the distinct buyer priorities this matters to. Do not repeat one.",
+        "",
+        "Give the dimension a lower_snake_case id naming the behaviour, not the party.",
+        "State no moral judgment and output no executable expression.",
+        "",
+        # An allowlisted projection, assembled from constants rather than from the stored
+        # body. Handing a model a dictionary out of a database is a way to let whatever ended
+        # up in that database write part of the prompt.
+        "Outcome: " + json.dumps({
+            "event_type": event_type,
+            "subjects": sorted(subjects),
+            "valence": VALENCE_OF[event_type],
+        }, sort_keys=True),
+    ])
     payload = {
         "model": model,
         "temperature": 0,
@@ -133,7 +194,10 @@ def create_dimension(
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-            return DimensionDefinition.from_model(json.loads(content), event_type)
+            answer = json.loads(content)
+            answer.pop("signal_direction", None)  # not the model's to decide
+            answer["signal_direction"] = VALENCE_OF[event_type]
+            return DimensionDefinition.from_model(answer, event_type)
         except (KeyError, TypeError, ValueError, requests.RequestException, DimensionError) as exc:
             last_error = exc
     raise DimensionError("model failed to return a valid dimension after two attempts") from last_error

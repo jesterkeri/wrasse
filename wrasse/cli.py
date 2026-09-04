@@ -18,7 +18,12 @@ from web3 import HTTPProvider, Web3
 
 from . import chain, escrow
 from .chain_time import ChainObservation, observe_chain_time, past_lag, require_recent
-from .dimensions import DIMENSION_CATEGORY, create_dimension, load_dimensions
+from .dimensions import (
+    DIMENSION_CATEGORY,
+    DimensionDefinition,
+    create_dimension,
+    load_dimensions,
+)
 from .engine import PROFILES, produce_provider_terms, produce_terms
 from .memory_gate import recall_counterparty_evidence
 from .policy_document import PolicyDocumentError, ValidatedPolicy, load_policy
@@ -218,6 +223,13 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("provider")
     learn = sub.add_parser("learn-dimension", help="learn or reuse a dimension for a verified event")
     learn.add_argument("event_id")
+    learn.add_argument(
+        "--relearn",
+        action="store_true",
+        help="retire the dimension currently held for this outcome and ask again. Nothing is "
+        "erased: the old definition stays in the store, marked retired, so a bad reading is "
+        "visible rather than quietly replaced.",
+    )
     policy = sub.add_parser("policy", help="produce profile-conditioned policy terms")
     policy.add_argument("provider")
     policy.add_argument("--buyer", required=True, help="buyer address; the commitment covers it")
@@ -1166,15 +1178,44 @@ def main(argv: list[str] | None = None) -> int:
         # One model call, then the same definition into each side's own store. Asking twice
         # would cost twice and, worse, let the two sides end up holding different readings of
         # the same public receipt for no reason anybody could point at.
-        existing = {
-            side: next(
-                (d for d in load_dimensions(store.memory)
-                 if d.source_event_type == event["event_type"]),
+        # Read the raw rows, not `load_dimensions`. The validator refuses a definition that
+        # cannot be trusted, which is right for pricing and wrong here: a bad reading has to be
+        # retirable, and going through the validator would make it permanent.
+        existing = {}
+        for side, store in stores.items():
+            raw = next(
+                (row for row in store.memory.list_entities(DIMENSION_CATEGORY, status="active",
+                                                           limit=100)
+                 if row["body"].get("source_event_type") == event["event_type"]),
                 None,
             )
-            for side, store in stores.items()
-        }
-        definition = next((d for d in existing.values() if d is not None), None)
+            if raw is not None and args.relearn:
+                store.memory.set_entity(
+                    DIMENSION_CATEGORY, raw["name"], raw["body"], status="retired"
+                )
+                raw = None
+            existing[side] = raw
+
+        # A disagreement between the two stores is not something to resolve by picking one.
+        readings = {json.dumps(row["body"], sort_keys=True) for row in existing.values()
+                    if row is not None}
+        if len(readings) > 1:
+            raise RuntimeError(
+                f"the two memories hold different dimensions for {event['event_type']}. "
+                "Re-run with --relearn rather than letting one side's reading stand in for "
+                "the other's."
+            )
+
+        held = next((row for row in existing.values() if row is not None), None)
+        definition = (
+            DimensionDefinition.from_model(
+                {k: held["body"][k] for k in
+                 ("dimension_id", "signal_direction", "severity", "confidence", "applies_when")},
+                held["body"]["source_event_type"],
+            )
+            if held is not None
+            else None
+        )
         if definition is None:
             definition = create_dimension(
                 event,

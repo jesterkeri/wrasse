@@ -25,13 +25,29 @@ JOURNAL_MARKER_CATEGORY = "chain_event_journalled"
 #: until the payout delay expired is a buyer making the provider wait. Without this, a
 #: provider's own failure would raise the price it charges, and a buyer's slowness would raise
 #: the bond that buyer demands, which is nonsense in both directions.
-SUBJECT_OF = {
-    "timeout_claimed_without_delivery": "provider",
-    "delivered_and_released_by_buyer": "buyer",
-    "delivered_and_claimed_after_delay": "buyer",
+SUBJECTS_OF = {
+    "timeout_claimed_without_delivery": frozenset({"provider"}),
+    # Evidence about both. A prompt release is good conduct by the buyer, and it is also proof
+    # the provider delivered. Attributing it to one side alone would leave the closing beat
+    # unbuildable: the only positive outcome could never soften a buyer's view of a provider.
+    "delivered_and_released_by_buyer": frozenset({"buyer", "provider"}),
+    "delivered_and_claimed_after_delay": frozenset({"buyer"}),
 }
 
-EVENT_TYPES = frozenset(SUBJECT_OF)
+#: Whether an outcome is a reason to demand safer terms or to offer easier ones. Derived from
+#: the contract, never chosen by a model.
+#:
+#: A live call proved why. Asked what a timeout meant, the model answered `positive` with a
+#: severity of zero, so a provider that took payment and never delivered would have made itself
+#: cheaper. The model still names the dimension and judges how much it matters; which way it
+#: points is not its call.
+VALENCE_OF = {
+    "timeout_claimed_without_delivery": "negative",
+    "delivered_and_released_by_buyer": "positive",
+    "delivered_and_claimed_after_delay": "negative",
+}
+
+EVENT_TYPES = frozenset(SUBJECTS_OF)
 
 
 class EventConflict(RuntimeError):

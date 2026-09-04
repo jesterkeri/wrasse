@@ -7,7 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable
 
 from .dimensions import DimensionDefinition
-from .evidence import SUBJECT_OF
+from .evidence import SUBJECTS_OF
 from .policy_hash import canonical_event_id
 from .providers import ProviderPersona
 
@@ -181,7 +181,7 @@ def _score(events, dimensions, *, about: str, weight: Decimal, relevance) -> tup
     risk = Decimal("0")
     used: set[str] = set()
     for event in events:
-        if SUBJECT_OF.get(str(event.get("event_type"))) != about:
+        if about not in SUBJECTS_OF.get(str(event.get("event_type")), frozenset()):
             continue
         for dimension in definitions:
             if event.get("event_type") != dimension.source_event_type:
