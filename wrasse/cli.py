@@ -53,7 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
     policy = sub.add_parser("policy", help="produce profile-conditioned policy terms")
     policy.add_argument("provider")
     policy.add_argument("--buyer", required=True, help="buyer address; the commitment covers it")
-    policy.add_argument("--base-price-wei", type=int, default=10**15)
+    policy.add_argument(
+        "--base-price-wei",
+        type=int,
+        default=10**14,
+        help=(
+            "starting price in wei before profile adjustment. Defaults to 0.0001 ETH, sized "
+            "so a faucet-funded testnet wallet can run the whole loop several times over."
+        ),
+    )
     policy.add_argument("--base-bond-bps", type=int, default=500)
     policy.add_argument("--service-window", type=int, default=3_600)
     policy.add_argument("--payout-delay", type=int, default=1_800)

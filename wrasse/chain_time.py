@@ -48,10 +48,10 @@ def observe_chain_time(web3: Any, *, expected_chain_id: int) -> ChainObservation
     # non-numeric one, is an unreliable RPC like any other, and must surface as this module's
     # own error rather than as a KeyError from somewhere in the caller.
     try:
-        chain_id = int(web3.eth.chain_id)
+        chain_id = _strict_int(web3.eth.chain_id, "chain id")
         block = web3.eth.get_block("latest")
-        number = int(block["number"])
-        timestamp = int(block["timestamp"])
+        number = _strict_int(block["number"], "block number")
+        timestamp = _strict_int(block["timestamp"], "block timestamp")
     except Exception as error:  # noqa: BLE001 - any read or decode failure means no live quote
         raise ChainTimeUnavailable(f"could not read a usable latest block: {error}") from error
 
@@ -63,6 +63,19 @@ def observe_chain_time(web3: Any, *, expected_chain_id: int) -> ChainObservation
     if number < 0 or timestamp <= 0:
         raise ChainTimeUnavailable(f"block {number} reports an impossible timestamp {timestamp}")
     return ChainObservation(chain_id=chain_id, block_number=number, timestamp=timestamp)
+
+
+def _strict_int(value: Any, label: str) -> int:
+    """Accept an integer, not anything that could be coerced into one.
+
+    Ethereum quantities decode to integers. A float or a bool arriving here means the payload
+    is not what this boundary claims to be reading, and quietly truncating it would defeat the
+    point of validating at all.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{label} is {type(value).__name__}, expected an integer")
+    return value
 
 
 def past_lag(observation: ChainObservation, *, local_now: int) -> int:

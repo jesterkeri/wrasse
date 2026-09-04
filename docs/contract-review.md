@@ -38,9 +38,12 @@ the exact ABI encoding.
   further transition.
 - Credits from several deals aggregate into one balance per address, and a
   regression test shows one deal cannot reach another deal's funds.
-- A handler-driven invariant suite targets only the handler, fuzzes arbitrary
-  interleavings with zero rejected calls, and asserts the escrow balance always
-  covers open liabilities plus uncollected credits. Confirmed to fail against a
+- A handler-driven invariant suite targets only the handler and asserts the escrow
+  balance always covers open liabilities plus uncollected credits. The handler
+  selects on state and on time, wraps nothing in `try/catch`, and runs under
+  `fail_on_revert`, so its zero-revert result means the transitions succeeded
+  rather than that their rejections were swallowed. Removing one time check from
+  that selection fails the campaign, which is how that claim was checked. Confirmed to fail against a
   double-credit mutation, a settlement that skips its state change, and a credit
   that leaks one wei into another party's balance. A separate deterministic walk
   proves every lifecycle state is reachable through that handler, so the

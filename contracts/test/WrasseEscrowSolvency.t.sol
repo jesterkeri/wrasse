@@ -11,9 +11,11 @@ interface Vm {
 
 /// @notice Drives the escrow through arbitrary interleavings so the solvency argument is
 /// regression-protected rather than only reasoned about and demonstrated on two examples.
-/// @dev Every call is wrapped, so a rejected transition is a no-op rather than an aborted
-/// run. The escrow is created here rather than in the invariant contract's setUp, so the
-/// fuzzer drives it through this handler and its authorisation rules.
+/// @dev Selection is aware of both state and time, so an action is attempted only when the
+/// escrow will accept it. Nothing is wrapped in try/catch and `fail_on_revert` is on, so the
+/// campaign's zero-revert result means the transitions actually happened rather than that
+/// their rejections were swallowed. The escrow is created here rather than in the invariant
+/// contract's setUp, so the fuzzer drives it through this handler.
 contract SolvencyHandler {
     Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
@@ -64,6 +66,16 @@ contract SolvencyHandler {
         return dealIds.length;
     }
 
+    /// @dev Which transition a candidate deal has to be ready for, in state and in time.
+    enum Ready {
+        Accept,
+        Deliver,
+        Release,
+        Payment,
+        Timeout,
+        Cancel
+    }
+
     function createDeal(uint256 buyerSeed, uint256 priceSeed, uint256 bondSeed, uint256 windowSeed) external {
         uint256 buyerIndex = buyerSeed % actors.length;
         uint256 offset = 1 + (priceSeed % (actors.length - 1));
@@ -78,7 +90,7 @@ contract SolvencyHandler {
 
         vm.deal(buyer, buyer.balance + price);
         vm.prank(buyer);
-        try escrow.createDeal{value: price}(
+        uint256 dealId = escrow.createDeal{value: price}(
             provider,
             bondBps,
             uint64(block.timestamp + window),
@@ -87,65 +99,72 @@ contract SolvencyHandler {
             keccak256("wrasse/0.1.0"),
             keccak256("buyer-evidence"),
             keccak256("provider-evidence")
-        ) returns (uint256 dealId) {
-            dealIds.push(dealId);
-            created++;
-        } catch {}
+        );
+        dealIds.push(dealId);
+        created++;
     }
 
     function acceptDeal(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Offered);
+        (uint256 dealId, bool ok) = _pickReady(dealSeed, Ready.Accept);
         if (!ok) return;
         (, address provider,, uint256 bond,,,,,,,,) = escrow.deals(dealId);
         vm.deal(provider, provider.balance + bond);
         vm.prank(provider);
-        try escrow.acceptDeal{value: bond}(dealId) { accepted++; } catch {}
+        escrow.acceptDeal{value: bond}(dealId);
+        accepted++;
     }
 
     function markDelivered(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Accepted);
+        (uint256 dealId, bool ok) = _pickReady(dealSeed, Ready.Deliver);
         if (!ok) return;
         (, address provider,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(provider);
-        try escrow.markDelivered(dealId) { delivered++; } catch {}
+        escrow.markDelivered(dealId);
+        delivered++;
     }
 
     function releaseDeal(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Delivered);
+        (uint256 dealId, bool ok) = _pickReady(dealSeed, Ready.Release);
         if (!ok) return;
         (address buyer,,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(buyer);
-        try escrow.releaseDeal(dealId) { released++; } catch {}
+        escrow.releaseDeal(dealId);
+        released++;
     }
 
     function claimPayment(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Delivered);
+        (uint256 dealId, bool ok) = _pickReady(dealSeed, Ready.Payment);
         if (!ok) return;
         (, address provider,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(provider);
-        try escrow.claimPayment(dealId) { paidOut++; } catch {}
+        escrow.claimPayment(dealId);
+        paidOut++;
     }
 
     function claimTimeout(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Accepted);
+        (uint256 dealId, bool ok) = _pickReady(dealSeed, Ready.Timeout);
         if (!ok) return;
         (address buyer,,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(buyer);
-        try escrow.claimTimeout(dealId) { timedOut++; } catch {}
+        escrow.claimTimeout(dealId);
+        timedOut++;
     }
 
     function cancelUnaccepted(uint256 dealSeed) external {
-        (uint256 dealId, bool ok) = _pickInState(dealSeed, WrasseEscrow.State.Offered);
+        (uint256 dealId, bool ok) = _pickReady(dealSeed, Ready.Cancel);
         if (!ok) return;
         (address buyer,,,,,,,,,,,) = escrow.deals(dealId);
         vm.prank(buyer);
-        try escrow.cancelUnaccepted(dealId) { cancelled++; } catch {}
+        escrow.cancelUnaccepted(dealId);
+        cancelled++;
     }
 
     function withdraw(uint256 actorSeed) external {
         address actor = actors[actorSeed % actors.length];
+        if (escrow.withdrawable(actor) == 0) return;
         vm.prank(actor);
-        try escrow.withdraw(payable(actor)) returns (uint256) { withdrawn++; } catch {}
+        escrow.withdraw(payable(actor));
+        withdrawn++;
     }
 
     /// @notice Time has to move or no deadline is ever reachable.
@@ -153,18 +172,41 @@ contract SolvencyHandler {
         vm.warp(block.timestamp + _bound(secondsForward, 1, 2 hours));
     }
 
-    /// @dev Choosing a deal already in the required state, rather than at random, is what
-    /// makes the campaign spend its depth on real transitions instead of on rejections.
-    function _pickInState(uint256 seed, WrasseEscrow.State wanted) private view returns (uint256, bool) {
+    /// @dev Finds a deal the escrow will actually accept this transition on, in state and in
+    /// time. State alone is not enough: an offer past its acceptance deadline is still
+    /// `Offered`, and attempting to accept it would be a rejection the handler had to swallow.
+    /// Swallowed rejections are what made a zero-revert campaign mean less than it looked.
+    function _pickReady(uint256 seed, Ready ready) private view returns (uint256, bool) {
         uint256 count = dealIds.length;
         if (count == 0) return (0, false);
         uint256 start = seed % count;
         for (uint256 i = 0; i < count; i++) {
             uint256 candidate = dealIds[(start + i) % count];
-            (,,,,,,,,,,, WrasseEscrow.State state) = escrow.deals(candidate);
-            if (state == wanted) return (candidate, true);
+            if (_isReady(candidate, ready)) return (candidate, true);
         }
         return (0, false);
+    }
+
+    function _isReady(uint256 dealId, Ready ready) private view returns (bool) {
+        (,,,, uint64 acceptBy,,, uint64 deadline,, uint64 payoutAvailableAt,, WrasseEscrow.State state) =
+            escrow.deals(dealId);
+
+        if (ready == Ready.Accept) {
+            return state == WrasseEscrow.State.Offered && block.timestamp <= acceptBy;
+        }
+        if (ready == Ready.Cancel) {
+            return state == WrasseEscrow.State.Offered && block.timestamp > acceptBy;
+        }
+        if (ready == Ready.Deliver) {
+            return state == WrasseEscrow.State.Accepted && block.timestamp <= deadline;
+        }
+        if (ready == Ready.Timeout) {
+            return state == WrasseEscrow.State.Accepted && block.timestamp > deadline;
+        }
+        if (ready == Ready.Release) {
+            return state == WrasseEscrow.State.Delivered;
+        }
+        return state == WrasseEscrow.State.Delivered && block.timestamp >= payoutAvailableAt;
     }
 
     function _bound(uint256 value, uint256 low, uint256 high) private pure returns (uint256) {

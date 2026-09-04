@@ -21,7 +21,8 @@
     "price times rate overflows uint256",
     "service window beyond uint64",
     "payout delay beyond uint64",
-    "acceptBy beyond uint64"
+    "acceptBy beyond uint64",
+    "acceptBy offset at uint256 max"
   ],
   "price": [
     "0xde0b6b3a7640000",
@@ -42,6 +43,7 @@
     "0x2710",
     "0x270f",
     "0x68db8bac710cb295e9e1b089a027525460aa64c2f837b4a2339c0ebedfa44",
+    "0xde0b6b3a7640000",
     "0xde0b6b3a7640000",
     "0xde0b6b3a7640000",
     "0xde0b6b3a7640000"
@@ -67,6 +69,7 @@
     "0x2710",
     "0x7d0",
     "0x7d0",
+    "0x7d0",
     "0x7d0"
   ],
   "acceptByOffset": [
@@ -90,7 +93,8 @@
     "0xe10",
     "0xe10",
     "0xe10",
-    "0x10000000000000000"
+    "0x10000000000000000",
+    "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
   ],
   "serviceWindow": [
     "0x1c20",
@@ -112,6 +116,7 @@
     "0x1c20",
     "0x1c20",
     "0x10000000000000000",
+    "0x1c20",
     "0x1c20",
     "0x1c20"
   ],
@@ -136,6 +141,7 @@
     "0x708",
     "0x708",
     "0x10000000000000000",
+    "0x708",
     "0x708"
   ],
   "creatable": [
@@ -155,6 +161,7 @@
     true,
     false,
     true,
+    false,
     false,
     false,
     false,

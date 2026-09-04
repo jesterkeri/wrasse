@@ -926,17 +926,21 @@ contract WrasseEscrowTest {
         // Python exercised the original, so both suites could report the same verdict for
         // different reasons. An unrepresentable vector is a rejected producer input, and is
         // never handed to createDeal in a form the contract could accept.
-        uint256 acceptByWide = block.timestamp + acceptByOffset;
+        //
+        // The sum is tested before it is taken, not after. Computing it first would panic on
+        // a large offset before ever reaching this branch, so the guard would not be total
+        // over the uint256 values the JSON can carry.
         if (
             acceptByOffset > type(uint64).max || serviceWindow > type(uint64).max
-                || payoutDelay > type(uint64).max || acceptByWide > type(uint64).max
+                || payoutDelay > type(uint64).max
+                || block.timestamp > uint256(type(uint64).max) - acceptByOffset
         ) {
             require(!creatable, "a vector outside uint64 cannot be creatable");
             return;
         }
 
         vm.deal(BUYER, price);
-        uint64 acceptBy = uint64(acceptByWide);
+        uint64 acceptBy = uint64(block.timestamp + acceptByOffset);
 
         vm.prank(BUYER);
         if (!creatable) {
