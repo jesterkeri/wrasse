@@ -103,7 +103,6 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
             NONCE_CONSUMED_OR_REPLACED,
             STUCK,
             REJECTED,
-            UNBROADCAST,
         }
     ),
     PENDING: frozenset(
@@ -520,6 +519,22 @@ class TransactionLedger:
         assert created is not None
         return created, True
 
+    def mark_unbroadcast(self, row: LedgerRow, reason: str) -> LedgerRow:
+        """Release a nonce, and only when the bytes provably never reached a mempool.
+
+        The generic transition is deliberately absent from the graph. Releasing a nonce that
+        might still be live is how a duplicate appears, so the precondition lives here rather
+        than in whichever caller happens to be right today: the very first send attempt, and
+        a row that never got as far as pending.
+        """
+
+        if row.status != SEND_ATTEMPTED or row.attempts != 1:
+            raise IllegalTransition(
+                f"{row.intent_id} is {row.status} after {row.attempts} attempts; only a first "
+                "send refused before admission may release its nonce"
+            )
+        return self._write_status(row, UNBROADCAST, last_error=reason)
+
     def set_status(
         self,
         row: LedgerRow,
@@ -540,7 +555,25 @@ class TransactionLedger:
 
         if status not in ALLOWED_TRANSITIONS.get(row.status, frozenset()):
             raise IllegalTransition(f"{row.status} -> {status} is not an allowed transition")
+        return self._write_status(
+            row,
+            status,
+            block_number=block_number,
+            block_hash=block_hash,
+            last_error=last_error,
+            bump_attempts=bump_attempts,
+        )
 
+    def _write_status(
+        self,
+        row: LedgerRow,
+        status: str,
+        *,
+        block_number: int | None = None,
+        block_hash: str | None = None,
+        last_error: str | None = None,
+        bump_attempts: bool = False,
+    ) -> LedgerRow:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -710,6 +743,10 @@ def _verify_committed_terms(row: LedgerRow) -> None:
         ("buyer_evidence_hash", arguments["buyer_evidence_hash"], preimage.buyer_evidence_hash),
         ("provider_evidence_hash", arguments["provider_evidence_hash"], preimage.provider_evidence_hash),
         ("price", row.value_wei, preimage.price),
+        # The buyer never appears in the calldata; the contract reads it as msg.sender. Left
+        # unbound, the stored preimage could name a different buyer than the key that signed,
+        # and the audit trail would describe someone else's deal.
+        ("buyer", row.wallet, canonical_address(preimage.buyer)),
     ):
         if committed != stored:
             raise LedgerCorrupt(
@@ -917,9 +954,30 @@ def resolve(
                 f"{row.nonce} on the other",
             )
 
+        # Two views of the tip are corroboration, not confirmation. A short reorg can undo
+        # whatever advanced the nonce, and this verdict releases the wallet, so consumption
+        # has to hold at a safety level or the nonce gap simply reopens later.
+        try:
+            safe_nonces = [
+                _nonce(node, row.wallet, "safe") for node in (web3, fallback_web3)
+            ]
+        except RpcUnavailable:
+            return Verdict(
+                NONCE_CONFLICT_PENDING,
+                f"latest nonce is past {row.nonce} on both RPCs, but neither can report the "
+                "account at the safe head; refusing to abandon the payload on an unsafe tip",
+            )
+
+        if min(safe_nonces) <= row.nonce:
+            return Verdict(
+                NONCE_CONFLICT_PENDING,
+                f"nonce {row.nonce} looks used at the tip but not yet at the safe head "
+                f"({min(safe_nonces)}); a reorg would put it back",
+            )
+
         return Verdict(
             NONCE_CONSUMED_OR_REPLACED,
-            f"both RPCs report a latest nonce past {row.nonce}; something else took this slot",
+            f"both RPCs report the account past {row.nonce} at the safe head; the slot is gone",
         )
 
     if pending > row.nonce:
@@ -998,6 +1056,10 @@ def confirm(web3: Any, row: LedgerRow, *, policy: ConfirmationPolicy | None = No
     head. Success and revert stay distinguishable at every step, which is why there is no
     single `confirmed`.
     """
+
+    # A confirmed row is what reconciliation turns into memory. Checking the bytes only on
+    # the unmined path would let a row corrupted after inclusion be promoted and believed.
+    verify_row_integrity(row)
 
     if row.block_number is None or row.block_hash is None:
         raise LedgerError(f"{row.intent_id} has no recorded block to confirm")

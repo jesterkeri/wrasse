@@ -101,7 +101,14 @@ def _fallback_web3() -> Web3 | None:
     """A second opinion, used only before abandoning a transaction as replaced."""
 
     url = (os.getenv("BASE_SEPOLIA_FALLBACK_RPC_URL") or "").strip()
-    return Web3(_provider(url)) if url else None
+    if not url:
+        return None
+    if url.rstrip("/") == _rpc_url().rstrip("/"):
+        raise RuntimeError(
+            "the fallback RPC is the same endpoint as the primary; one node asked twice is "
+            "not a second opinion"
+        )
+    return Web3(_provider(url))
 
 
 def _required_env(name: str) -> str:
@@ -602,7 +609,7 @@ def _create_deal(args) -> int:
         # The node refused it during pre-validation, on the very first attempt, so these bytes
         # never entered a mempool and nothing can ever mine at this nonce. Releasing it is the
         # difference between one bounced send and a wallet that is stuck forever.
-        ledger.set_status(row, chain.UNBROADCAST, last_error=str(error))
+        ledger.mark_unbroadcast(row, str(error))
         print(json.dumps({
             "intent_id": row.intent_id,
             "status": chain.UNBROADCAST,
@@ -702,6 +709,7 @@ def _tx_resolve(args) -> int:
         policy = chain.safe_head_policy()
 
     chain_now = _chain_now(web3)
+    record = _deployment_record()
 
     for row in _rows_for(args, ledger):
         if row.is_terminal:
@@ -734,6 +742,25 @@ def _tx_resolve(args) -> int:
                                "verdict": verdict.status, "detail": verdict.detail,
                                "action": "pass --rebroadcast to resend the identical bytes"})
                 continue
+            # Replay is a send. It carries the same preconditions as the first one: the
+            # code at the address is still the reviewed build, the row belongs to the
+            # deployment this run is configured for, and the deadline is still live at the
+            # moment of sending rather than at the moment the command started.
+            if row.contract_address != chain.canonical_address(
+                _required_env("WRASSE_ESCROW_ADDRESS")
+            ):
+                report.append({"intent_id": row.intent_id, "status": row.status,
+                               "action": "belongs to another deployment; not resent"})
+                continue
+            _require_deployment_identity(web3, _required_env("WRASSE_ESCROW_ADDRESS"), record)
+
+            send_time = _chain_now(web3)
+            if send_time is None or row.accept_by <= send_time:
+                row = ledger.set_status(row, chain.STUCK)
+                report.append({"intent_id": row.intent_id, "status": row.status,
+                               "action": "the deadline passed while resolving; not resent"})
+                continue
+
             row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
             try:
                 outcome = chain.broadcast(web3, row)

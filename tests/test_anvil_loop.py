@@ -471,3 +471,53 @@ def test_a_live_deadline_still_allows_the_deliberate_resend(rehearsal, capsys, m
     assert main(["tx-resolve", "--rebroadcast"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert "resent" in report[0]["action"]
+
+
+def test_replay_refuses_when_the_deployment_no_longer_matches(rehearsal, capsys, monkeypatch):
+    """A resend is a send, so it carries the same preconditions as the first one.
+
+    If the deployment were reorged out or the address repointed, replay would otherwise push
+    value at code nobody reviewed.
+    """
+    web3 = rehearsal["web3"]
+    future = int(web3.eth.get_block("latest")["timestamp"]) + 3_600
+    _unsent_row_with_deadline(rehearsal, future)
+
+    record = Path(os.environ["WRASSE_DEPLOYMENT_RECORD"])
+    body = json.loads(record.read_text())
+    body["runtime_bytecode_hash"] = "0x" + "ab" * 32
+    record.write_text(json.dumps(body))
+
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    before = web3.eth.get_transaction_count(rehearsal["buyer"].address, "latest")
+    with pytest.raises(RuntimeError, match="does not match the recorded deployment"):
+        main(["tx-resolve", "--rebroadcast"])
+    assert web3.eth.get_transaction_count(rehearsal["buyer"].address, "latest") == before
+
+
+def test_a_deadline_that_expires_during_resolution_stops_the_resend(
+    rehearsal, capsys, monkeypatch
+):
+    """The opening observation is not the one that matters.
+
+    Receipt, transaction and nonce reads all sit between it and the send, each able to retry
+    against a twenty second timeout. A transaction can be live when the command starts and
+    dead by the time it would go out.
+    """
+    from wrasse import cli
+
+    web3 = rehearsal["web3"]
+    now = int(web3.eth.get_block("latest")["timestamp"])
+    _unsent_row_with_deadline(rehearsal, now + 3_600)
+
+    readings = iter([now, now + 7_200])  # live when resolution starts, expired at the send
+    monkeypatch.setattr(cli, "_chain_now", lambda _web3: next(readings, now + 7_200))
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+
+    before = web3.eth.get_transaction_count(rehearsal["buyer"].address, "latest")
+    assert main(["tx-resolve", "--rebroadcast"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report[0]["status"] == chain.STUCK
+    assert "passed while resolving" in report[0]["action"]
+    assert web3.eth.get_transaction_count(rehearsal["buyer"].address, "latest") == before

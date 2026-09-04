@@ -45,6 +45,7 @@ class FakeEth:
         self.fail_receipts = False
         self.safe_supported = True
         self.echo_hash: bytes | None = None
+        self.safe_nonce: dict[str, int] = {}
 
     def get_transaction_receipt(self, tx_hash):
         if self.fail_receipts:
@@ -59,7 +60,9 @@ class FakeEth:
         return self.transactions[tx_hash]
 
     def get_transaction_count(self, address, tag):
-        table = self.latest if tag == "latest" else self.pending
+        if tag == "safe" and not self.safe_supported:
+            raise Boom("unknown block tag safe")
+        table = {"latest": self.latest, "pending": self.pending, "safe": self.safe_nonce}[tag]
         return table.get(chain.canonical_address(address), 0)
 
     def get_block(self, identifier):
@@ -429,7 +432,12 @@ def test_one_node_alone_cannot_declare_the_slot_spent(tmp_path):
     assert "no fallback RPC is configured" in verdict.detail
 
 
-def test_two_agreeing_nodes_declare_the_slot_spent(tmp_path):
+def test_a_nonce_used_only_at_the_tip_is_not_declared_spent(tmp_path):
+    """Two views of the tip are corroboration, not confirmation.
+
+    A short reorg can undo whatever advanced the nonce. This verdict releases the wallet, so
+    acting on an unsafe tip would simply reopen the gap a few blocks later.
+    """
     ledger = _ledger(tmp_path)
     row, _, _ = _record(ledger)
     primary, fallback = FakeWeb3(), FakeWeb3()
@@ -437,8 +445,34 @@ def test_two_agreeing_nodes_declare_the_slot_spent(tmp_path):
         node.eth.latest[row.wallet] = row.nonce + 1
 
     verdict = chain.resolve(primary, row, fallback_web3=fallback)
+    assert verdict.status == chain.NONCE_CONFLICT_PENDING
+    assert "not yet at the safe head" in verdict.detail
+
+
+def test_a_nonce_spent_at_the_safe_head_is_declared_spent(tmp_path):
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    primary, fallback = FakeWeb3(), FakeWeb3()
+    for node in (primary, fallback):
+        node.eth.latest[row.wallet] = row.nonce + 1
+        node.eth.safe_nonce[row.wallet] = row.nonce + 1
+
+    verdict = chain.resolve(primary, row, fallback_web3=fallback)
     assert verdict.status == chain.NONCE_CONSUMED_OR_REPLACED
     assert verdict.status in chain.TERMINAL_STATUSES
+
+
+def test_a_node_with_no_safe_head_cannot_abandon_the_payload(tmp_path):
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    primary, fallback = FakeWeb3(), FakeWeb3()
+    for node in (primary, fallback):
+        node.eth.latest[row.wallet] = row.nonce + 1
+        node.eth.safe_supported = False
+
+    verdict = chain.resolve(primary, row, fallback_web3=fallback)
+    assert verdict.status == chain.NONCE_CONFLICT_PENDING
+    assert "safe head" in verdict.detail
 
 
 def test_two_nodes_that_disagree_do_not_abandon_the_payload(tmp_path):
@@ -950,3 +984,63 @@ def test_the_rehearsal_confirmation_policy_refuses_a_real_node_on_loopback():
 
 def test_the_rehearsal_confirmation_policy_accepts_a_local_dev_node():
     assert "anvil" in chain.require_local_chain(_Node("anvil/v1.3.0"), "http://127.0.0.1:8545")
+
+
+def test_the_buyer_is_bound_to_the_key_that_signed(tmp_path):
+    """The buyer never appears in the calldata; the contract reads it as msg.sender.
+
+    Left unbound, the stored preimage could name someone else entirely and the audit trail
+    would describe a deal that did not happen.
+    """
+    import dataclasses
+
+    row = _create_deal_row(_ledger(tmp_path))
+    tampered = dict(row.preimage)
+    tampered["buyer"] = Web3.to_checksum_address("0x" + "aa" * 20)
+
+    with pytest.raises(chain.LedgerCorrupt, match="buyer"):
+        chain.verify_row_integrity(dataclasses.replace(row, preimage=tampered))
+
+
+def test_confirmation_checks_the_bytes_before_promoting_a_row(tmp_path):
+    """A confirmed row is what reconciliation turns into memory."""
+    import dataclasses
+
+    ledger = _ledger(tmp_path)
+    row = _create_deal_row(ledger)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED)
+    row = ledger.set_status(row, chain.INCLUDED_SUCCESS, block_number=3, block_hash="0x" + "0e" * 32)
+
+    web3 = FakeWeb3()
+    web3.eth.blocks[3] = {"hash": row.block_hash, "number": 3}
+    web3.eth.blocks["safe"] = {"number": 9}
+    assert chain.confirm(web3, row).status == chain.CONFIRMED_SUCCESS
+
+    corrupted = dataclasses.replace(row, calldata="0xdeadbeef")
+    with pytest.raises(chain.LedgerCorrupt):
+        chain.confirm(web3, corrupted)
+
+
+def test_only_a_first_send_may_release_its_nonce(tmp_path):
+    """The precondition lives in the ledger, not in whichever caller happens to be right."""
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+
+    with pytest.raises(chain.IllegalTransition, match="only a first send"):
+        ledger.mark_unbroadcast(row, "not attempted yet")
+
+    attempted = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+    released = ledger.mark_unbroadcast(attempted, "insufficient funds")
+    assert released.status == chain.UNBROADCAST
+
+
+def test_a_resent_transaction_can_never_release_its_nonce(tmp_path):
+    """Once bytes have been accepted somewhere, a later refusal proves nothing."""
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+    row = ledger.set_status(row, chain.PENDING)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+
+    with pytest.raises(chain.IllegalTransition, match="after 2 attempts"):
+        ledger.mark_unbroadcast(row, "refused on resend")
