@@ -17,6 +17,7 @@ def chain_event() -> ChainEvent:
         block_number=123456,
         event_type="timeout_claimed_without_delivery",
         deal_id=7,
+        buyer="0x4444444444444444444444444444444444444444",
         provider="0x3333333333333333333333333333333333333333",
         observed_at=datetime(2026, 9, 3, 12, 0, tzinfo=UTC).isoformat(),
     )

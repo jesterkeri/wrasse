@@ -401,6 +401,21 @@ class TransactionLedger:
         with self._connect() as connection:
             return self._find(connection, chain_id, wallet, contract_address, intent_id)
 
+    def find_by_tx_hash(self, *, chain_id: int, tx_hash: str) -> LedgerRow | None:
+        """The row this build recorded for these bytes, if it recorded any.
+
+        Reconciliation starts here rather than at the receipt: a transaction this build never
+        sent is not evidence of this build's behaviour, whatever the chain says about it.
+        """
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM transactions WHERE chain_id = ? AND lower(tx_hash) = lower(?)",
+                (chain_id, tx_hash),
+            )
+            record = cursor.fetchone()
+            return _row_from(record) if record is not None else None
+
     def rows(self, *, chain_id: int | None = None) -> list[LedgerRow]:
         with self._connect() as connection:
             if chain_id is None:

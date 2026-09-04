@@ -35,7 +35,7 @@ from .policy_hash import (
     require_inclusion_margin,
     validate_creatable,
 )
-from .reconciler import reconcile_timeout_claim
+from .reconciler import reconcile
 
 
 #: Bumped whenever the shape of policy.json changes. A consumer that does not recognise the
@@ -128,6 +128,31 @@ def _deployment_record() -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _store_path(role: str) -> Path:
+    default = f".wrasse/{role}-memory.db"
+    return Path(os.getenv(f"WRASSE_{role.upper()}_MEMORY_PATH", default))
+
+
+def _stores() -> dict[str, MemoryClient]:
+    """One memory per side, and never the same file twice.
+
+    Two paths that resolve to one store would make every bilateral claim in this project false
+    while appearing to work, and because both sides receive the same receipts the collision
+    would be invisible from the outside.
+    """
+
+    paths = {role: _store_path(role) for role in ("buyer", "provider")}
+    resolved = {role: path.resolve() for role, path in paths.items()}
+    if resolved["buyer"] == resolved["provider"]:
+        raise RuntimeError(
+            f"both memory paths resolve to {resolved['buyer']}; one store cannot hold two "
+            "independently held memories"
+        )
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    return {role: MemoryClient.local(path) for role, path in paths.items()}
+
+
 def _memory() -> MemoryClient:
     path = Path(os.getenv("WRASSE_MEMORY_PATH", ".wrasse/memory.db"))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,10 +217,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds a live quote must still have left after the observed chain time",
     )
     policy.add_argument("--output", type=Path)
-    reconcile = sub.add_parser("reconcile-timeout", help="verify a timeout receipt and persist it")
-    reconcile.add_argument("tx_hash")
-    reconcile.add_argument("--deal-id", type=int, required=True)
-    reconcile.add_argument("--provider", required=True)
+    ingest = sub.add_parser(
+        "reconcile", help="turn a confirmed receipt into evidence in both memories"
+    )
+    ingest.add_argument("--tx", required=True, dest="tx_hash")
 
     check = sub.add_parser("deploy-check", help="prove the configured address is this build")
     check.add_argument(
@@ -1177,17 +1202,24 @@ def main(argv: list[str] | None = None) -> int:
         return _tx_resolve(args)
     if args.command == "rebind-policy":
         return _rebind_policy(args)
-    if args.command == "reconcile-timeout":
-        contract = os.environ["WRASSE_ESCROW_ADDRESS"]
-        result = reconcile_timeout_claim(
-            _memory(),
+    if args.command == "reconcile":
+        results = reconcile(
+            _stores(),
             _web3(),
+            _ledger(),
             tx_hash=args.tx_hash,
             expected_chain_id=_chain_id(),
-            expected_contract=contract,
-            expected_deal_id=args.deal_id,
-            expected_provider=args.provider,
+            expected_contract=_required_env("WRASSE_ESCROW_ADDRESS"),
         )
-        print(json.dumps({"created": result.created, "entity": result.entity}, indent=2, sort_keys=True))
+        sample = next(iter(results.values()))
+        print(json.dumps({
+            "event_id": sample.entity["body"]["event_id"],
+            "event_type": sample.entity["body"]["event_type"],
+            "deal_id": sample.entity["body"]["deal_id"],
+            "buyer": sample.entity["body"]["buyer"],
+            "provider": sample.entity["body"]["provider"],
+            "delivered_to": {name: result.created for name, result in results.items()},
+            "note": "both memories receive the same neutral fact; each draws its own conclusion",
+        }, indent=2, sort_keys=True))
         return 0
     raise AssertionError("unreachable")
