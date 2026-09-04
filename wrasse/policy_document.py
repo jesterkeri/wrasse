@@ -21,7 +21,10 @@ from typing import Any
 
 from web3 import Web3
 
+from .engine import PROFILES
 from .policy_hash import (
+    EMPTY_EVIDENCE_HASH,
+    ENGINE_VERSION,
     MAX_DURATION,
     MAX_PROVIDER_BOND_BPS,
     PolicyPreimage,
@@ -52,6 +55,18 @@ _TOP_LEVEL = {
 }
 
 _PROFILE_KEYS = {"terms", "policy_preimage", "policy_hash"}
+
+_TERMS_KEYS = {"price_wei", "provider_bond_bps", "service_window", "risk", "evidence_event_ids"}
+
+_EXECUTABILITY_KEYS = {
+    "basis",
+    "reference_timestamp",
+    "chain",
+    "inclusion_margin_seconds",
+    "observed_lag_seconds",
+    "executable",
+    "note",
+}
 
 _PREIMAGE_KEYS = {
     "buyer",
@@ -209,6 +224,26 @@ def load_policy(
         available = ", ".join(sorted(profiles)) if isinstance(profiles, dict) else "none"
         raise PolicyDocumentError(f"no profile named {profile!r}; the document has: {available}")
 
+    if profile not in PROFILES:
+        raise PolicyDocumentError(
+            f"{profile!r} is not a profile this engine produces: {', '.join(sorted(PROFILES))}"
+        )
+    if document["engine_version"] != ENGINE_VERSION:
+        raise PolicyDocumentError(
+            f"the document was written by {document['engine_version']}, this build is "
+            f"{ENGINE_VERSION}; the version is hashed into the commitment"
+        )
+    if not _same_address(document["counterparty"], provider):
+        raise PolicyDocumentError(
+            f"the document was quoted against counterparty {document['counterparty']}, "
+            f"this run targets {provider}"
+        )
+    if not isinstance(document["cold_start"], bool):
+        raise PolicyDocumentError("cold_start is not a boolean")
+    if not isinstance(document["memory_verdict"], str):
+        raise PolicyDocumentError("memory_verdict is not a string")
+    _exact_keys(document["executability"], _EXECUTABILITY_KEYS, "executability")
+
     chosen = _exact_keys(profiles[profile], _PROFILE_KEYS, f"profile {profile!r}")
     preimage = _exact_keys(chosen["policy_preimage"], _PREIMAGE_KEYS, f"profile {profile!r} preimage")
 
@@ -257,12 +292,35 @@ def load_policy(
             f"profile {profile!r} quotes {chosen['policy_hash']} but its own fields hash to {recomputed}"
         )
 
-    _check_evidence(document, validated)
+    _check_terms(chosen["terms"], validated, profile)
+    _check_evidence(document, chosen["terms"], validated)
     return validated
 
 
-def _check_evidence(document: dict[str, Any], validated: ValidatedPolicy) -> None:
-    """The buyer's evidence commitment must cover exactly the receipts the document lists."""
+def _check_terms(terms: Any, validated: ValidatedPolicy, profile: str) -> None:
+    """The numbers a human reads must be the numbers the signature commits to.
+
+    `terms` is the displayed half of the document and `policy_preimage` is the signed half.
+    Validating only the signed half would let a file show a low price beside a commitment that
+    funds a high one, which is precisely the substitution an explainable receipt must rule out.
+    """
+
+    terms = _exact_keys(terms, _TERMS_KEYS, f"profile {profile!r} terms")
+    for name, displayed, committed in (
+        ("price_wei", terms["price_wei"], validated.price_wei),
+        ("provider_bond_bps", terms["provider_bond_bps"], validated.bond_bps),
+        ("service_window", terms["service_window"], validated.service_window),
+    ):
+        if displayed != committed:
+            raise PolicyDocumentError(
+                f"profile {profile!r} displays {name}={displayed!r} but commits to {committed!r}"
+            )
+    if not isinstance(terms["risk"], str):
+        raise PolicyDocumentError("risk is not a string")
+
+
+def _check_evidence(document: dict[str, Any], terms: dict[str, Any], validated: ValidatedPolicy) -> None:
+    """Both evidence commitments must describe exactly the receipts the document lists."""
 
     evidence = document["evidence"]
     if not isinstance(evidence, list):
@@ -279,4 +337,21 @@ def _check_evidence(document: dict[str, Any], validated: ValidatedPolicy) -> Non
         raise PolicyDocumentError(
             f"the buyer evidence commitment is {validated.buyer_evidence_hash}, but the listed "
             f"receipts hash to {expected}"
+        )
+
+    listed = terms["evidence_event_ids"]
+    if not isinstance(listed, list):
+        raise PolicyDocumentError("evidence_event_ids is not a list")
+    if evidence_hash(canonical_event_id(str(item)) for item in listed) != expected:
+        raise PolicyDocumentError(
+            "the receipts the profile says it priced are not the receipts it committed to"
+        )
+
+    # The provider recalls nothing about this buyer until bilateral recall lands, so this side
+    # must be the canonical empty set. Anything else here would be a commitment nothing in this
+    # build can explain.
+    if validated.provider_evidence_hash != EMPTY_EVIDENCE_HASH:
+        raise PolicyDocumentError(
+            "the provider evidence commitment is not the empty set, but nothing in this build "
+            "produces provider-side recall yet"
         )

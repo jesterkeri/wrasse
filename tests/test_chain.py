@@ -44,6 +44,7 @@ class FakeEth:
         self.send_error: Exception | None = None
         self.fail_receipts = False
         self.safe_supported = True
+        self.echo_hash: bytes | None = None
 
     def get_transaction_receipt(self, tx_hash):
         if self.fail_receipts:
@@ -72,7 +73,9 @@ class FakeEth:
         if self.send_error is not None:
             raise self.send_error
         self.sent.append(raw)
-        return raw
+        # A real node echoes the transaction hash, and the orchestrator checks that it names
+        # the transaction we actually sent.
+        return self.echo_hash if self.echo_hash is not None else Web3.keccak(raw)
 
 
 class FakeWeb3:
@@ -125,7 +128,7 @@ def _record(ledger, *, intent_id: str = INTENT, nonce: int = 0, chain_nonce: int
         wallet=wallet or account.address,
         contract_address=ESCROW,
         intent_id=intent_id,
-        chain_nonce=chain_nonce,
+        read_chain_nonce=lambda: chain_nonce,
         sign=sign,
     )
     return row, created, calls
@@ -408,7 +411,12 @@ def test_a_pending_nonce_alone_is_never_a_terminal_answer(tmp_path):
     assert verdict.may_rebroadcast is False
 
 
-def test_only_a_confirmed_nonce_declares_the_slot_spent(tmp_path):
+def test_one_node_alone_cannot_declare_the_slot_spent(tmp_path):
+    """Abandoning a payload is terminal, so it needs corroboration.
+
+    Without a second chain agreeing, the honest answer is that we do not know, which holds the
+    wallet rather than skipping a nonce.
+    """
     ledger = _ledger(tmp_path)
     row, _, _ = _record(ledger)
     web3 = FakeWeb3()
@@ -416,8 +424,53 @@ def test_only_a_confirmed_nonce_declares_the_slot_spent(tmp_path):
     web3.eth.pending[row.wallet] = row.nonce + 1
 
     verdict = chain.resolve(web3, row)
+    assert verdict.status == chain.NONCE_CONFLICT_PENDING
+    assert verdict.status not in chain.TERMINAL_STATUSES
+    assert "no fallback RPC is configured" in verdict.detail
+
+
+def test_two_agreeing_nodes_declare_the_slot_spent(tmp_path):
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    primary, fallback = FakeWeb3(), FakeWeb3()
+    for node in (primary, fallback):
+        node.eth.latest[row.wallet] = row.nonce + 1
+
+    verdict = chain.resolve(primary, row, fallback_web3=fallback)
     assert verdict.status == chain.NONCE_CONSUMED_OR_REPLACED
     assert verdict.status in chain.TERMINAL_STATUSES
+
+
+def test_two_nodes_that_disagree_do_not_abandon_the_payload(tmp_path):
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    primary, fallback = FakeWeb3(), FakeWeb3()
+    primary.eth.latest[row.wallet] = row.nonce + 1  # the fallback still sees the slot free
+
+    verdict = chain.resolve(primary, row, fallback_web3=fallback)
+    assert verdict.status == chain.NONCE_CONFLICT_PENDING
+    assert "disagree" in verdict.detail
+
+
+def test_a_fallback_on_the_wrong_chain_is_not_a_second_opinion(tmp_path):
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    primary, fallback = FakeWeb3(), FakeWeb3(chain_id=1)
+    primary.eth.latest[row.wallet] = row.nonce + 1
+
+    with pytest.raises(chain.RpcUnavailable, match="reports chain 1"):
+        chain.resolve(primary, row, fallback_web3=fallback)
+
+
+def test_a_node_naming_a_different_hash_is_an_integrity_failure(tmp_path):
+    """The local hash is authoritative. A node accepting something else is not agreeing."""
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    web3 = FakeWeb3()
+    web3.eth.echo_hash = bytes.fromhex("ee" * 32)
+
+    with pytest.raises(chain.LedgerCorrupt, match="but we sent"):
+        chain.broadcast(web3, row, environ={"WRASSE_ALLOW_BROADCAST": "1"})
 
 
 def test_the_fallback_rpc_is_asked_before_a_transaction_is_abandoned(tmp_path):
@@ -628,3 +681,272 @@ def test_a_wallet_that_cannot_cover_the_worst_case_does_not_sign():
 
     with pytest.raises(chain.LedgerError, match="worst case"):
         chain.require_affordable(10**12, value_wei=10**14, gas_limit=250_000, max_fee_wei=10**9)
+
+
+# --------------------------------------------------------------------------------------
+# Nonce lifecycle
+# --------------------------------------------------------------------------------------
+
+
+def test_a_nonce_that_never_reached_a_mempool_is_given_back(tmp_path):
+    """A pre-validation refusal means nothing can ever mine at that nonce.
+
+    Keeping it allocated would leave a permanent gap, and every later transaction from this
+    wallet would sit behind it forever. One bounced send would end the demo.
+    """
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, nonce=0, chain_nonce=0)
+    row = ledger.set_status(row, chain.UNBROADCAST, last_error="insufficient funds")
+    assert row.is_terminal is True
+
+    # A genuinely new intent, so different bytes and a different hash.
+    reused, created, calls = _record(
+        ledger, intent_id="next:urgent", nonce=0, chain_nonce=0, calldata="0xcafebabe"
+    )
+    assert created is True
+    assert calls == [0], "the released nonce must be offered again, not skipped"
+    assert reused.nonce == 0
+
+
+def test_a_held_nonce_is_not_given_back(tmp_path):
+    """`stuck` means we do not know, and not knowing is not permission to skip."""
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED)
+    ledger.set_status(row, chain.STUCK)
+
+    with pytest.raises(chain.WalletBusy):
+        _record(ledger, intent_id="next:urgent", nonce=1, chain_nonce=0)
+
+
+def test_the_nonce_is_read_inside_the_lock(tmp_path):
+    """A count taken before gas estimation is already old, and this lock does not stop other
+    users of the same wallet."""
+    ledger = _ledger(tmp_path)
+    reads: list[str] = []
+
+    account, intent = _signed(4)
+
+    def read_nonce() -> int:
+        reads.append("read")
+        return 4
+
+    row, created = ledger.record_signed(
+        chain_id=CHAIN_ID,
+        wallet=account.address,
+        contract_address=ESCROW,
+        intent_id="late:urgent",
+        read_chain_nonce=read_nonce,
+        sign=lambda allocated: intent,
+    )
+    assert created is True and row.nonce == 4 and reads == ["read"]
+
+
+# --------------------------------------------------------------------------------------
+# Concurrent resolvers
+# --------------------------------------------------------------------------------------
+
+
+def test_a_stale_resolver_cannot_overwrite_a_settled_row(tmp_path):
+    """Two tx-resolve runs can read the same included row.
+
+    If the second wrote its older opinion unconditionally, a confirmed transaction would be
+    downgraded to reorged by a process that simply looked earlier.
+    """
+    path = tmp_path / "state" / "transactions.db"
+    first = chain.TransactionLedger(path)
+    row, _, _ = _record(first)
+    row = first.set_status(row, chain.SEND_ATTEMPTED)
+    included = first.set_status(row, chain.INCLUDED_SUCCESS, block_number=9, block_hash="0x" + "0e" * 32)
+
+    second = chain.TransactionLedger(path)
+    stale = second.rows()[0]
+    assert stale.status == chain.INCLUDED_SUCCESS
+
+    first.set_status(included, chain.CONFIRMED_SUCCESS, block_number=9, block_hash="0x" + "0e" * 32)
+
+    with pytest.raises(chain.StaleStatus, match="but is now confirmed_success"):
+        second.set_status(stale, chain.REORGED)
+
+    assert second.rows()[0].status == chain.CONFIRMED_SUCCESS
+
+
+# --------------------------------------------------------------------------------------
+# Integrity of the recovery-critical columns
+# --------------------------------------------------------------------------------------
+
+
+def _create_deal_row(ledger, *, accept_by=1_800_000_000, price=10**14):
+    """A row whose calldata really is a createDeal, so the terms can be bound to it."""
+    from wrasse import escrow
+    from wrasse.policy_hash import EMPTY_EVIDENCE_HASH, ENGINE_VERSION, PolicyPreimage
+
+    account = Account.from_key(BUYER_KEY)
+    preimage = PolicyPreimage(
+        buyer=account.address,
+        provider=Web3.to_checksum_address("0x" + "33" * 20),
+        price=price,
+        bond_bps=2_000,
+        accept_by=accept_by,
+        service_window=7_200,
+        payout_delay=1_800,
+        engine_version=ENGINE_VERSION,
+        buyer_evidence_hash=EMPTY_EVIDENCE_HASH,
+        provider_evidence_hash=EMPTY_EVIDENCE_HASH,
+    )
+    calldata = escrow.create_deal_calldata(
+        Web3(), ESCROW,
+        provider=preimage.provider, bond_bps=preimage.bond_bps, accept_by=accept_by,
+        service_window=preimage.service_window, payout_delay=preimage.payout_delay,
+        engine_version_hash="0x" + bytes(Web3.keccak(text=ENGINE_VERSION)).hex(),
+        buyer_evidence_hash=preimage.buyer_evidence_hash,
+        provider_evidence_hash=preimage.provider_evidence_hash,
+    )
+    transaction = {
+        "chainId": CHAIN_ID, "nonce": 0, "to": ESCROW, "data": calldata, "value": price,
+        "maxFeePerGas": 10**9, "maxPriorityFeePerGas": 10**6, "gas": 250_000, "type": 2,
+    }
+    intent = chain.with_intent_context(
+        chain.sign_transaction(account, transaction), accept_by=accept_by, preimage=preimage.as_dict()
+    )
+    row, _ = ledger.record_signed(
+        chain_id=CHAIN_ID, wallet=account.address, contract_address=ESCROW,
+        intent_id="terms:urgent", read_chain_nonce=lambda: 0, sign=lambda n: intent,
+    )
+    return row
+
+
+def test_the_deadline_the_resolver_reads_is_the_one_the_transaction_commits(tmp_path):
+    """`accept_by` decides whether a rebroadcast can still succeed.
+
+    Moving it forward in the row while the signed bytes still carry the expired deadline would
+    let a dead transaction be resent.
+    """
+    import dataclasses
+
+    row = _create_deal_row(_ledger(tmp_path))
+    chain.verify_row_integrity(row)
+
+    with pytest.raises(chain.LedgerCorrupt, match="calldata commits to acceptBy"):
+        chain.verify_row_integrity(dataclasses.replace(row, accept_by=row.accept_by + 10_000))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("price", 1),
+        ("bond_bps", 1),
+        ("service_window", 60),
+        ("payout_delay", 60),
+        ("engine_version", "wrasse/9.9.9"),
+        ("provider", "0x" + "aa" * 20),
+        ("buyer_evidence_hash", "0x" + "bb" * 32),
+        ("provider_evidence_hash", "0x" + "cc" * 32),
+    ],
+)
+def test_the_stored_preimage_is_bound_to_the_transaction(tmp_path, field, value):
+    """The preimage is what an audit trail says the deal committed to.
+
+    Unbound, it could describe terms other than the ones actually funded.
+    """
+    import dataclasses
+
+    row = _create_deal_row(_ledger(tmp_path))
+    tampered = dict(row.preimage)
+    tampered[field] = value
+
+    with pytest.raises(chain.LedgerCorrupt, match="commits|preimage"):
+        chain.verify_row_integrity(dataclasses.replace(row, preimage=tampered))
+
+
+def test_calldata_with_the_right_selector_but_wrong_arguments_is_caught(tmp_path):
+    import dataclasses
+    from wrasse import escrow
+
+    row = _create_deal_row(_ledger(tmp_path))
+    forged = escrow.create_deal_calldata(
+        Web3(), ESCROW, provider="0x" + "ee" * 20, bond_bps=1, accept_by=row.accept_by,
+        service_window=1, payout_delay=1,
+        engine_version_hash="0x" + "00" * 32,
+        buyer_evidence_hash="0x" + "00" * 32, provider_evidence_hash="0x" + "00" * 32,
+    )
+    with pytest.raises(chain.LedgerCorrupt):
+        chain.verify_row_integrity(dataclasses.replace(row, calldata=forged))
+
+
+# --------------------------------------------------------------------------------------
+# Reads retry, sends never do
+# --------------------------------------------------------------------------------------
+
+
+class _Flaky:
+    def __init__(self, failures: int, error: Exception) -> None:
+        self.calls = 0
+        self.failures = failures
+        self.error = error
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise self.error
+        return "answer"
+
+
+def test_a_transient_read_failure_is_retried_within_a_bound(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(chain, "_sleep", slept.append)
+
+    call = _Flaky(2, Boom("502 Bad Gateway"))
+    assert chain._read(call, describe="probe") == "answer"
+    assert call.calls == 3
+    assert len(slept) == 2 and all(delay > 0 for delay in slept)
+
+
+def test_a_persistent_read_failure_gives_up_and_says_so(monkeypatch):
+    monkeypatch.setattr(chain, "_sleep", lambda _: None)
+    call = _Flaky(99, Boom("429 Too Many Requests"))
+
+    with pytest.raises(chain.RpcUnavailable, match="probe"):
+        chain._read(call, describe="probe")
+    assert call.calls == chain.READ_ATTEMPTS
+
+
+def test_a_server_that_names_its_own_delay_is_obeyed(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(chain, "_sleep", slept.append)
+
+    class Throttled(Exception):
+        class response:  # noqa: N801 - mimics a requests response
+            headers = {"Retry-After": "2.5"}
+
+    call = _Flaky(1, Throttled())
+    assert chain._read(call, describe="probe") == "answer"
+    assert slept == [2.5]
+
+
+# --------------------------------------------------------------------------------------
+# The rehearsal fence
+# --------------------------------------------------------------------------------------
+
+
+class _Node:
+    def __init__(self, client: str) -> None:
+        self.client_version = client
+        self.eth = FakeEth()
+
+
+def test_the_rehearsal_confirmation_policy_refuses_a_real_endpoint():
+    """A warning is not a boundary, and the chain id cannot fence this because the rehearsal
+    deliberately runs on the production one."""
+    with pytest.raises(chain.NotALocalChain, match="not a loopback"):
+        chain.require_local_chain(_Node("anvil/v1.0"), "https://sepolia.base.org")
+
+
+def test_the_rehearsal_confirmation_policy_refuses_a_real_node_on_loopback():
+    """A tunnel or a proxy can put a real network on a local address."""
+    with pytest.raises(chain.NotALocalChain, match="not local development software"):
+        chain.require_local_chain(_Node("Geth/v1.14.0"), "http://127.0.0.1:8545")
+
+
+def test_the_rehearsal_confirmation_policy_accepts_a_local_dev_node():
+    assert "anvil" in chain.require_local_chain(_Node("anvil/v1.3.0"), "http://127.0.0.1:8545")

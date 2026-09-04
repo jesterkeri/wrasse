@@ -100,8 +100,13 @@ deployed runtime bytecode compared against the compiled artifact and the record 
 bytecode. It also runs the canonical policy fixture through the deployed contract, which
 moves the cross-language check from a test to the address the demo will use.
 
-`create-deal` looks up the quote's stable identity first, before reading the chain or
-touching the keystore. `policy.json` carries a `request_id` minted before any transaction
+`create-deal` refuses to send value unless the code at the configured address hashes to
+the artifact this build compiled and to the recorded deployment. `deploy-check` reports the
+same comparison, but reporting is not enough on the path that moves money: a contract can
+implement one matching pure function and still make `createDeal` do something else.
+
+It looks up the quote's stable identity first, before reading the chain or touching the
+keystore. `policy.json` carries a `request_id` minted before any transaction
 exists, and the execution identity is that id paired with the explicitly chosen profile.
 Nothing about it depends on the terms, which is what makes a retry a retry: the acceptance
 deadline is re-derived from chain time immediately before signing, so the committed hash
@@ -117,10 +122,31 @@ set it in `.env`.
 `tx-resolve` owns every persisted transition, and `--rebroadcast` is the only path that can
 resend, and only ever the identical recorded bytes.
 
+The document is validated as untrusted input, because between being written and being
+signed against it is a file anything can edit. The half a person reads and the half a
+signature commits to are separate objects in it, so the displayed price, bond and window are
+each checked against the committed ones. A file that showed a small price beside a commitment
+funding a large one would be an explainable receipt for a deal that never happened.
+
 Settlement records live in `.wrasse/transactions.db`, deliberately separate from the Sibyl
 memory store. A row is a claim about some signed bytes; the bytes are the authority, so every
-load decodes them and checks the sender, chain, nonce, destination, calldata, value and fees
-against the row before anything acts on it.
+load decodes them and checks the sender, chain, nonce, destination, calldata, value, fees,
+the acceptance deadline and every committed term against the row before anything acts on it.
+
+### Nonces, and the one that comes back
+
+A wallet holds one transaction at a time. Anything unresolved holds it, including a
+transaction we cannot account for, because skipping a nonce strands every later transaction
+behind the gap.
+
+There is one exception. A node that refuses a transaction during pre-validation, for
+insufficient funds or too little intrinsic gas, never admitted it anywhere. Nothing can mine
+at that nonce, so it is released and offered again. That only applies to a first attempt: once
+bytes have been accepted somewhere, a later refusal proves nothing and the nonce is held.
+
+Reads are retried a bounded number of times with jitter, honouring a server that names its own
+delay. A broadcast never is. Uncertainty after sending goes to the resolver, which can only
+resend the identical bytes.
 
 ### Inclusion, confirmation and what `safe` means
 
@@ -134,8 +160,13 @@ back to the latest block.
 
 Local chains have no meaningful safe head. Anvil pins it at block zero forever, so the
 rehearsal passes `--local-confirmation-blocks` to count blocks instead. That is a rehearsal
-affordance, not a finality claim, it has to be typed on the command, and it is named in every
-result it produces.
+affordance, not a finality claim.
+
+A printed warning would not be a boundary, and the chain id cannot be one either, because the
+rehearsal deliberately runs on the production chain id so that the chain-id checks are
+exercised. The option therefore requires two independent facts that a real network cannot
+satisfy: the endpoint is loopback, and the node identifies itself as local development
+software. It is named in every result it produces.
 
 ### The deliberate crash
 

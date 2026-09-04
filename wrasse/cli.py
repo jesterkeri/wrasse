@@ -24,6 +24,7 @@ from .memory_gate import recall_counterparty_evidence
 from .policy_document import PolicyDocumentError, ValidatedPolicy, load_policy
 from .policy_hash import (
     BPS_DENOMINATOR,
+    ENGINE_VERSION,
     DEFAULT_INCLUSION_MARGIN_SECONDS,
     EMPTY_EVIDENCE_HASH,
     MAX_DURATION,
@@ -40,10 +41,6 @@ from .reconciler import reconcile_timeout_claim
 #: Bumped whenever the shape of policy.json changes. A consumer that does not recognise the
 #: version must refuse the document rather than guess which fields it is looking at.
 POLICY_SCHEMA_VERSION = 1
-
-#: Hashed into every commitment, so it is a term of the deal and not a label.
-ENGINE_VERSION = "wrasse/0.1.0"
-
 
 def _write_atomic(path: Path, text: str) -> None:
     """Replace a file in one step, or not at all.
@@ -75,8 +72,21 @@ def _escrow_address() -> str | None:
     return Web3.to_checksum_address(configured) if configured else None
 
 
+#: Every RPC call is bounded. A hung read must fail rather than sit inside a write lock or
+#: quietly eat the inclusion margin.
+RPC_TIMEOUT_SECONDS = 20
+
+
+def _provider(url: str) -> HTTPProvider:
+    return HTTPProvider(url, request_kwargs={"timeout": RPC_TIMEOUT_SECONDS})
+
+
+def _rpc_url() -> str:
+    return os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")
+
+
 def _web3() -> Web3:
-    return Web3(HTTPProvider(os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")))
+    return Web3(_provider(_rpc_url()))
 
 
 def _chain_id() -> int:
@@ -91,7 +101,7 @@ def _fallback_web3() -> Web3 | None:
     """A second opinion, used only before abandoning a transaction as replaced."""
 
     url = (os.getenv("BASE_SEPOLIA_FALLBACK_RPC_URL") or "").strip()
-    return Web3(HTTPProvider(url)) if url else None
+    return Web3(_provider(url)) if url else None
 
 
 def _required_env(name: str) -> str:
@@ -378,6 +388,40 @@ def _deploy_check(args) -> int:
     return 0 if ok else 1
 
 
+def _require_deployment_identity(web3: Web3, address: str, record: dict) -> None:
+    """The bytecode at this address must be the build that was reviewed.
+
+    `deploy-check` reports; this refuses. It sits on the path that moves value, because a
+    contract implementing one matching pure function can still make `createDeal` do something
+    else entirely.
+    """
+
+    if int(web3.eth.chain_id) != _chain_id():
+        raise RuntimeError(f"the node reports chain {web3.eth.chain_id}, configuration says {_chain_id()}")
+    if Web3.to_checksum_address(record["address"]) != Web3.to_checksum_address(address):
+        raise RuntimeError(f"the deployment record names {record['address']}, configuration names {address}")
+
+    deployed = escrow.deployed_runtime_hash(web3, address)
+    if deployed != escrow.artifact_runtime_hash():
+        raise RuntimeError(
+            f"the code at {address} hashes to {deployed}, which is not the artifact this build "
+            "compiled; refusing to send value to a contract that was not reviewed"
+        )
+    if deployed != record["runtime_bytecode_hash"]:
+        raise RuntimeError(f"the code at {address} does not match the recorded deployment")
+
+    # The recorded deployment block must still be the block it was recorded as.
+    block = web3.eth.get_block(int(record["block_number"]))
+    recorded_hash = str(record["block_hash"])
+    if not recorded_hash.startswith("0x"):
+        recorded_hash = "0x" + recorded_hash
+    if "0x" + bytes(block["hash"]).hex() != recorded_hash.lower():
+        raise RuntimeError(
+            f"deployment block {record['block_number']} no longer has the recorded hash; "
+            "the deployment record and this chain disagree"
+        )
+
+
 def _fee_fields(web3: Web3) -> tuple[int, int]:
     """A priority fee the chain will accept, and a ceiling that survives a fee rise."""
 
@@ -425,6 +469,8 @@ def _create_deal(args) -> int:
         }, indent=2, sort_keys=True))
         return 0
 
+    _require_deployment_identity(web3, address, _deployment_record())
+
     account = chain.load_signer(
         _required_env("WRASSE_KEYSTORE"),
         _required_env("WRASSE_KEYSTORE_PASSWORD_FILE"),
@@ -465,7 +511,6 @@ def _create_deal(args) -> int:
         gas_limit=gas_limit,
         max_fee_wei=max_fee,
     )
-    chain_nonce = int(web3.eth.get_transaction_count(buyer, "pending"))
     committed: dict = {}
 
     def sign(nonce: int) -> chain.SignedIntent:
@@ -497,6 +542,20 @@ def _create_deal(args) -> int:
                 f"{onchain_hash}; refusing to commit to terms the chain reads differently"
             )
 
+        # That call is an RPC and can stall, so the deadline is judged once more against the
+        # newest block. `accept_by` is already fixed by the hash above, so this re-checks the
+        # committed value rather than moving it.
+        latest = observe_chain_time(web3, expected_chain_id=chain_id)
+        local_now = int(time.time())
+        require_recent(latest, local_now=local_now)
+        validate_creatable(preimage, reference_timestamp=latest.timestamp)
+        require_inclusion_margin(
+            preimage,
+            chain_timestamp=latest.timestamp,
+            observed_lag_seconds=past_lag(latest, local_now=local_now),
+            margin_seconds=args.inclusion_margin,
+        )
+
         transaction = {
             "chainId": chain_id,
             "nonce": nonce,
@@ -524,7 +583,9 @@ def _create_deal(args) -> int:
         wallet=buyer,
         contract_address=address,
         intent_id=policy.intent_id,
-        chain_nonce=chain_nonce,
+        # Read inside the lock. A count taken before gas estimation is already old, and this
+        # program's lock does not stop anything else using the same wallet.
+        read_chain_nonce=lambda: int(web3.eth.get_transaction_count(buyer, "pending")),
         sign=sign,
     )
     if not created:
@@ -538,9 +599,18 @@ def _create_deal(args) -> int:
     try:
         outcome = chain.broadcast(web3, row)
     except chain.DeterministicRejection as error:
-        ledger.set_status(row, chain.REJECTED, last_error=str(error))
-        print(json.dumps({"intent_id": row.intent_id, "status": chain.REJECTED,
-                          "error": str(error)}, indent=2, sort_keys=True))
+        # The node refused it during pre-validation, on the very first attempt, so these bytes
+        # never entered a mempool and nothing can ever mine at this nonce. Releasing it is the
+        # difference between one bounced send and a wallet that is stuck forever.
+        ledger.set_status(row, chain.UNBROADCAST, last_error=str(error))
+        print(json.dumps({
+            "intent_id": row.intent_id,
+            "status": chain.UNBROADCAST,
+            "nonce_released": row.nonce,
+            "error": str(error),
+            "note": "the node refused this before admitting it, so nonce "
+                    f"{row.nonce} was never used and is available again",
+        }, indent=2, sort_keys=True))
         return 1
 
     row = ledger.set_status(
@@ -563,6 +633,19 @@ def _create_deal(args) -> int:
     return 0
 
 
+def _chain_now(web3: Web3) -> int | None:
+    """The chain's own clock, or None if it could not be read.
+
+    Only the chain decides whether a deadline has passed. Not knowing the time is a reason to
+    refuse a resend, never a reason to assume there is still time.
+    """
+
+    try:
+        return observe_chain_time(web3, expected_chain_id=_chain_id()).timestamp
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _rows_for(args, ledger: chain.TransactionLedger) -> list[chain.LedgerRow]:
     rows = ledger.rows(chain_id=_chain_id())
     intent = getattr(args, "intent", None)
@@ -578,6 +661,7 @@ def _tx_status(args) -> int:
     ledger = _ledger()
     web3 = _web3()
     fallback = _fallback_web3()
+    chain_now = _chain_now(web3)
     report = []
     for row in _rows_for(args, ledger):
         entry = {"intent_id": row.intent_id, "status": row.status, "nonce": row.nonce,
@@ -586,9 +670,9 @@ def _tx_status(args) -> int:
             entry["verdict"] = {"status": row.status, "detail": "terminal"}
         else:
             try:
-                verdict = chain.resolve(web3, row, fallback_web3=fallback)
+                verdict = chain.resolve(web3, row, fallback_web3=fallback, chain_now=chain_now)
                 entry["verdict"] = {"status": verdict.status, "detail": verdict.detail,
-                                    "may_rebroadcast": verdict.may_rebroadcast}
+                                    "may_rebroadcast": verdict.may_rebroadcast and chain_now is not None}
             except chain.RpcUnavailable as error:
                 entry["verdict"] = {"status": "unreadable", "detail": str(error)}
         report.append(entry)
@@ -604,32 +688,63 @@ def _tx_resolve(args) -> int:
     fallback = _fallback_web3()
     report = []
 
-    policy = (
-        chain.local_depth_policy(args.local_confirmation_blocks)
-        if args.local_confirmation_blocks is not None
-        else chain.safe_head_policy()
-    )
     if args.local_confirmation_blocks is not None:
+        # A warning is not a boundary. The rehearsal runs on the production chain id on
+        # purpose, so the id cannot fence this; two independent local facts must.
+        client = chain.require_local_chain(web3, _rpc_url())
+        policy = chain.local_depth_policy(args.local_confirmation_blocks)
         print(
-            f"!! confirming by {policy.name}, not by the chain's safe head. Rehearsal only.",
+            f"!! confirming by {policy.name} against {client}, not by the chain's safe head. "
+            "Rehearsal only.",
             file=sys.stderr,
         )
+    else:
+        policy = chain.safe_head_policy()
+
+    chain_now = _chain_now(web3)
 
     for row in _rows_for(args, ledger):
         if row.is_terminal:
             report.append({"intent_id": row.intent_id, "status": row.status, "action": "none"})
             continue
 
-        verdict = chain.resolve(web3, row, fallback_web3=fallback)
+        # An included row is judged as included first. Asking the unmined resolver about it
+        # would return a verdict the state graph cannot accept, and a reorg would raise instead
+        # of being recorded.
+        if row.status in (chain.INCLUDED_SUCCESS, chain.INCLUDED_REVERTED):
+            settled = chain.confirm(web3, row, policy=policy)
+            if settled.status != row.status:
+                row = ledger.set_status(row, settled.status, block_number=settled.block_number,
+                                        block_hash=settled.block_hash)
+            report.append({"intent_id": row.intent_id, "status": row.status,
+                           "confirmation_basis": policy.name,
+                           "detail": settled.detail, "action": "resolved"})
+            continue
+
+        verdict = chain.resolve(web3, row, fallback_web3=fallback, chain_now=chain_now)
 
         if verdict.status == chain.UNKNOWN:
+            if chain_now is None:
+                report.append({"intent_id": row.intent_id, "status": row.status,
+                               "verdict": verdict.status,
+                               "action": "chain time unreadable; refusing to resend blind"})
+                continue
             if not args.rebroadcast:
                 report.append({"intent_id": row.intent_id, "status": row.status,
                                "verdict": verdict.status, "detail": verdict.detail,
                                "action": "pass --rebroadcast to resend the identical bytes"})
                 continue
             row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
-            outcome = chain.broadcast(web3, row)
+            try:
+                outcome = chain.broadcast(web3, row)
+            except chain.DeterministicRejection as error:
+                # These bytes were accepted somewhere once, so unlike the first send this does
+                # not prove the nonce is free. Hold the wallet and say so.
+                row = ledger.set_status(row, chain.STUCK, last_error=str(error))
+                report.append({"intent_id": row.intent_id, "status": row.status,
+                               "action": "refused on resend; the nonce is held, not released",
+                               "detail": str(error)})
+                continue
             row = ledger.set_status(row, outcome.status,
                                     last_error=None if outcome.status == chain.PENDING else outcome.detail)
             report.append({"intent_id": row.intent_id, "status": row.status,
@@ -640,6 +755,8 @@ def _tx_resolve(args) -> int:
             row = ledger.set_status(row, verdict.status, block_number=verdict.block_number,
                                     block_hash=verdict.block_hash, last_error=None)
 
+        # A row that just became included is confirmed in the same pass, so one command takes
+        # a transaction all the way rather than needing to be run twice.
         if row.status in (chain.INCLUDED_SUCCESS, chain.INCLUDED_REVERTED):
             settled = chain.confirm(web3, row, policy=policy)
             if settled.status != row.status:

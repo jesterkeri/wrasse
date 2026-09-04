@@ -150,6 +150,47 @@ def create_deal_calldata(
     )
 
 
+CREATE_DEAL_TYPES = [
+    "address",
+    "uint256",
+    "uint64",
+    "uint64",
+    "uint64",
+    "bytes32",
+    "bytes32",
+    "bytes32",
+]
+CREATE_DEAL_SELECTOR = "0x" + bytes(
+    Web3.keccak(text="createDeal(address,uint256,uint64,uint64,uint64,bytes32,bytes32,bytes32)")
+)[:4].hex()
+
+
+def decode_create_deal(calldata: str) -> dict[str, Any] | None:
+    """Pull the committed arguments back out of the calldata, or None if it is not a createDeal.
+
+    The ledger stores a description of a transaction beside the bytes. Only reading the bytes
+    can show that the description is true.
+    """
+
+    from eth_abi import decode
+
+    raw = bytes.fromhex(calldata.removeprefix("0x"))
+    if len(raw) < 4 or "0x" + raw[:4].hex() != CREATE_DEAL_SELECTOR:
+        return None
+
+    values = decode(CREATE_DEAL_TYPES, raw[4:])
+    return {
+        "provider": Web3.to_checksum_address(values[0]),
+        "bond_bps": int(values[1]),
+        "accept_by": int(values[2]),
+        "service_window": int(values[3]),
+        "payout_delay": int(values[4]),
+        "engine_version_hash": "0x" + values[5].hex(),
+        "buyer_evidence_hash": "0x" + values[6].hex(),
+        "provider_evidence_hash": "0x" + values[7].hex(),
+    }
+
+
 def compute_policy_hash_onchain(web3: Any, address: str, preimage: Any) -> str:
     """Ask the deployed contract for the commitment it would store.
 

@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -286,3 +287,187 @@ def _decode_creation(web3: Web3, address: str, receipt) -> dict:
         )
         return {"accept_by": values[3], "policy_hash": "0x" + values[6].hex()}
     raise AssertionError("no DealCreated log from the escrow in this receipt")
+
+
+def test_a_released_nonce_is_reused_and_actually_mines(rehearsal, capsys, monkeypatch):
+    """The end-to-end version of the nonce-gap failure.
+
+    A send refused before it entered a mempool leaves nonce 0 unused. If the ledger kept it
+    allocated, the next transaction would sign at nonce 1 and sit unmined forever behind the
+    gap. Signing is not the property under test here; mining is.
+    """
+    ledger = chain.TransactionLedger(os.environ["WRASSE_TX_DB"])
+    buyer = rehearsal["buyer"]
+
+    # Stand in for a deterministic rejection on the very first attempt.
+    bounced = Account.from_key(buyer.key).sign_transaction({
+        "chainId": CHAIN_ID, "nonce": 0, "to": rehearsal["address"], "data": "0xdeadbeef",
+        "value": 1, "maxFeePerGas": 10**9, "maxPriorityFeePerGas": 10**6,
+        "gas": 250_000, "type": 2,
+    })
+    raw = "0x" + bytes(bounced.raw_transaction).hex()
+    row, created = ledger.record_signed(
+        chain_id=CHAIN_ID, wallet=buyer.address, contract_address=rehearsal["address"],
+        intent_id="bounced:urgent", read_chain_nonce=lambda: 0,
+        sign=lambda nonce: chain.SignedIntent(
+            nonce=nonce, calldata="0xdeadbeef", value_wei=1, max_fee_wei=10**9,
+            max_priority_wei=10**6, gas_limit=250_000, accept_by=0, preimage={},
+            tx_hash="0x" + bytes(Web3.keccak(hexstr=raw)).hex(), raw=raw,
+        ),
+    )
+    assert created is True and row.nonce == 0
+    ledger.set_status(row, chain.UNBROADCAST, last_error="insufficient funds for gas * price + value")
+
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    assert main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"]) == 0
+    created_deal = json.loads(capsys.readouterr().out)
+    assert created_deal["nonce"] == 0, "the released nonce must be reused, not skipped"
+
+    receipt = rehearsal["web3"].eth.wait_for_transaction_receipt(created_deal["tx_hash"])
+    assert receipt["status"] == 1, "the replacement must actually mine, not merely sign"
+
+
+def test_an_included_receipt_that_stops_being_canonical_is_recorded_as_reorged(
+    rehearsal, capsys, monkeypatch
+):
+    """The CLI lifecycle, not the helper.
+
+    A reorg turns an included row's verdict into one the unmined resolver would return, which
+    the state graph refuses. Judging included rows as included first is what keeps that from
+    raising instead of being recorded.
+    """
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    assert main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"]) == 0
+    created = json.loads(capsys.readouterr().out)
+    rehearsal["web3"].eth.wait_for_transaction_receipt(created["tx_hash"])
+
+    # Anvil pins its safe head at zero, so the real rule leaves the row included, not confirmed.
+    assert main(["tx-resolve"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["status"] == chain.INCLUDED_SUCCESS
+
+    # The block this was included in is no longer the block we recorded.
+    ledger = chain.TransactionLedger(os.environ["WRASSE_TX_DB"])
+    row = ledger.rows()[0]
+    with sqlite3.connect(os.environ["WRASSE_TX_DB"]) as connection:
+        connection.execute(
+            "UPDATE transactions SET block_hash = ? WHERE intent_id = ?",
+            ("0x" + "de" * 32, row.intent_id),
+        )
+
+    assert main(["tx-resolve"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["status"] == chain.REORGED
+
+
+def test_the_rehearsal_confirmation_policy_is_refused_against_a_real_endpoint(
+    rehearsal, capsys, monkeypatch
+):
+    """The flag must be fenced by something a real network cannot satisfy."""
+    monkeypatch.setenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")
+    with pytest.raises(chain.NotALocalChain, match="not a loopback"):
+        main(["tx-resolve", "--local-confirmation-blocks", "0"])
+
+
+def test_create_deal_refuses_an_address_that_is_not_the_reviewed_build(
+    rehearsal, capsys, monkeypatch
+):
+    """deploy-check reports; the money path has to refuse.
+
+    A contract can implement one matching pure function and still make createDeal do something
+    else entirely, so proving the hash of one function is not proving the deployment.
+    """
+    web3 = rehearsal["web3"]
+    other = web3.eth.send_transaction({"from": web3.eth.accounts[0], "data": "0x60016000f3"})
+    address = Web3.to_checksum_address(web3.eth.wait_for_transaction_receipt(other)["contractAddress"])
+
+    # Quote against the decoy too, so the document itself is consistent and the only thing
+    # left standing between the wallet and the wrong contract is the identity gate.
+    monkeypatch.setenv("WRASSE_ESCROW_ADDRESS", address)
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+
+    with pytest.raises(RuntimeError, match="deployment record names"):
+        main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
+
+    # And with the record pointed at the decoy as well, the bytecode is what refuses.
+    record = Path(os.environ["WRASSE_DEPLOYMENT_RECORD"])
+    body = json.loads(record.read_text())
+    body["address"] = address
+    body["block_number"] = 0
+    body["block_hash"] = "0x" + bytes(web3.eth.get_block(0)["hash"]).hex()
+    record.write_text(json.dumps(body))
+
+    with pytest.raises(RuntimeError, match="not the artifact this build compiled"):
+        main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
+
+
+def _unsent_row_with_deadline(rehearsal, accept_by: int):
+    """A signed, never-broadcast createDeal whose acceptance deadline is already in the past."""
+    from wrasse import escrow
+    from wrasse.policy_hash import EMPTY_EVIDENCE_HASH, ENGINE_VERSION, PolicyPreimage
+
+    buyer = rehearsal["buyer"]
+    address = rehearsal["address"]
+    preimage = PolicyPreimage(
+        buyer=buyer.address, provider=PROVIDER, price=10**13, bond_bps=2_000,
+        accept_by=accept_by, service_window=7_200, payout_delay=1_800,
+        engine_version=ENGINE_VERSION,
+        buyer_evidence_hash=EMPTY_EVIDENCE_HASH, provider_evidence_hash=EMPTY_EVIDENCE_HASH,
+    )
+    calldata = escrow.create_deal_calldata(
+        rehearsal["web3"], address, provider=PROVIDER, bond_bps=2_000, accept_by=accept_by,
+        service_window=7_200, payout_delay=1_800,
+        engine_version_hash="0x" + bytes(Web3.keccak(text=ENGINE_VERSION)).hex(),
+        buyer_evidence_hash=EMPTY_EVIDENCE_HASH, provider_evidence_hash=EMPTY_EVIDENCE_HASH,
+    )
+    signed = Account.from_key(buyer.key).sign_transaction({
+        "chainId": CHAIN_ID, "nonce": 0, "to": address, "data": calldata, "value": 10**13,
+        "maxFeePerGas": 10**9, "maxPriorityFeePerGas": 10**6, "gas": 400_000, "type": 2,
+    })
+    raw = "0x" + bytes(signed.raw_transaction).hex()
+    ledger = chain.TransactionLedger(os.environ["WRASSE_TX_DB"])
+    row, _ = ledger.record_signed(
+        chain_id=CHAIN_ID, wallet=buyer.address, contract_address=address,
+        intent_id="expired:urgent", read_chain_nonce=lambda: 0,
+        sign=lambda nonce: chain.SignedIntent(
+            nonce=nonce, calldata=calldata, value_wei=10**13, max_fee_wei=10**9,
+            max_priority_wei=10**6, gas_limit=400_000, accept_by=accept_by,
+            preimage=preimage.as_dict(),
+            tx_hash="0x" + bytes(Web3.keccak(hexstr=raw)).hex(), raw=raw,
+        ),
+    )
+    return ledger, ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+
+
+def test_an_expired_transaction_is_not_resent_by_the_command_that_can_resend(
+    rehearsal, capsys, monkeypatch
+):
+    """Only the chain's clock decides whether a deadline has passed.
+
+    The helper takes chain time as an argument, so a command that never supplies it would
+    report `unknown` and cheerfully resend bytes the contract must reject.
+    """
+    web3 = rehearsal["web3"]
+    past = int(web3.eth.get_block("latest")["timestamp"]) - 10
+    _, row = _unsent_row_with_deadline(rehearsal, past)
+    before = web3.eth.get_transaction_count(rehearsal["buyer"].address, "latest")
+
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    assert main(["tx-resolve", "--rebroadcast"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report[0]["status"] == chain.STUCK
+    assert web3.eth.get_transaction_count(rehearsal["buyer"].address, "latest") == before
+
+
+def test_a_live_deadline_still_allows_the_deliberate_resend(rehearsal, capsys, monkeypatch):
+    """The counterpart, so the test above is proving the deadline and not just refusing."""
+    web3 = rehearsal["web3"]
+    future = int(web3.eth.get_block("latest")["timestamp"]) + 3_600
+    _, row = _unsent_row_with_deadline(rehearsal, future)
+
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    assert main(["tx-resolve", "--rebroadcast"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert "resent" in report[0]["action"]

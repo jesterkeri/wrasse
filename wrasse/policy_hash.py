@@ -21,6 +21,9 @@ from web3 import Web3
 #: Mirrors the constants of the same name in `WrasseEscrow`. Duplicated rather than read
 #: from a deployment because the terms have to be checkable before any contract exists;
 #: `tests/test_policy_rules.py` pins them against the Solidity fixture.
+#: Hashed into every commitment, so it is a term of the deal and not a label.
+ENGINE_VERSION = "wrasse/0.1.0"
+
 BPS_DENOMINATOR = 10_000
 MAX_PROVIDER_BOND_BPS = 10_000
 MAX_DURATION = 30 * 24 * 60 * 60

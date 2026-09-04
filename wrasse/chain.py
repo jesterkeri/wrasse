@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sqlite3
 import stat
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -50,6 +52,7 @@ NONCE_CONFLICT_PENDING = "nonce_conflict_pending"
 NONCE_CONSUMED_OR_REPLACED = "nonce_consumed_or_replaced"
 STUCK = "stuck"
 REJECTED = "rejected"
+UNBROADCAST = "unbroadcast"
 
 ALL_STATUSES = (
     SIGNED,
@@ -64,6 +67,7 @@ ALL_STATUSES = (
     NONCE_CONSUMED_OR_REPLACED,
     STUCK,
     REJECTED,
+    UNBROADCAST,
 )
 
 #: Nothing further will happen to a row in one of these states.
@@ -72,14 +76,23 @@ ALL_STATUSES = (
 #: know whether this nonce is spent", and allowing the wallet to move on would open a nonce
 #: gap that silently strands every later transaction. Clearing either is an operator decision.
 TERMINAL_STATUSES = frozenset(
-    {CONFIRMED_SUCCESS, CONFIRMED_REVERTED, NONCE_CONSUMED_OR_REPLACED, REJECTED}
+    {CONFIRMED_SUCCESS, CONFIRMED_REVERTED, NONCE_CONSUMED_OR_REPLACED, REJECTED, UNBROADCAST}
 )
+
+#: `unbroadcast` is the only terminal state that gives its nonce back.
+#:
+#: A node that refuses a transaction during pre-validation, for insufficient funds or too
+#: little intrinsic gas, never admitted it to a mempool. Nothing can mine at that nonce, so
+#: holding it would strand every later transaction behind a permanent gap. It is only reached
+#: when the very first send attempt was refused that way; anything that was ever accepted
+#: keeps its nonce, because we cannot prove those bytes are gone.
+NONCE_RELEASING_STATUSES = frozenset({UNBROADCAST})
 
 #: Transitions are an explicit graph, not a monotonic ladder: a reorg moves a row backwards
 #: from included to unmined, which is the whole reason inclusion and confirmation are
 #: different states.
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    SIGNED: frozenset({SEND_ATTEMPTED, STUCK, REJECTED}),
+    SIGNED: frozenset({SEND_ATTEMPTED, STUCK, REJECTED, UNBROADCAST}),
     SEND_ATTEMPTED: frozenset(
         {
             SEND_ATTEMPTED,
@@ -90,6 +103,7 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
             NONCE_CONSUMED_OR_REPLACED,
             STUCK,
             REJECTED,
+            UNBROADCAST,
         }
     ),
     PENDING: frozenset(
@@ -126,6 +140,7 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
             STUCK,
         }
     ),
+    UNBROADCAST: frozenset(),
     STUCK: frozenset(
         {
             SEND_ATTEMPTED,
@@ -167,6 +182,10 @@ class LedgerCorrupt(LedgerError):
 
 class IllegalTransition(LedgerError):
     """A status change that the state graph does not permit."""
+
+
+class StaleStatus(LedgerError):
+    """The row moved on since the caller read it, so the decision was made about old facts."""
 
 
 class BroadcastNotAuthorised(RuntimeError):
@@ -317,7 +336,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     updated_at       TEXT    NOT NULL,
     PRIMARY KEY (chain_id, wallet, contract_address, intent_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS tx_nonce_unique ON transactions(chain_id, wallet, nonce);
+CREATE UNIQUE INDEX IF NOT EXISTS tx_nonce_unique ON transactions(chain_id, wallet, nonce)
+    WHERE status <> 'unbroadcast';
 CREATE UNIQUE INDEX IF NOT EXISTS tx_hash_unique  ON transactions(chain_id, tx_hash);
 """
 
@@ -406,7 +426,7 @@ class TransactionLedger:
         wallet: str,
         contract_address: str,
         intent_id: str,
-        chain_nonce: int,
+        read_chain_nonce: Callable[[], int],
         sign: Callable[[int], SignedIntent],
     ) -> tuple[LedgerRow, bool]:
         """Allocate a nonce, sign, and commit the row before anything is sent.
@@ -418,9 +438,11 @@ class TransactionLedger:
         can both miss the first one, and the loser gets a uniqueness violation instead of the
         idempotent answer it was promised.
 
-        `sign` is invoked inside the lock and receives the allocated nonce. That is where the
-        final chain-time observation and revalidation belong: everything expensive, including
-        keystore decryption and gas estimation, has already happened outside.
+        `read_chain_nonce` and `sign` are both invoked inside the lock. The nonce is read
+        there rather than passed in because this program's lock does not stop other users of
+        the same wallet, and a count taken before gas estimation is already old. `sign` is
+        where the final chain-time observation and revalidation belong: everything expensive,
+        including keystore decryption and gas estimation, has already happened outside.
         """
 
         wallet = canonical_address(wallet)
@@ -442,11 +464,17 @@ class TransactionLedger:
                         "resolve it before signing another transaction"
                     )
 
+                # A nonce released by a rejection that never reached a mempool is not
+                # counted. Counting it would leave a permanent gap that nothing can fill, and
+                # every later transaction would sit behind it forever.
+                placeholders = ",".join("?" for _ in NONCE_RELEASING_STATUSES)
                 cursor = connection.execute(
-                    "SELECT MAX(nonce) FROM transactions WHERE chain_id = ? AND wallet = ?",
-                    (chain_id, wallet),
+                    "SELECT MAX(nonce) FROM transactions "
+                    f"WHERE chain_id = ? AND wallet = ? AND status NOT IN ({placeholders})",
+                    (chain_id, wallet, *sorted(NONCE_RELEASING_STATUSES)),
                 )
                 highest = cursor.fetchone()[0]
+                chain_nonce = int(read_chain_nonce())
                 nonce = chain_nonce if highest is None else max(chain_nonce, int(highest) + 1)
 
                 intent = sign(nonce)
@@ -502,36 +530,63 @@ class TransactionLedger:
         last_error: str | None = None,
         bump_attempts: bool = False,
     ) -> LedgerRow:
+        """Move a row forward, but only from the state it is actually in.
+
+        The caller holds a snapshot that may already be stale. Validating against that
+        snapshot and then writing unconditionally would let a second resolver overwrite a
+        settled row with an older opinion, so the write is a compare-and-swap on the status
+        it was validated against, taken inside one write transaction.
+        """
+
         if status not in ALLOWED_TRANSITIONS.get(row.status, frozenset()):
             raise IllegalTransition(f"{row.status} -> {status} is not an allowed transition")
 
         with self._connect() as connection:
-            connection.execute(
-                """UPDATE transactions
-                      SET status = ?, block_number = ?, block_hash = ?, last_error = ?,
-                          attempts = attempts + ?, updated_at = ?
-                    WHERE chain_id = ? AND wallet = ? AND contract_address = ? AND intent_id = ?""",
-                (
-                    status,
-                    block_number,
-                    block_hash,
-                    last_error,
-                    1 if bump_attempts else 0,
-                    _now(),
-                    row.chain_id,
-                    row.wallet,
-                    row.contract_address,
-                    row.intent_id,
-                ),
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._find(
+                    connection, row.chain_id, row.wallet, row.contract_address, row.intent_id
+                )
+                if current is None:
+                    raise LedgerError(f"{row.intent_id} vanished from the ledger")
+                if current.status != row.status:
+                    raise StaleStatus(
+                        f"{row.intent_id} was {row.status} when this was decided but is now "
+                        f"{current.status}; re-read it before deciding again"
+                    )
+                connection.execute(
+                    """UPDATE transactions
+                          SET status = ?, block_number = ?, block_hash = ?, last_error = ?,
+                              attempts = attempts + ?, updated_at = ?
+                        WHERE chain_id = ? AND wallet = ? AND contract_address = ?
+                          AND intent_id = ? AND status = ?""",
+                    (
+                        status,
+                        block_number,
+                        block_hash,
+                        last_error,
+                        1 if bump_attempts else 0,
+                        _now(),
+                        row.chain_id,
+                        row.wallet,
+                        row.contract_address,
+                        row.intent_id,
+                        row.status,
+                    ),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+
+            updated = self._find(
+                connection, row.chain_id, row.wallet, row.contract_address, row.intent_id
             )
-        return replace(
-            row,
-            status=status,
-            block_number=block_number,
-            block_hash=block_hash,
-            last_error=last_error,
-            attempts=row.attempts + (1 if bump_attempts else 0),
-        )
+        assert updated is not None
+        return updated
 
 
 def _row_from(record: sqlite3.Row) -> LedgerRow:
@@ -613,6 +668,59 @@ def verify_row_integrity(row: LedgerRow) -> None:
                 f"{row.intent_id}: signed payload says {name}={actual[name]!r}, row says {want!r}"
             )
 
+    _verify_committed_terms(row)
+
+
+def _verify_committed_terms(row: LedgerRow) -> None:
+    """Bind the two columns the resolver and the audit trail actually rely on.
+
+    `accept_by` decides whether a rebroadcast can still succeed, and `preimage` is what the
+    receipt claims the deal committed to. Neither is covered by checking the transaction's
+    envelope, so both are compared against the arguments inside the calldata.
+    """
+
+    from . import escrow
+    from .policy_hash import policy_hash as _policy_hash
+    from .policy_hash import PolicyPreimage
+
+    arguments = escrow.decode_create_deal(row.calldata)
+    if arguments is None:
+        # Later gates add other calls. Their terms are bound where they are introduced.
+        return
+
+    if arguments["accept_by"] != row.accept_by:
+        raise LedgerCorrupt(
+            f"{row.intent_id}: calldata commits to acceptBy {arguments['accept_by']}, "
+            f"the row says {row.accept_by}"
+        )
+
+    try:
+        preimage = PolicyPreimage(**row.preimage)
+    except TypeError as error:
+        raise LedgerCorrupt(f"{row.intent_id}: stored preimage is not a policy: {error}") from error
+
+    engine_hash = "0x" + bytes(Web3.keccak(text=preimage.engine_version)).hex()
+    for name, committed, stored in (
+        ("provider", arguments["provider"], Web3.to_checksum_address(preimage.provider)),
+        ("bond_bps", arguments["bond_bps"], preimage.bond_bps),
+        ("accept_by", arguments["accept_by"], preimage.accept_by),
+        ("service_window", arguments["service_window"], preimage.service_window),
+        ("payout_delay", arguments["payout_delay"], preimage.payout_delay),
+        ("engine_version", arguments["engine_version_hash"], engine_hash),
+        ("buyer_evidence_hash", arguments["buyer_evidence_hash"], preimage.buyer_evidence_hash),
+        ("provider_evidence_hash", arguments["provider_evidence_hash"], preimage.provider_evidence_hash),
+        ("price", row.value_wei, preimage.price),
+    ):
+        if committed != stored:
+            raise LedgerCorrupt(
+                f"{row.intent_id}: the transaction commits {name}={committed!r} but the stored "
+                f"preimage says {stored!r}"
+            )
+
+    # Self-consistency: the stored preimage must still hash, so an audit trail can never quote
+    # a commitment that its own fields cannot produce.
+    _policy_hash(preimage)
+
 
 def _decode_transaction(raw: bytes) -> dict[str, Any]:
     """Pull the typed-transaction fields back out of the signed payload."""
@@ -656,29 +764,81 @@ class Verdict:
 UNKNOWN = "unknown"
 
 
+#: Reads are idempotent, so a flaky node is worth a second attempt. Bounded and jittered, so
+#: a rate-limited endpoint is not hammered into refusing harder.
+READ_ATTEMPTS = 3
+READ_BASE_DELAY_SECONDS = 0.25
+READ_MAX_DELAY_SECONDS = 4.0
+
+#: Replaced in tests. Nothing here should ever sleep for real during a suite run.
+_sleep = time.sleep
+
+
+def _retry_after(error: Exception) -> float | None:
+    """Honour a server that has told us exactly how long to wait."""
+
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    value = headers.get("Retry-After")
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _read(call: Callable[[], Any], *, describe: str) -> Any:
+    """Retry an idempotent read, and never a write.
+
+    A broadcast must never come through here. Uncertainty after sending goes to the resolver,
+    which can only resend the identical bytes; retrying a send anywhere else is how a second
+    transaction appears.
+    """
+
+    for attempt in range(1, READ_ATTEMPTS + 1):
+        try:
+            return call()
+        except (TransactionNotFound, BlockNotFound):
+            raise
+        except Exception as error:  # noqa: BLE001 - a failed query is not an answer
+            if attempt == READ_ATTEMPTS:
+                raise RpcUnavailable(f"{describe}: {error}") from error
+            delay = _retry_after(error)
+            if delay is None:
+                delay = min(READ_MAX_DELAY_SECONDS, READ_BASE_DELAY_SECONDS * 2 ** (attempt - 1))
+                delay *= 0.5 + random.random() / 2
+            _sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def _receipt_or_none(web3: Any, tx_hash: str) -> Any:
     try:
-        return web3.eth.get_transaction_receipt(tx_hash)
+        return _read(
+            lambda: web3.eth.get_transaction_receipt(tx_hash),
+            describe=f"receipt lookup failed for {tx_hash}",
+        )
     except TransactionNotFound:
         return None
-    except Exception as error:  # noqa: BLE001 - a failed query is not an answer
-        raise RpcUnavailable(f"receipt lookup failed for {tx_hash}: {error}") from error
 
 
 def _transaction_or_none(web3: Any, tx_hash: str) -> Any:
     try:
-        return web3.eth.get_transaction(tx_hash)
+        return _read(
+            lambda: web3.eth.get_transaction(tx_hash),
+            describe=f"transaction lookup failed for {tx_hash}",
+        )
     except TransactionNotFound:
         return None
-    except Exception as error:  # noqa: BLE001
-        raise RpcUnavailable(f"transaction lookup failed for {tx_hash}: {error}") from error
 
 
 def _nonce(web3: Any, wallet: str, tag: str) -> int:
-    try:
-        return int(web3.eth.get_transaction_count(Web3.to_checksum_address(wallet), tag))
-    except Exception as error:  # noqa: BLE001
-        raise RpcUnavailable(f"{tag} nonce lookup failed for {wallet}: {error}") from error
+    return int(
+        _read(
+            lambda: web3.eth.get_transaction_count(Web3.to_checksum_address(wallet), tag),
+            describe=f"{tag} nonce lookup failed for {wallet}",
+        )
+    )
 
 
 def _field(value: Any, name: str) -> Any:
@@ -725,22 +885,41 @@ def resolve(
     pending = _nonce(web3, row.wallet, "pending")
 
     if latest > row.nonce:
-        # One node's view is not the chain. Ask a second before calling a nonce spent, because
-        # this verdict is terminal and it abandons a transaction that may yet be mined.
-        if fallback_web3 is not None:
-            confirmation = _receipt_or_none(fallback_web3, row.tx_hash)
-            if confirmation is not None:
-                block_number = int(_field(confirmation, "blockNumber"))
-                succeeded = int(_field(confirmation, "status")) == 1
-                return Verdict(
-                    status=INCLUDED_SUCCESS if succeeded else INCLUDED_REVERTED,
-                    detail="found on the fallback RPC",
-                    block_number=block_number,
-                    block_hash=_as_hex(_field(confirmation, "blockHash")),
-                )
+        # This verdict is terminal and abandons a payload that may yet be mined, so one node's
+        # opinion is not enough. Without a second chain agreeing, the honest answer is that we
+        # do not know, which keeps the wallet held rather than skipping a nonce.
+        if fallback_web3 is None:
+            return Verdict(
+                NONCE_CONFLICT_PENDING,
+                f"latest nonce {latest} is past {row.nonce}, but no fallback RPC is configured "
+                "to corroborate it; refusing to abandon the payload on one node's word",
+            )
+
+        if int(fallback_web3.eth.chain_id) != row.chain_id:
+            raise RpcUnavailable(
+                f"the fallback RPC reports chain {fallback_web3.eth.chain_id}, not {row.chain_id}"
+            )
+
+        confirmation = _receipt_or_none(fallback_web3, row.tx_hash)
+        if confirmation is not None:
+            succeeded = int(_field(confirmation, "status")) == 1
+            return Verdict(
+                status=INCLUDED_SUCCESS if succeeded else INCLUDED_REVERTED,
+                detail="found on the fallback RPC",
+                block_number=int(_field(confirmation, "blockNumber")),
+                block_hash=_as_hex(_field(confirmation, "blockHash")),
+            )
+
+        if _nonce(fallback_web3, row.wallet, "latest") <= row.nonce:
+            return Verdict(
+                NONCE_CONFLICT_PENDING,
+                f"the two RPCs disagree: latest nonce is {latest} on one and not past "
+                f"{row.nonce} on the other",
+            )
+
         return Verdict(
             NONCE_CONSUMED_OR_REPLACED,
-            f"latest nonce {latest} is past {row.nonce}; something else occupied this slot",
+            f"both RPCs report a latest nonce past {row.nonce}; something else took this slot",
         )
 
     if pending > row.nonce:
@@ -879,6 +1058,44 @@ class BroadcastOutcome:
     detail: str
 
 
+#: Hosts a real network can never be reached on.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+#: Node software that only exists to run a throwaway chain.
+_LOCAL_CLIENTS = ("anvil", "hardhat", "ganache")
+
+
+class NotALocalChain(RuntimeError):
+    """A rehearsal-only affordance was pointed at something that is not a rehearsal."""
+
+
+def require_local_chain(web3: Any, rpc_url: str) -> str:
+    """Prove this really is a throwaway chain before a rehearsal shortcut is allowed.
+
+    A printed warning is not a boundary. The rehearsal deliberately runs on the production
+    chain id, so the id cannot fence it either. Two independent facts are required instead:
+    the endpoint is loopback, and the node identifies itself as local development software.
+    Base Sepolia satisfies neither.
+    """
+
+    host = rpc_url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+    if host not in _LOOPBACK_HOSTS:
+        raise NotALocalChain(
+            f"{rpc_url} is not a loopback endpoint; rehearsal-only options are refused here"
+        )
+
+    try:
+        client = str(web3.client_version).lower()
+    except Exception as error:  # noqa: BLE001
+        raise NotALocalChain(f"could not identify the node: {error}") from error
+
+    if not any(name in client for name in _LOCAL_CLIENTS):
+        raise NotALocalChain(
+            f"the node identifies as {client!r}, which is not local development software"
+        )
+    return client
+
+
 def require_broadcast_opt_in(environ: dict[str, str] | None = None) -> None:
     """Refuse to send unless somebody deliberately asked for it, this invocation."""
 
@@ -903,7 +1120,7 @@ def broadcast(web3: Any, row: LedgerRow, *, environ: dict[str, str] | None = Non
     verify_row_integrity(row)
 
     try:
-        web3.eth.send_raw_transaction(bytes.fromhex(row.raw.removeprefix("0x")))
+        returned = web3.eth.send_raw_transaction(bytes.fromhex(row.raw.removeprefix("0x")))
     except Exception as error:  # noqa: BLE001 - the classification below is the point
         message = str(error).lower()
         if any(token in message for token in _ALREADY_KNOWN):
@@ -918,6 +1135,15 @@ def broadcast(web3: Any, row: LedgerRow, *, environ: dict[str, str] | None = Non
         # never be retried here; it goes back to the resolver, which can only resend the
         # identical bytes.
         return BroadcastOutcome(SEND_ATTEMPTED, f"uncertain: {error}")
+
+    # The local hash is authoritative, so a node naming a different one is not describing
+    # our transaction. That is an integrity failure, not a successful send.
+    if returned is not None:
+        named = _as_hex(returned).lower()
+        if named != row.tx_hash.lower():
+            raise LedgerCorrupt(
+                f"the node accepted {named} but we sent {row.tx_hash}"
+            )
 
     _trip_failpoint(CRASH_AFTER_SEND)
     return BroadcastOutcome(PENDING, "broadcast accepted")
@@ -1015,10 +1241,14 @@ __all__: Sequence[str] = (
     "DeterministicRejection",
     "FAILPOINT_ENV",
     "IllegalTransition",
+    "StaleStatus",
+    "UNBROADCAST",
     "LedgerCorrupt",
     "LedgerError",
     "LedgerRow",
+    "NotALocalChain",
     "RoleMismatch",
+    "require_local_chain",
     "RpcUnavailable",
     "SafeHeadUnavailable",
     "SignedIntent",
