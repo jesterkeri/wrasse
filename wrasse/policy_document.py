@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -148,6 +149,26 @@ def _exact_keys(value: Any, expected: set[str], where: str) -> dict[str, Any]:
     return value
 
 
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+#: Every verdict `WrasseStore.recall` can produce. Anything else is a label somebody invented.
+_VERDICTS = {"match", "no_match", "empty_store"}
+
+
+def _bounded_decimal(value: Any, name: str) -> Decimal:
+    """A score a reader is shown has to be a number between nothing and everything."""
+
+    if not isinstance(value, str):
+        raise PolicyDocumentError(f"{name} is not a string")
+    try:
+        number = Decimal(value)
+    except InvalidOperation as error:
+        raise PolicyDocumentError(f"{name} is not a decimal") from error
+    if not Decimal("0") <= number <= Decimal("1"):
+        raise PolicyDocumentError(f"{name} is outside 0..1")
+    return number
+
+
 def _bounded_int(value: Any, name: str, *, low: int, high: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise PolicyDocumentError(f"{name} is not an integer")
@@ -228,12 +249,14 @@ def load_policy(
     provider_side = _check_side(document["provider"], _PROVIDER_KEYS, "provider", provider, buyer)
 
     persona = _exact_keys(provider_side["persona"], _PERSONA_KEYS, "the provider persona")
-    if not isinstance(persona["commitment"], str) or len(persona["commitment"]) != 64:
+    if not _SHA256.match(str(persona["commitment"])):
         raise PolicyDocumentError("the persona commitment is not a sha256 digest")
+    _bounded_decimal(persona["cashflow_sensitivity"], "cashflow_sensitivity")
 
     provider_terms = _exact_keys(
         provider_side["terms"], _PROVIDER_TERMS_KEYS, "the provider's terms"
     )
+    _bounded_decimal(provider_terms["risk"], "the provider's risk")
     provider_used = _check_used(provider_terms, provider_side, "provider")
 
     profiles = buyer_side["profiles"]
@@ -301,8 +324,25 @@ def _check_side(side: Any, keys: set[str], role: str, owner: str, counterparty: 
         raise PolicyDocumentError(f"the {role} cold_start is not a boolean")
     if not isinstance(side["verdict"], str):
         raise PolicyDocumentError(f"the {role} verdict is not a string")
+    if side["verdict"] not in _VERDICTS:
+        raise PolicyDocumentError(
+            f"the {role} verdict {side['verdict']!r} is not one this build produces"
+        )
     if not isinstance(side["recalled_evidence"], list):
         raise PolicyDocumentError(f"the {role} recalled_evidence is not a list")
+
+    # A document showing evidence beside "I remember nothing" is telling a reader two
+    # different things at once, and only one of them can be true.
+    holds = bool(side["recalled_evidence"])
+    if side["cold_start"] is holds:
+        raise PolicyDocumentError(
+            f"the {role} says cold_start={side['cold_start']} while listing "
+            f"{len(side['recalled_evidence'])} receipts"
+        )
+    if (side["verdict"] == "match") is not holds:
+        raise PolicyDocumentError(
+            f"the {role} verdict {side['verdict']!r} does not match the evidence it lists"
+        )
     for index, item in enumerate(side["recalled_evidence"]):
         if not isinstance(item, dict) or "event_id" not in item:
             raise PolicyDocumentError(f"{role} recalled_evidence[{index}] has no event_id")
@@ -421,5 +461,4 @@ def _check_terms(terms: dict[str, Any], validated: ValidatedPolicy, profile: str
             raise PolicyDocumentError(
                 f"profile {profile!r} displays {name}={displayed!r} but commits to {committed!r}"
             )
-    if not isinstance(terms["risk"], str):
-        raise PolicyDocumentError("risk is not a string")
+    _bounded_decimal(terms["risk"], f"profile {profile!r} risk")

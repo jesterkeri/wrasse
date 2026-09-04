@@ -18,12 +18,14 @@ one by exact lookup. Fuzzy search remains, for discovery and display, and never 
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from sibyl_memory_client import MemoryClient, NotFoundError, SibylMemoryError
 from web3 import Web3
@@ -37,6 +39,16 @@ IDENTITY_CATEGORY = "store_identity"
 INDEX_CATEGORY = "counterparty_index"
 PERSONA_CATEGORY = "persona_commitment"
 
+#: Written before the record and cleared only once the record and the index agree. An
+#: outstanding marker means an ingest died somewhere in the middle, so the store cannot say
+#: what it holds and must not price anything.
+PENDING_CATEGORY = "pending_ingestion"
+
+#: `list_entities` takes a limit and offers no cursor, so enumeration past it is impossible.
+#: A full page is therefore treated as "there may be more I cannot see", which is a refusal
+#: rather than a silent truncation.
+ENUMERATION_LIMIT = 1_000
+
 #: Which field of a neutral receipt names the counterparty, from each owner's point of view.
 #: Both stores hold both receipts; what differs is who each store is reading them about.
 _COUNTERPARTY_FIELD = {"buyer": "provider", "provider": "buyer"}
@@ -44,6 +56,15 @@ _COUNTERPARTY_FIELD = {"buyer": "provider", "provider": "buyer"}
 
 class StoreError(RuntimeError):
     """The store is not the one this configuration describes, or holds something unexplainable."""
+
+
+class IngestionIncomplete(StoreError):
+    """An earlier ingest died between writing the record and indexing it.
+
+    The store cannot say what it holds until that is finished, and a quote produced meanwhile
+    would be priced on a history that is quietly shorter than the truth. That is the exact
+    failure the index exists to prevent, so it stops rather than guesses.
+    """
 
 
 class EvidenceRejected(StoreError):
@@ -97,9 +118,31 @@ def _address(value: str) -> str:
 class WrasseStore:
     """One side's memory, with its own identity and its own index."""
 
-    def __init__(self, memory: MemoryClient, identity: StoreIdentity) -> None:
+    def __init__(self, memory: MemoryClient, identity: StoreIdentity, lock: Path | None = None) -> None:
         self._memory = memory
         self.identity = identity
+        self._lock_path = lock
+
+    @contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """Serialise index updates across processes.
+
+        The index entry is a read-modify-write and the SDK offers no transaction, so two
+        concurrent ingests would otherwise lose one another's ids. The transaction ledger gets
+        this from SQLite's own write lock; here there is nothing to borrow, so it takes an OS
+        lock. POSIX only, which is where this runs.
+        """
+
+        if self._lock_path is None:
+            yield
+            return
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._lock_path, "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
     # -- opening --------------------------------------------------------------------------
 
@@ -120,6 +163,7 @@ class WrasseStore:
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        lock = path.with_suffix(path.suffix + ".lock")
         wanted = StoreIdentity(
             schema_version=STORE_SCHEMA_VERSION,
             role=role,
@@ -133,11 +177,23 @@ class WrasseStore:
             try:
                 found = memory.get_entity(IDENTITY_CATEGORY, "self")["body"]
             except NotFoundError:
+                # Only a demonstrably empty store may be adopted. A database that already
+                # holds records but names no owner is a legacy or half-migrated file, and
+                # letting configuration alone assign it a role is precisely the swap the
+                # identity record exists to stop. This needs no compromise to happen; it
+                # needs one careless path.
+                for category in (CHAIN_EVENT_CATEGORY, INDEX_CATEGORY, PENDING_CATEGORY):
+                    if memory.list_entities(category, limit=1):
+                        raise StoreError(
+                            f"{path} already holds {category} records but names no owner. "
+                            "Refusing to adopt it: delete it and reconcile again, rather than "
+                            "letting a configuration line decide whose memory this is."
+                        ) from None
                 memory.set_entity(
                     IDENTITY_CATEGORY, "self", {**wanted.body(), "created_at": _now()},
                     status="verified",
                 )
-                return cls(memory, wanted)
+                return cls(memory, wanted, lock)
         except SibylMemoryError as error:
             raise MemoryRequired(f"cannot open the {role} memory at {path}") from error
 
@@ -149,7 +205,7 @@ class WrasseStore:
                     f"{wanted.owner_address} on chain {chain_id}. Its {field} disagrees. "
                     "A store cannot change whose memory it is."
                 )
-        return cls(memory, wanted)
+        return cls(memory, wanted, lock)
 
     @property
     def memory(self) -> MemoryClient:
@@ -214,14 +270,62 @@ class WrasseStore:
         return _address(other)
 
     def ingest(self, event: ChainEvent) -> dict[str, Any]:
-        """Persist the canonical fact, then index it under this store's own relationship."""
+        """Persist the canonical fact, then index it, and say so while it is half done.
 
-        result = persist_verified_event(self._memory, event)
-        body = result.entity["body"]
-        counterparty = self.counterparty_of(body)
-        if counterparty is not None:
-            self._add_to_index(counterparty, body["event_id"])
+        The order is deliberate:
+
+        ```
+        1. mark this event id as being ingested
+        2. write the canonical record
+        3. add it to this store's index
+        4. clear the mark
+        ```
+
+        A crash anywhere in the middle leaves the mark standing, and `recall` refuses to price
+        while any mark is outstanding. Without step 1 a crash between 2 and 3 left real
+        evidence outside the index, and the quote path had no way to tell that from a store
+        that genuinely held nothing. That is not a rare interleaving; it is any ordinary
+        interruption, and it produced a confident quote on a shorter history than the truth.
+        """
+
+        identifier = event.canonical_body()["event_id"]
+        with self._exclusive():
+            self._memory.set_entity(
+                PENDING_CATEGORY, identifier,
+                {"event_id": identifier, "started_at": _now()}, status="verified",
+            )
+            result = persist_verified_event(self._memory, event)
+            body = result.entity["body"]
+            counterparty = self.counterparty_of(body)
+            if counterparty is not None:
+                self._add_to_index(counterparty, body["event_id"])
+            self._memory.delete_entity(PENDING_CATEGORY, identifier)
         return {"created": result.created, "counterparty": counterparty, "body": body}
+
+    def pending_ingestions(self) -> list[str]:
+        """Event ids whose ingest never finished."""
+
+        try:
+            rows = self._memory.list_entities(PENDING_CATEGORY, limit=ENUMERATION_LIMIT)
+        except SibylMemoryError as error:
+            raise MemoryRequired("Sibyl Memory is required to generate deal terms") from error
+        return sorted(row["name"] for row in rows)
+
+    def finish_pending(self, events: dict[str, ChainEvent]) -> list[str]:
+        """Complete every half-finished ingest, given the receipts they were about.
+
+        Repair, not invention: it needs the same verified events, so it cannot conjure a
+        record that was never established.
+        """
+
+        finished = []
+        for identifier in self.pending_ingestions():
+            event = events.get(identifier)
+            if event is None:
+                continue
+            self.ingest(event)
+            finished.append(identifier)
+        return finished
 
     def _add_to_index(self, counterparty: str, identifier: str) -> None:
         """The index is a projection, so adding twice is harmless and adding late is a repair."""
@@ -253,8 +357,18 @@ class WrasseStore:
         whole reason the entities stay canonical and the index stays a projection.
         """
 
+        rows = self._memory.list_entities(CHAIN_EVENT_CATEGORY, limit=ENUMERATION_LIMIT)
+        if len(rows) >= ENUMERATION_LIMIT:
+            # There is no cursor, so a full page means there may be records this cannot see,
+            # and a repair that silently stops short is worse than one that refuses.
+            raise StoreError(
+                f"this store holds at least {ENUMERATION_LIMIT} records and the SDK offers no "
+                "way to page past that, so a full repair cannot be proved. Refusing rather "
+                "than reporting a partial one as complete."
+            )
+
         repaired = 0
-        for row in self._memory.list_entities(CHAIN_EVENT_CATEGORY, limit=1000):
+        for row in rows:
             body = row.get("body")
             if not isinstance(body, dict):
                 continue
@@ -282,6 +396,15 @@ class WrasseStore:
         """
 
         counterparty = _address(counterparty)
+
+        outstanding = self.pending_ingestions()
+        if outstanding:
+            raise IngestionIncomplete(
+                f"{len(outstanding)} ingest(s) never finished in the {self.identity.role} "
+                f"memory: {', '.join(outstanding[:3])}. This store cannot say what it holds, "
+                "so it will not price anything. Replay those receipts first."
+            )
+
         try:
             body = self._memory.get_entity(INDEX_CATEGORY, self._index_name(counterparty))["body"]
             identifiers = list(body.get("event_ids", []))
@@ -303,8 +426,30 @@ class WrasseStore:
                 raise MemoryRequired("Sibyl Memory is required to generate deal terms") from error
             evidence.append(self._validated(row, identifier, counterparty))
 
-        verdict = "empty_store" if not identifiers else ("no_match" if not evidence else "match")
+        if evidence:
+            verdict = "match"
+        elif self._memory.list_entities(CHAIN_EVENT_CATEGORY, limit=1):
+            # A store with history about other counterparties is not an empty store. Both use
+            # baseline terms; only one of them is honestly described as knowing nothing.
+            verdict = "no_match"
+        else:
+            verdict = "empty_store"
         return Recall(counterparty, self.identity.role, tuple(evidence), verdict)
+
+    def indexed_event_ids(self, counterparty: str) -> tuple[str, ...]:
+        """What this store believes it holds about a relationship, before validating any of it.
+
+        Used to compare the two sides before a bilateral quote: they receive the same receipts,
+        so they must agree on which ones exist.
+        """
+
+        try:
+            body = self._memory.get_entity(
+                INDEX_CATEGORY, self._index_name(_address(counterparty))
+            )["body"]
+        except NotFoundError:
+            return ()
+        return tuple(sorted(body.get("event_ids", [])))
 
     def _validated(self, row: dict[str, Any], identifier: str, counterparty: str) -> dict[str, Any]:
         body = row.get("body")

@@ -1208,3 +1208,46 @@ def test_calldata_this_build_never_produces_is_refused(tmp_path):
     )
     with pytest.raises(chain.LedgerCorrupt, match="not a call this build makes"):
         chain.verify_row_integrity(row)
+
+
+def test_a_server_asking_for_a_day_does_not_get_one(monkeypatch):
+    """Honouring a server's own number is courteous until the number is 86400."""
+    slept: list[float] = []
+    monkeypatch.setattr(chain, "_sleep", slept.append)
+
+    class Greedy(Exception):
+        class response:  # noqa: N801
+            headers = {"Retry-After": "86400"}
+
+    call = _Flaky(1, Greedy())
+    assert chain._read(call, describe="probe") == "answer"
+    assert slept == [chain.READ_MAX_DELAY_SECONDS]
+
+
+def test_a_retry_budget_bounds_the_whole_operation(monkeypatch):
+    """The attempt count is not a time bound on its own."""
+    monkeypatch.setattr(chain, "_sleep", lambda _: None)
+    monkeypatch.setattr(chain, "READ_TOTAL_BUDGET_SECONDS", 0.1)
+
+    class Slow(Exception):
+        class response:  # noqa: N801
+            headers = {"Retry-After": "30"}
+
+    with pytest.raises(chain.RpcUnavailable, match="gave up after"):
+        chain._read(_Flaky(99, Slow()), describe="probe")
+
+
+def test_a_date_form_retry_after_is_understood(monkeypatch):
+    """The standard allows either form, and ignoring one of them silently is not handling it."""
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    slept: list[float] = []
+    monkeypatch.setattr(chain, "_sleep", slept.append)
+
+    class Dated(Exception):
+        class response:  # noqa: N801
+            headers = {"Retry-After": format_datetime(datetime.now(UTC) + timedelta(seconds=2))}
+
+    assert chain._read(_Flaky(1, Dated()), describe="probe") == "answer"
+    assert 0 < slept[0] <= chain.READ_MAX_DELAY_SECONDS

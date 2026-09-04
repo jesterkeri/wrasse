@@ -675,3 +675,46 @@ def test_a_reconciled_receipt_is_findable_by_the_side_that_will_price_it(both_ro
         recalled = store.recall(counterparty)
         assert len(recalled.evidence) == 1, f"the {role} cannot find what it was just told"
         assert recalled.evidence[0]["event_type"] == "timeout_claimed_without_delivery"
+
+
+def test_a_quote_refuses_when_the_two_memories_disagree(both_roles, capsys):
+    """A partial dual-store delivery is an ordinary crash, not an exotic one.
+
+    Quoting across it would price one side on a history the other cannot see, and the document
+    would look complete on both.
+    """
+    from wrasse.store import INDEX_CATEGORY, WrasseStore
+
+    web3 = both_roles["web3"]
+    deal_id = _open_deal(both_roles, capsys, service_window=1)
+    assert main(["accept-deal", "--deal-id", str(deal_id)]) == 0
+    accepted = json.loads(capsys.readouterr().out)
+    web3.eth.wait_for_transaction_receipt(accepted["tx_hash"])
+    assert main(["tx-resolve", "--local-confirmation-blocks", "0"]) == 0
+    capsys.readouterr()
+
+    web3.provider.make_request("evm_increaseTime", [120])
+    web3.provider.make_request("evm_mine", [])
+    assert main(["claim-timeout", "--deal-id", str(deal_id)]) == 0
+    claimed = json.loads(capsys.readouterr().out)
+    web3.eth.wait_for_transaction_receipt(claimed["tx_hash"])
+    assert main(["tx-resolve", "--local-confirmation-blocks", "0"]) == 0
+    capsys.readouterr()
+    assert main(["reconcile", "--tx", claimed["tx_hash"]]) == 0
+    capsys.readouterr()
+
+    # Take the receipt away from one side only, as a crash between the two writes would.
+    provider = WrasseStore.open(
+        os.environ["WRASSE_PROVIDER_MEMORY_PATH"], role="provider",
+        owner_address=os.environ["WRASSE_PROVIDER_A_ADDRESS"], chain_id=CHAIN_ID,
+        escrow_address=both_roles["address"],
+    )
+    name = provider._index_name(both_roles["buyer"].address)
+    provider.memory.set_entity(INDEX_CATEGORY, name, {"event_ids": []}, status="verified")
+
+    with pytest.raises(RuntimeError, match="disagree about what happened"):
+        main([
+            "policy", os.environ["WRASSE_PROVIDER_A_ADDRESS"],
+            "--buyer", both_roles["buyer"].address, "--accept-window", "600",
+            "--output", str(both_roles["tmp"] / "split.json"),
+        ])

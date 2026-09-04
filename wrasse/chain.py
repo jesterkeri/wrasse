@@ -904,22 +904,39 @@ READ_ATTEMPTS = 3
 READ_BASE_DELAY_SECONDS = 0.25
 READ_MAX_DELAY_SECONDS = 4.0
 
+#: The whole operation's patience, not just one wait's. Honouring a server's own number is
+#: courteous until the number is 86400, at which point the courtesy is a hang.
+READ_TOTAL_BUDGET_SECONDS = 15.0
+
 #: Replaced in tests. Nothing here should ever sleep for real during a suite run.
 _sleep = time.sleep
 
 
 def _retry_after(error: Exception) -> float | None:
-    """Honour a server that has told us exactly how long to wait."""
+    """Honour a server that has told us exactly how long to wait, in either form it may say it."""
 
     response = getattr(error, "response", None)
     headers = getattr(response, "headers", None)
     if headers is None or not hasattr(headers, "get"):
         return None
     value = headers.get("Retry-After")
+    if value is None:
+        return None
     try:
         return max(0.0, float(value))
     except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(str(value))
+    except (TypeError, ValueError):
         return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
 def _read(call: Callable[[], Any], *, describe: str) -> Any:
@@ -930,6 +947,7 @@ def _read(call: Callable[[], Any], *, describe: str) -> Any:
     transaction appears.
     """
 
+    spent = 0.0
     for attempt in range(1, READ_ATTEMPTS + 1):
         try:
             return call()
@@ -938,10 +956,21 @@ def _read(call: Callable[[], Any], *, describe: str) -> Any:
         except Exception as error:  # noqa: BLE001 - a failed query is not an answer
             if attempt == READ_ATTEMPTS:
                 raise RpcUnavailable(f"{describe}: {error}") from error
-            delay = _retry_after(error)
-            if delay is None:
+
+            named = _retry_after(error)
+            if named is None:
                 delay = min(READ_MAX_DELAY_SECONDS, READ_BASE_DELAY_SECONDS * 2 ** (attempt - 1))
                 delay *= 0.5 + random.random() / 2
+            else:
+                # A hint, capped. An endpoint asking for a day gets what we can spare.
+                delay = min(named, READ_MAX_DELAY_SECONDS)
+
+            if spent + delay > READ_TOTAL_BUDGET_SECONDS:
+                raise RpcUnavailable(
+                    f"{describe}: gave up after {spent:.1f}s of waiting; the endpoint asked "
+                    f"for {named if named is not None else delay:.0f}s more"
+                ) from error
+            spent += delay
             _sleep(delay)
     raise AssertionError("unreachable")
 

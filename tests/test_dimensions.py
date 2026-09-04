@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import json
+
 import pytest
 from sibyl_memory_client import MemoryClient
 
@@ -89,3 +91,65 @@ def test_existing_source_event_dimension_is_reused_without_model_call(tmp_path):
     assert created is False
     assert load_dimensions(memory) == (existing,)
 
+
+
+def test_an_answer_no_retry_can_improve_is_not_retried():
+    """A bad key or an empty balance refuses identically next time.
+
+    Retrying it burns the one attempt a genuinely transient failure would have needed.
+    """
+    from wrasse.dimensions import DimensionError, create_dimension
+
+    calls = []
+
+    class Refused:
+        status_code = 402
+
+        @staticmethod
+        def raise_for_status():
+            raise AssertionError("should never be reached")
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return Refused()
+
+    with pytest.raises(DimensionError, match="402"):
+        create_dimension(
+            {"event_type": "timeout_claimed_without_delivery"}, api_key="bad", post=post
+        )
+    assert len(calls) == 1
+
+
+def test_a_transient_failure_gets_its_second_chance(monkeypatch):
+    from wrasse import dimensions as module
+
+    monkeypatch.setattr(module, "_sleep", lambda _: None)
+    attempts = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"choices": [{"message": {"content": json.dumps({
+                "dimension_id": "non_delivery_after_payment",
+                "severity": 0.9,
+                "confidence": 0.9,
+                "applies_when": ["deadline_sensitive"],
+            })}}]}
+
+    def post(url, **kwargs):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise module.requests.RequestException("connection reset")
+        return Response()
+
+    definition = module.create_dimension(
+        {"event_type": "timeout_claimed_without_delivery"}, api_key="ok", post=post
+    )
+    assert len(attempts) == 2
+    assert definition.signal_direction == "negative"

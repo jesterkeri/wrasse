@@ -324,6 +324,142 @@ def test_an_unreadable_store_stops_the_quote_rather_than_reporting_no_history(bu
         def get_entity(self, *args, **kwargs):
             raise SibylMemoryError("database is locked")
 
+        def list_entities(self, *args, **kwargs):
+            raise SibylMemoryError("database is locked")
+
     buyer_store._memory = Broken()
     with pytest.raises(MemoryRequired):
         buyer_store.recall(PROVIDER)
+
+
+# --------------------------------------------------------------------------------------
+# A half-finished ingest is not an empty history
+# --------------------------------------------------------------------------------------
+
+
+def test_a_crash_between_the_record_and_the_index_stops_the_quote(buyer_store):
+    """The failure this marker exists for.
+
+    Without it, a crash after writing the record and before indexing it left real evidence
+    outside the index, and the quote path could not tell that from a store that genuinely held
+    nothing. It priced confidently on a shorter history than the truth.
+    """
+    from wrasse.evidence import persist_verified_event
+    from wrasse.store import PENDING_CATEGORY, IngestionIncomplete
+
+    event = _event()
+    identifier = event.canonical_body()["event_id"]
+    buyer_store.memory.set_entity(
+        PENDING_CATEGORY, identifier, {"event_id": identifier, "started_at": "now"},
+        status="verified",
+    )
+    persist_verified_event(buyer_store.memory, event)  # the crash landed here
+
+    assert buyer_store.pending_ingestions() == [identifier]
+    with pytest.raises(IngestionIncomplete, match="never finished"):
+        buyer_store.recall(PROVIDER)
+
+
+def test_finishing_the_pending_ingest_restores_the_quote(buyer_store):
+    from wrasse.evidence import persist_verified_event
+    from wrasse.store import PENDING_CATEGORY
+
+    event = _event()
+    identifier = event.canonical_body()["event_id"]
+    buyer_store.memory.set_entity(
+        PENDING_CATEGORY, identifier, {"event_id": identifier, "started_at": "now"},
+        status="verified",
+    )
+    persist_verified_event(buyer_store.memory, event)
+
+    assert buyer_store.finish_pending({identifier: event}) == [identifier]
+    assert buyer_store.pending_ingestions() == []
+    assert len(buyer_store.recall(PROVIDER).evidence) == 1
+
+
+def test_a_completed_ingest_leaves_no_marker(buyer_store):
+    buyer_store.ingest(_event())
+    assert buyer_store.pending_ingestions() == []
+
+
+# --------------------------------------------------------------------------------------
+# An unowned store is not an available store
+# --------------------------------------------------------------------------------------
+
+
+def test_a_database_with_history_but_no_owner_is_not_adopted(tmp_path):
+    """No compromise needed for this, only a careless configuration line.
+
+    A legacy or half-migrated file holding records but naming no owner would otherwise become
+    whichever side the configuration said, which is the swap the identity record exists to stop.
+    """
+    from sibyl_memory_client import MemoryClient
+
+    path = tmp_path / "legacy.db"
+    memory = MemoryClient.local(path)
+    memory.set_entity(CHAIN_EVENT_CATEGORY, "0x" + "ab" * 32, {"event_id": "x"}, status="verified")
+
+    with pytest.raises(StoreError, match="names no owner"):
+        _open(tmp_path, "buyer", BUYER, name="legacy.db")
+
+
+def test_an_empty_database_is_adopted(tmp_path):
+    store = _open(tmp_path, "buyer", BUYER, name="fresh.db")
+    assert store.identity.role == "buyer"
+
+
+# --------------------------------------------------------------------------------------
+# Honest verdicts
+# --------------------------------------------------------------------------------------
+
+
+def test_a_store_with_other_history_is_not_reported_as_empty(buyer_store):
+    """Both use baseline terms; only one of them knows nothing."""
+    buyer_store.ingest(_event(buyer=STRANGER, tx_hash="0x" + "77" * 32))
+
+    recall = buyer_store.recall(PROVIDER)
+    assert recall.is_cold_start is True
+    assert recall.verdict == "no_match"
+
+
+def test_the_two_sides_agree_on_which_receipts_exist(buyer_store, provider_store):
+    event = _event()
+    buyer_store.ingest(event)
+    provider_store.ingest(event)
+
+    assert buyer_store.indexed_event_ids(PROVIDER) == provider_store.indexed_event_ids(BUYER)
+
+
+def test_a_full_page_refuses_rather_than_repairing_part_of_the_store(buyer_store, monkeypatch):
+    """`list_entities` has no cursor, so a full page means there may be more nobody can see."""
+    from wrasse import store as store_module
+
+    monkeypatch.setattr(store_module, "ENUMERATION_LIMIT", 1)
+    buyer_store.ingest(_event())
+    buyer_store.ingest(_event(tx_hash="0x" + "88" * 32))
+
+    with pytest.raises(StoreError, match="cannot be proved"):
+        buyer_store.repair_index()
+
+
+def test_the_marker_is_written_before_the_record(buyer_store, monkeypatch):
+    """Order is the whole mechanism.
+
+    A marker written after the record would leave exactly the window it exists to close: the
+    record on disk, the index not yet updated, and nothing saying so.
+    """
+    from wrasse import store as store_module
+    from wrasse.store import PENDING_CATEGORY
+
+    seen = {}
+    original = store_module.persist_verified_event
+
+    def observe(memory, event):
+        seen["marker_present"] = bool(memory.list_entities(PENDING_CATEGORY, limit=10))
+        return original(memory, event)
+
+    monkeypatch.setattr(store_module, "persist_verified_event", observe)
+    buyer_store.ingest(_event())
+
+    assert seen["marker_present"] is True, "the record was written with nothing marking it"
+    assert buyer_store.pending_ingestions() == []

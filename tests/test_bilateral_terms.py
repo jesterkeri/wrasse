@@ -377,3 +377,80 @@ def test_a_prompt_release_is_evidence_about_both_sides():
     assert SUBJECTS_OF["delivered_and_released_by_buyer"] == frozenset({"buyer", "provider"})
     assert SUBJECTS_OF["timeout_claimed_without_delivery"] == frozenset({"provider"})
     assert SUBJECTS_OF["delivered_and_claimed_after_delay"] == frozenset({"buyer"})
+
+
+# --------------------------------------------------------------------------------------
+# "Used" has to mean it moved a number
+# --------------------------------------------------------------------------------------
+
+
+def test_a_contribution_that_rounds_away_is_not_called_used(both):
+    """Contributing to a sum is not the same as changing an answer.
+
+    A vanishing severity contributes a nonzero amount that clamps and rounds to nothing. Every
+    committed term comes out identical to a cold start, so committing to that receipt would
+    claim it explained a number it never touched.
+    """
+    vanishing = DimensionDefinition(
+        dimension_id="barely_anything",
+        source_event_type="timeout_claimed_without_delivery",
+        signal_direction="negative",
+        severity=1e-12,
+        confidence=1e-12,
+        applies_when=("deadline_sensitive",),
+    )
+    evidence = [row for row in both["buyer"].recall(PROVIDER).evidence
+                if row["event_type"] == "timeout_claimed_without_delivery"]
+
+    cold = produce_terms(evidence=[], dimensions=[vanishing], profile=PROFILES["urgent"],
+                         base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
+                         base_service_window=BASE_WINDOW)
+    warm = produce_terms(evidence=evidence, dimensions=[vanishing], profile=PROFILES["urgent"],
+                         base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
+                         base_service_window=BASE_WINDOW)
+
+    assert warm.provider_bond_bps == cold.provider_bond_bps
+    assert warm.service_window == cold.service_window
+    assert warm.recalled_event_ids != ()
+    assert warm.used_evidence_ids == (), "nothing moved, so nothing may be committed to"
+
+
+def test_removing_any_used_receipt_changes_a_committed_number(both):
+    """The property the name promises, checked directly."""
+    evidence = list(both["buyer"].recall(PROVIDER).evidence)
+    dimensions = load_dimensions(both["buyer"].memory)
+    full = _buyer_terms(both["buyer"], evidence)
+    assert full.used_evidence_ids, "this fixture is supposed to move the terms"
+
+    from wrasse.policy_hash import canonical_event_id
+
+    for identifier in full.used_evidence_ids:
+        without = [row for row in evidence
+                   if canonical_event_id(str(row["event_id"])) != identifier]
+        reduced = produce_terms(
+            evidence=without, dimensions=dimensions, profile=PROFILES["urgent"],
+            base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
+            base_service_window=BASE_WINDOW,
+        )
+        assert (reduced.provider_bond_bps, reduced.service_window) != (
+            full.provider_bond_bps, full.service_window
+        ), f"{identifier} is in the used set but removing it changes nothing"
+
+
+def test_the_used_set_reproduces_the_same_terms_as_the_whole_history(both):
+    """Minimal, not arbitrary: what was dropped genuinely made no difference."""
+    from wrasse.policy_hash import canonical_event_id
+
+    evidence = list(both["buyer"].recall(PROVIDER).evidence)
+    dimensions = load_dimensions(both["buyer"].memory)
+    full = _buyer_terms(both["buyer"], evidence)
+
+    only_used = [row for row in evidence
+                 if canonical_event_id(str(row["event_id"])) in set(full.used_evidence_ids)]
+    reduced = produce_terms(
+        evidence=only_used, dimensions=dimensions, profile=PROFILES["urgent"],
+        base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS, base_service_window=BASE_WINDOW,
+    )
+    assert (reduced.provider_bond_bps, reduced.service_window) == (
+        full.provider_bond_bps, full.service_window
+    )

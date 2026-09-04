@@ -1253,6 +1253,23 @@ def main(argv: list[str] | None = None) -> int:
         stores = _open_stores(buyer=buyer, provider=provider)
         persona = _provider_persona(stores["provider"])
 
+        # Both sides receive every receipt, so they must agree on which ones exist. A
+        # disagreement means a delivery landed in one memory and not the other, and quoting
+        # across that gap would price one side on a history the other cannot see.
+        indexed = {
+            "buyer": stores["buyer"].indexed_event_ids(provider),
+            "provider": stores["provider"].indexed_event_ids(buyer),
+        }
+        if set(indexed["buyer"]) != set(indexed["provider"]):
+            only_buyer = sorted(set(indexed["buyer"]) - set(indexed["provider"]))
+            only_provider = sorted(set(indexed["provider"]) - set(indexed["buyer"]))
+            raise RuntimeError(
+                "the two memories disagree about what happened between these parties. "
+                f"Only the buyer holds {only_buyer or 'nothing extra'}; only the provider "
+                f"holds {only_provider or 'nothing extra'}. Replay the missing receipts "
+                "before quoting rather than pricing across the gap."
+            )
+
         # Each side recalls the other. Both stores hold the same receipts; what differs is who
         # each one is reading them about, and what it concludes.
         recall = {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Protocol
 
@@ -28,6 +29,16 @@ _MEANINGS = {
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 _DIRECTIONS = {"positive", "negative"}
 _CONTEXTS = {"deadline_sensitive", "cost_sensitive", "quality_sensitive"}
+
+
+#: Answers no retry can improve: a bad key, no credit, a refused or malformed request.
+_PERMANENT_STATUSES = frozenset({400, 401, 402, 403, 404, 422})
+
+#: One short pause between the two attempts, so a blip gets a second chance and a broken
+#: endpoint does not get hammered.
+_BACKOFF_SECONDS = 1.0
+
+_sleep = time.sleep
 
 
 class DimensionError(RuntimeError):
@@ -184,7 +195,7 @@ def create_dimension(
         "response_format": {"type": "json_schema", "json_schema": DIMENSION_JSON_SCHEMA},
     }
     last_error: Exception | None = None
-    for _ in range(2):
+    for attempt in range(2):
         try:
             response = post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -192,14 +203,25 @@ def create_dimension(
                 json=payload,
                 timeout=20,
             )
+            # A bad key, no credit or a refused request will refuse identically next time.
+            # Retrying those wastes the attempt that a genuinely transient failure needs.
+            status = getattr(response, "status_code", None)
+            if status is not None and status in _PERMANENT_STATUSES:
+                raise DimensionError(
+                    f"the model endpoint answered {status}, which a retry cannot change"
+                )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
             answer = json.loads(content)
             answer.pop("signal_direction", None)  # not the model's to decide
             answer["signal_direction"] = VALENCE_OF[event_type]
             return DimensionDefinition.from_model(answer, event_type)
-        except (KeyError, TypeError, ValueError, requests.RequestException, DimensionError) as exc:
+        except DimensionError:
+            raise
+        except (KeyError, TypeError, ValueError, requests.RequestException) as exc:
             last_error = exc
+            if attempt == 0:
+                _sleep(_BACKOFF_SECONDS)
     raise DimensionError("model failed to return a valid dimension after two attempts") from last_error
 
 

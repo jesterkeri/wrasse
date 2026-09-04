@@ -112,6 +112,8 @@ def test_each_side_commits_to_the_evidence_it_actually_used(document):
     def plant(body):
         row = {"event_id": "0x" + "7a" * 32}
         body["buyer"]["recalled_evidence"] = [row]
+        body["buyer"]["cold_start"] = False
+        body["buyer"]["verdict"] = "match"
         body["buyer"]["profiles"]["urgent"]["terms"]["used_evidence_ids"] = [row["event_id"]]
 
     with pytest.raises(PolicyDocumentError, match="commits buyer evidence"):
@@ -248,3 +250,40 @@ def test_a_file_that_is_not_json_is_refused(tmp_path):
     path.write_text("{not json")
     with pytest.raises(PolicyDocumentError, match="not valid JSON"):
         _load(path)
+
+
+# --------------------------------------------------------------------------------------
+# The half a person reads has to be coherent, not merely well shaped
+# --------------------------------------------------------------------------------------
+
+
+def test_a_document_cannot_show_evidence_and_claim_to_remember_nothing(document):
+    """Two statements, only one of which can be true, shown to the same reader."""
+
+    def contradict(body):
+        body["buyer"]["recalled_evidence"] = [{"event_id": "0x" + "7a" * 32}]
+
+    with pytest.raises(PolicyDocumentError, match="cold_start=True while listing"):
+        _load(_rewrite(document, contradict))
+
+
+def test_a_verdict_this_build_never_produces_is_refused(document):
+    with pytest.raises(PolicyDocumentError, match="not one this build produces"):
+        _load(_rewrite(document, lambda body: body["buyer"].update({"verdict": "trusted"})))
+
+
+@pytest.mark.parametrize("risk", ["not a number", "-0.5", "2", "1e400"])
+def test_a_risk_a_reader_cannot_trust_is_refused(document, risk):
+    """A score shown beside a price has to be a number between nothing and everything."""
+    with pytest.raises(PolicyDocumentError, match="risk"):
+        _load(_rewrite(
+            document, lambda body: body["buyer"]["profiles"]["urgent"]["terms"].update({"risk": risk})
+        ))
+
+
+def test_a_persona_commitment_that_is_not_a_digest_is_refused(document):
+    """A fake fingerprint beside a real signature is the forgery worth catching."""
+    with pytest.raises(PolicyDocumentError, match="not a sha256 digest"):
+        _load(_rewrite(
+            document, lambda body: body["provider"]["persona"].update({"commitment": "trust me"})
+        ))

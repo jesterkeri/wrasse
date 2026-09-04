@@ -91,24 +91,36 @@ def produce_terms(
         ),
     )
 
-    bond_delta = _round_decimal(risk * profile.bond_sensitivity_bps)
+    def committed(subset) -> tuple[int, int]:
+        """The two numbers this side actually commits to."""
+
+        partial, _ = _score(
+            subset, dimensions, about="provider", weight=profile.risk_weight,
+            relevance=lambda dimension: (
+                Decimal("1.5") if profile.contexts.intersection(dimension.applies_when)
+                else Decimal("0.5")
+            ),
+        )
+        return (
+            min(10_000, base_bond_bps + _round_decimal(partial * profile.bond_sensitivity_bps)),
+            max(
+                min(base_service_window, MIN_SERVICE_WINDOW_SECONDS),
+                base_service_window + _round_decimal(partial * profile.window_buffer_seconds),
+            ),
+        )
+
+    bond, service_window = committed(events)
     discount_bps = _round_decimal(risk * profile.discount_sensitivity_bps)
     price = base_price_wei * (10_000 - discount_bps) // 10_000
-
-    # The floor applies to the adjustment, not to a base the caller chose deliberately.
-    window_floor = min(base_service_window, MIN_SERVICE_WINDOW_SECONDS)
-    service_window = max(
-        window_floor, base_service_window + _round_decimal(risk * profile.window_buffer_seconds)
-    )
 
     return DealTerms(
         profile=profile.name,
         price_wei=price,
-        provider_bond_bps=min(10_000, base_bond_bps + bond_delta),
+        provider_bond_bps=bond,
         service_window=service_window,
         risk=risk.quantize(Decimal("0.0001")),
         recalled_event_ids=tuple(sorted(canonical_event_id(str(e["event_id"])) for e in events)),
-        used_evidence_ids=tuple(sorted(used)),
+        used_evidence_ids=_minimal_causal_set(events, used, committed),
     )
 
 
@@ -148,12 +160,25 @@ def produce_provider_terms(
         events, dimensions, about="buyer", weight=Decimal("1"), relevance=lambda _: Decimal("1")
     )
 
-    price = base_price_wei * (10_000 + _round_decimal(risk * persona.price_sensitivity_bps)) // 10_000
-    tightening = _round_decimal(
-        risk * persona.delay_sensitivity_seconds * persona.cashflow_sensitivity
-    )
-    delay_floor = min(base_payout_delay, MIN_PAYOUT_DELAY_SECONDS)
-    payout_delay = max(delay_floor, base_payout_delay - tightening)
+    def committed(subset) -> tuple[int, int]:
+        partial, _ = _score(
+            subset, dimensions, about="buyer", weight=Decimal("1"),
+            relevance=lambda _: Decimal("1"),
+        )
+        return (
+            base_price_wei
+            * (10_000 + _round_decimal(partial * persona.price_sensitivity_bps))
+            // 10_000,
+            max(
+                min(base_payout_delay, MIN_PAYOUT_DELAY_SECONDS),
+                base_payout_delay
+                - _round_decimal(
+                    partial * persona.delay_sensitivity_seconds * persona.cashflow_sensitivity
+                ),
+            ),
+        )
+
+    price, payout_delay = committed(events)
 
     return ProviderTerms(
         persona=persona.name,
@@ -161,8 +186,35 @@ def produce_provider_terms(
         payout_delay=payout_delay,
         risk=risk.quantize(Decimal("0.0001")),
         recalled_event_ids=tuple(sorted(canonical_event_id(str(e["event_id"])) for e in events)),
-        used_evidence_ids=tuple(sorted(used)),
+        used_evidence_ids=_minimal_causal_set(events, used, committed),
     )
+
+
+def _minimal_causal_set(events, candidates: set[str], committed) -> tuple[str, ...]:
+    """The receipts that actually moved a committed number.
+
+    Contributing to the risk sum is not the same as changing an answer. A contribution can be
+    clamped, rounded away, offset by another, or land against a cap or a floor, and the terms
+    come out identical to a cold start. A hash over those would claim a receipt explained a
+    number it did not touch.
+
+    The rule is a minimal set: drop candidates one at a time, in a fixed order, while the
+    committed terms stay the same. What remains has the property the name promises, because
+    removing any one of them changes at least one committed output. Where several receipts only
+    matter together, against a cap say, the set keeps as many as are needed and no more.
+    """
+
+    baseline = committed(events)
+    keep = list(sorted(candidates))
+    for identifier in sorted(candidates):
+        trial = [item for item in keep if item != identifier]
+        without = [
+            event for event in events
+            if canonical_event_id(str(event["event_id"])) in set(trial)
+        ]
+        if committed(without) == baseline:
+            keep = trial
+    return tuple(keep)
 
 
 def _score(events, dimensions, *, about: str, weight: Decimal, relevance) -> tuple[Decimal, set[str]]:
