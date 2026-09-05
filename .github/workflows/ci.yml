@@ -1,0 +1,117 @@
+name: ci
+
+# Everything this repository checks, in the order it checks it locally. There is nothing here
+# a contributor cannot run themselves in four commands, which is deliberate: a check that only
+# exists in CI is a check nobody runs before pushing.
+#
+# The contract suite has no external dependencies. `contracts/test` declares its own minimal
+# cheatcode interface rather than importing forge-std, so a clean checkout builds with nothing
+# but Foundry and there are no submodules to initialise.
+
+on:
+  push:
+    branches: [main, staging, rename-and-bilateral]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Build
+        working-directory: contracts
+        run: forge build --sizes
+
+      - name: Test
+        working-directory: contracts
+        # The two solvency invariants are the expensive ones and the ones worth having: they
+        # fuzz interleavings and assert the escrow's balance always covers its open
+        # liabilities plus every uncollected credit.
+        run: forge test -vv
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Foundry
+        # `anvil` is a test dependency, not a build one. `tests/test_anvil_loop.py` runs the
+        # whole transaction orchestrator against real compiled bytecode on a real EVM, and it
+        # skips itself cleanly when anvil or the compiled artifact is missing. Skipping
+        # silently in CI would be worse than not having the tests, so both are installed and
+        # the artifact is built before pytest runs.
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Compile the contract the Python suite tests against
+        working-directory: contracts
+        run: forge build
+
+      - name: Sync
+        run: uv sync --extra dev
+
+      - name: Lint
+        # Narrow on purpose: dead code and stale imports, not opinions about style. It found
+        # four leftovers from a refactor that 415 passing tests did not.
+        run: uv run ruff check wrasse tests
+
+      - name: Test
+        run: uv run pytest
+
+      - name: Prove the anvil suite actually ran
+        # A skipped suite and a passing one look identical in a green check. These tests skip
+        # themselves when anvil or the compiled artifact is missing, which is right locally
+        # and wrong here: in CI a silent skip turns the orchestrator's entire proof into a
+        # tick nobody earned.
+        #
+        # `-o addopts=` clears the repository's `-q`, which suppresses the summary line the
+        # count is read from. The first version of this guard grepped for "N skipped" against
+        # output that never contains it, so 37 skipped tests passed it. Both branches of this
+        # one were tested by moving the artifact away and watching it fail.
+        run: |
+          uv run pytest tests/test_anvil_loop.py -o addopts= -q 2>&1 | tee /tmp/anvil.txt
+          if grep -qE "[0-9]+ (skipped|error)" /tmp/anvil.txt; then
+            echo "::error::the anvil orchestrator suite did not run; this green check would mean less than it appears to"
+            exit 1
+          fi
+          grep -qE "[0-9]+ passed" /tmp/anvil.txt || {
+            echo "::error::no passing count found, so the guard could not confirm anything ran"
+            exit 1
+          }
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build the wheel and the sdist
+        run: uv build
+
+      - name: Prove the console entry point runs from the built package
+        # Installing the wheel into a throwaway environment catches a packaging mistake that
+        # `uv run` cannot: `uv run` works from the source tree whether or not the package
+        # would install correctly for anyone else.
+        run: |
+          uv venv /tmp/install-check
+          VIRTUAL_ENV=/tmp/install-check uv pip install dist/*.whl
+          /tmp/install-check/bin/wrasse --help > /dev/null

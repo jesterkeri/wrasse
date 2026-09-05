@@ -57,9 +57,12 @@ cd contracts
 forge test -vv
 ```
 
-There is no CI. Everything above runs locally and every commit in this repository
-was made with the two suites green. `ruff` is configured narrowly, to catch dead
-code and stale imports rather than to have opinions about style.
+`.github/workflows/ci.yml` runs exactly those commands, plus a wheel build and an
+install check. It also fails the job if the anvil orchestrator suite *skips*,
+because those tests skip themselves when anvil or the compiled artifact is
+missing and a silent skip in CI is a tick nobody earned. `ruff` is configured
+narrowly, to catch dead code and stale imports rather than to have opinions
+about style.
 
 The terminal interface currently exposes:
 
