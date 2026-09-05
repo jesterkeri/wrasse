@@ -96,7 +96,7 @@ def test_a_side_cannot_claim_to_have_used_evidence_it_does_not_hold(document):
     """A receipt citing a record the store never had explains nothing."""
 
     def relist(body):
-        body["buyer"]["profiles"]["urgent"]["terms"]["used_evidence_ids"] = ["0x" + "5c" * 32]
+        body["buyer"]["profiles"]["urgent"]["buyer"]["used_evidence_ids"] = ["0x" + "5c" * 32]
 
     with pytest.raises(PolicyDocumentError, match="used evidence it does not hold"):
         _load(_rewrite(document, relist))
@@ -114,7 +114,7 @@ def test_each_side_commits_to_the_evidence_it_actually_used(document):
         body["buyer"]["recalled_evidence"] = [row]
         body["buyer"]["cold_start"] = False
         body["buyer"]["verdict"] = "match"
-        body["buyer"]["profiles"]["urgent"]["terms"]["used_evidence_ids"] = [row["event_id"]]
+        body["buyer"]["profiles"]["urgent"]["buyer"]["used_evidence_ids"] = [row["event_id"]]
 
     with pytest.raises(PolicyDocumentError, match="commits buyer evidence"):
         _load(_rewrite(document, plant))
@@ -180,7 +180,18 @@ def test_a_missing_field_is_refused(document):
 
 def test_a_schema_version_this_build_does_not_know_is_refused(document):
     with pytest.raises(PolicyDocumentError, match="cannot know which fields"):
-        _load(_rewrite(document, lambda body: body.update({"schema_version": 3})))
+        _load(_rewrite(document, lambda body: body.update({"schema_version": 4})))
+
+
+def test_the_schema_this_build_writes_is_the_schema_it_reads(document):
+    """Two literals with no import between them drift, and the drift is invisible until a
+    document this build wrote is refused by this build."""
+
+    from wrasse.cli import POLICY_SCHEMA_VERSION
+    from wrasse.policy_document import SCHEMA_VERSION
+
+    assert POLICY_SCHEMA_VERSION is SCHEMA_VERSION
+    assert json.loads(document.read_text())["schema_version"] == SCHEMA_VERSION
 
 
 def test_an_engine_version_this_build_did_not_write_is_refused(document):
@@ -287,3 +298,61 @@ def test_a_persona_commitment_that_is_not_a_digest_is_refused(document):
         _load(_rewrite(
             document, lambda body: body["provider"]["persona"].update({"commitment": "trust me"})
         ))
+
+
+# --------------------------------------------------------------------------------------
+# The constants that decide a term, covered by the same commitment as the term
+# --------------------------------------------------------------------------------------
+
+
+def test_editing_a_negotiation_constant_changes_the_engine_version(monkeypatch):
+    """The claim that would otherwise be release discipline dressed as proof.
+
+    `engineVersionHash` is `keccak(ENGINE_VERSION)`. If that string is typed by a person,
+    editing a constant changes every term and no hash, and saying the constants are committed
+    is false. Deriving the string from a manifest of those constants makes it true.
+    """
+
+    import hashlib
+    import importlib
+    import json as _json
+
+    from wrasse import constants
+
+    before = constants.ENGINE_VERSION
+    edited = _json.loads(constants.canonical_manifest())
+    edited["max_bond_bps"] += 1
+    digest = hashlib.sha256(
+        _json.dumps(edited, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    assert digest[:12] != constants.MANIFEST_DIGEST[:12]
+    assert before.endswith(constants.MANIFEST_DIGEST[:12])
+    assert f"wrasse/0.2.0+{digest[:12]}" != before, (
+        "a changed constant must produce a changed version, or the commitment covers nothing"
+    )
+    importlib.reload(constants)  # leave the module as it was found
+
+
+def test_the_published_manifest_is_the_one_the_version_was_hashed_from(document):
+    """A reader recomputes the digest rather than trusting it, so the manifest has to be real."""
+
+    import hashlib
+
+    from wrasse.constants import ENGINE_VERSION
+
+    body = json.loads(document.read_text())
+    published = body["engine"]["negotiation_manifest"]
+    digest = hashlib.sha256(
+        json.dumps(published, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert ENGINE_VERSION.endswith(digest[:12])
+    assert body["engine_version"] == ENGINE_VERSION
+
+
+def test_a_document_publishing_someone_elses_constants_is_refused(document):
+    def swap(body):
+        body["engine"]["negotiation_manifest"]["max_bond_bps"] = 9_999
+
+    with pytest.raises(PolicyDocumentError, match="not the one this build hashes"):
+        _load(_rewrite(document, swap))

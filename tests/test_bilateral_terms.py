@@ -96,6 +96,15 @@ def both(tmp_path):
                                      owner_address=PROVIDER, chain_id=CHAIN_ID,
                                      escrow_address=ESCROW),
     }
+    # The persona is committed before any receipt exists, which is the claim it makes and the
+    # order the real run uses. Committing it after would be refused, and rightly.
+    import os
+
+    from wrasse.store import persona_digest
+
+    digest, document = persona_digest(os.environ["WRASSE_PROVIDER_PERSONA"])
+    stores["provider"].commit_persona(name=document["name"], digest=digest)
+
     for store in stores.values():
         for event in (TIMEOUT, LATE_RELEASE):
             store.ingest(event)
@@ -114,6 +123,7 @@ def _buyer_terms(store, evidence, profile="urgent"):
         base_price_wei=BASE_PRICE,
         base_bond_bps=BASE_BOND_BPS,
         base_service_window=BASE_WINDOW,
+        base_payout_delay=BASE_DELAY,
     )
 
 
@@ -124,6 +134,7 @@ def _provider_terms(store, evidence):
         persona=PERSONA,
         base_price_wei=BASE_PRICE,
         base_payout_delay=BASE_DELAY,
+        base_service_window=BASE_WINDOW,
     )
 
 
@@ -170,7 +181,7 @@ def test_a_remembered_late_release_makes_the_provider_charge_more_and_wait_less(
     cold = _provider_terms(both["provider"], [])
     warm = _provider_terms(both["provider"], both["provider"].recall(BUYER).evidence)
 
-    assert warm.price_wei > cold.price_wei
+    assert warm.price_bps > cold.price_bps
     assert warm.payout_delay < cold.payout_delay
 
 
@@ -183,6 +194,7 @@ def test_a_tightened_window_never_goes_below_what_a_provider_can_meet(both):
         base_price_wei=BASE_PRICE,
         base_bond_bps=BASE_BOND_BPS,
         base_service_window=MIN_SERVICE_WINDOW_SECONDS + 60,
+        base_payout_delay=BASE_DELAY,
     )
     assert terms.service_window >= MIN_SERVICE_WINDOW_SECONDS
 
@@ -199,6 +211,7 @@ def test_a_deliberately_short_base_window_is_not_raised_to_the_floor(both):
         base_price_wei=BASE_PRICE,
         base_bond_bps=BASE_BOND_BPS,
         base_service_window=60,
+        base_payout_delay=BASE_DELAY,
     )
     assert terms.service_window == 60
 
@@ -210,6 +223,7 @@ def test_a_shortened_payout_delay_has_a_floor_too(both):
         persona=PERSONA,
         base_price_wei=BASE_PRICE,
         base_payout_delay=MIN_PAYOUT_DELAY_SECONDS + 30,
+        base_service_window=BASE_WINDOW,
     )
     assert terms.payout_delay >= MIN_PAYOUT_DELAY_SECONDS
 
@@ -226,7 +240,7 @@ def test_the_buyers_timeout_does_not_move_the_providers_terms(both):
     cold = _provider_terms(both["provider"], [])
     warm = _provider_terms(both["provider"], only_timeout)
 
-    assert warm.price_wei == cold.price_wei
+    assert warm.price_bps == cold.price_bps
     assert warm.payout_delay == cold.payout_delay
     assert warm.used_evidence_ids == ()
     assert len(warm.recalled_event_ids) == 1, "recalled, and visibly so, but not used"
@@ -404,10 +418,14 @@ def test_a_contribution_that_rounds_away_is_not_called_used(both):
 
     cold = produce_terms(evidence=[], dimensions=[vanishing], profile=PROFILES["urgent"],
                          base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
-                         base_service_window=BASE_WINDOW)
+                         base_service_window=BASE_WINDOW,
+                         base_payout_delay=BASE_DELAY,
+                     )
     warm = produce_terms(evidence=evidence, dimensions=[vanishing], profile=PROFILES["urgent"],
                          base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
-                         base_service_window=BASE_WINDOW)
+                         base_service_window=BASE_WINDOW,
+                         base_payout_delay=BASE_DELAY,
+                     )
 
     assert warm.provider_bond_bps == cold.provider_bond_bps
     assert warm.service_window == cold.service_window
@@ -431,6 +449,7 @@ def test_removing_any_used_receipt_changes_a_committed_number(both):
             evidence=without, dimensions=dimensions, profile=PROFILES["urgent"],
             base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
             base_service_window=BASE_WINDOW,
+            base_payout_delay=BASE_DELAY,
         )
         assert (reduced.provider_bond_bps, reduced.service_window) != (
             full.provider_bond_bps, full.service_window
@@ -450,6 +469,7 @@ def test_the_used_set_reproduces_the_same_terms_as_the_whole_history(both):
     reduced = produce_terms(
         evidence=only_used, dimensions=dimensions, profile=PROFILES["urgent"],
         base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS, base_service_window=BASE_WINDOW,
+        base_payout_delay=BASE_DELAY,
     )
     assert (reduced.provider_bond_bps, reduced.service_window) == (
         full.provider_bond_bps, full.service_window
@@ -494,6 +514,7 @@ def test_two_receipts_that_cancel_leave_nothing_to_commit_to(both):
             evidence=rows, dimensions=list(mild.values()), profile=PROFILES["urgent"],
             base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
             base_service_window=BASE_WINDOW,
+            base_payout_delay=BASE_DELAY,
         )
 
     cold, full = quote([]), quote(events)
@@ -525,3 +546,250 @@ def test_two_active_dimensions_for_one_outcome_stop_the_quote(both):
 
     with pytest.raises(DimensionError, match="two active dimensions describe"):
         load_dimensions(both["buyer"].memory)
+
+
+# --------------------------------------------------------------------------------------
+# The negotiation, on the two receipts that are actually on Base
+# --------------------------------------------------------------------------------------
+
+
+#: What the two live stores on Base actually hold, read out of them rather than invented. The
+#: worked table this gate was designed against is a property of these numbers, so pinning them
+#: is what makes that table a test instead of a memory.
+LIVE_DIMENSIONS = (
+    DimensionDefinition(
+        dimension_id="non_delivery_after_payment",
+        source_event_type="timeout_claimed_without_delivery",
+        signal_direction="negative", severity=0.9, confidence=0.9,
+        applies_when=("deadline_sensitive", "cost_sensitive", "quality_sensitive"),
+    ),
+    DimensionDefinition(
+        dimension_id="buyer_payment_delay",
+        source_event_type="delivered_and_claimed_after_delay",
+        signal_direction="negative", severity=0.9, confidence=0.8,
+        applies_when=("deadline_sensitive", "cost_sensitive", "quality_sensitive"),
+    ),
+)
+
+
+def _positions(both, profile, base):
+    from wrasse.cli import BilateralQuote, _positions_for
+
+    buyer = produce_terms(
+        evidence=both["buyer"].recall(PROVIDER).evidence,
+        dimensions=LIVE_DIMENSIONS,
+        profile=PROFILES[profile],
+        base_price_wei=base["price_wei"], base_bond_bps=base["provider_bond_bps"],
+        base_service_window=base["service_window"], base_payout_delay=base["payout_delay"],
+    )
+    provider = produce_provider_terms(
+        evidence=both["provider"].recall(BUYER).evidence,
+        dimensions=LIVE_DIMENSIONS,
+        persona=PERSONA,
+        base_price_wei=base["price_wei"], base_payout_delay=base["payout_delay"],
+        base_service_window=base["service_window"],
+    )
+    quote = BilateralQuote(
+        recall={}, persona=PERSONA, provider_terms=provider,
+        buyer_terms={profile: buyer}, baseline=base,
+    )
+    return _positions_for(quote, profile)
+
+
+BASELINE = {
+    "price_wei": BASE_PRICE, "provider_bond_bps": BASE_BOND_BPS,
+    "service_window": 600, "payout_delay": 1_800,
+}
+
+
+def test_the_worked_table_reproduces_from_the_two_real_receipts(both):
+    """The table the design was signed off against, recomputed rather than remembered.
+
+    Three profiles, three outcomes: a proposal standing, a concession, and a refusal. All from
+    the same two receipts, which is the strongest thing this entry can show.
+    """
+    from wrasse.negotiation import price_wei, settle
+
+    outcomes = {}
+    for name in PROFILES:
+        result = settle(_positions(both, name, BASELINE))
+        outcomes[name] = result
+
+    urgent = outcomes["urgent"]
+    assert urgent.agreed
+    assert urgent.terms["provider_bond_bps"] == 2_480
+    assert urgent.terms["service_window"] == 300
+    assert price_wei(BASE_PRICE, urgent.terms["price_bps"]) == 118 * 10**12
+    assert urgent.terms["payout_delay"] == 900
+
+    sensitive = outcomes["sensitive"]
+    assert sensitive.agreed
+    assert price_wei(BASE_PRICE, sensitive.terms["price_bps"]) == 115 * 10**12
+
+    budget = outcomes["budget"]
+    assert not budget.agreed
+    assert (budget.failed_on, budget.gap) == ("price_bps", 850)
+
+
+def test_a_concession_and_a_rule_are_never_reported_as_each_other(both):
+    """The bond limit moves with the provider's memory; the others are constants.
+
+    Reporting a constant as a concession, or a memory-driven limit as a rule, would let a
+    number that no receipt touched present itself as evidence-driven.
+    """
+    from wrasse.negotiation import CONCESSION, RULE, settle
+
+    result = settle(_positions(both, "urgent", BASELINE))
+    kinds = {move.term: move.kind for move in result.moves}
+    assert kinds["provider_bond_bps"] == CONCESSION
+    assert kinds["payout_delay"] == RULE
+    assert all("0x" not in move.because for move in result.moves), (
+        "a settlement move cites a limit or a rule, never a receipt"
+    )
+
+
+@pytest.mark.parametrize("profile", sorted(PROFILES))
+def test_a_worse_buyer_never_improves_the_buyers_own_outcome(both, profile):
+    """Swept, not spot-checked. This is the property the fixed ceiling exists to give.
+
+    The buyer's record moves the provider's limits. As it worsens, the buyer must never do
+    better: no interval where the price falls, the bond it receives rises, or a refusal turns
+    back into a deal.
+    """
+    from wrasse.negotiation import settle
+
+    from wrasse.engine import produce_provider_terms as _provider
+    from wrasse.cli import BilateralQuote, _positions_for
+
+    buyer = produce_terms(
+        evidence=both["buyer"].recall(PROVIDER).evidence,
+        dimensions=LIVE_DIMENSIONS, profile=PROFILES[profile],
+        base_price_wei=BASE_PRICE, base_bond_bps=BASE_BOND_BPS,
+        base_service_window=600, base_payout_delay=1_800,
+    )
+
+    prices, bonds, agreed = [], [], []
+    for severity in [i / 20 for i in range(21)]:
+        dimension = DimensionDefinition(
+            dimension_id="buyer_payment_delay",
+            source_event_type="delivered_and_claimed_after_delay",
+            signal_direction="negative", severity=severity, confidence=1.0,
+            applies_when=("cost_sensitive",),
+        )
+        provider = _provider(
+            evidence=both["provider"].recall(BUYER).evidence, dimensions=[dimension],
+            persona=PERSONA, base_price_wei=BASE_PRICE, base_payout_delay=1_800,
+            base_service_window=600,
+        )
+        quote = BilateralQuote(
+            recall={}, persona=PERSONA, provider_terms=provider,
+            buyer_terms={profile: buyer}, baseline=BASELINE,
+        )
+        result = settle(_positions_for(quote, profile))
+        agreed.append(result.agreed)
+        if result.agreed:
+            prices.append(result.terms["price_bps"])
+            bonds.append(result.terms["provider_bond_bps"])
+
+    assert prices == sorted(prices), "a worse buyer record must never lower the price it pays"
+    assert bonds == sorted(bonds, reverse=True), (
+        "a worse buyer record must never raise the bond posted for its protection"
+    )
+    assert agreed == sorted(agreed, reverse=True), (
+        "a refusal must not turn back into a deal as the record gets worse"
+    )
+
+
+def test_a_refused_profile_has_nothing_to_sign(both, tmp_path, monkeypatch, capsys):
+    """Structural, not a flag. A refused profile omits terms, preimage and hash entirely.
+
+    A reader cannot mistake it for an offer and `load_policy` refuses it before any store is
+    opened or any chain is read, because there is no work worth doing on a deal that does not
+    exist.
+    """
+    import json
+
+    from wrasse.cli import main
+    from wrasse.policy_document import PolicyDocumentError, load_policy
+
+    monkeypatch.setenv("WRASSE_BUYER_MEMORY_PATH", str(both["buyer"]._lock_path.with_suffix("")))
+    monkeypatch.setenv("WRASSE_PROVIDER_MEMORY_PATH", str(both["provider"]._lock_path.with_suffix("")))
+    monkeypatch.setenv("WRASSE_ESCROW_ADDRESS", ESCROW)
+    monkeypatch.setenv("BASE_SEPOLIA_CHAIN_ID", str(CHAIN_ID))
+    monkeypatch.setenv("WRASSE_BUYER_ADDRESS", BUYER)
+    monkeypatch.setenv("WRASSE_PROVIDER_A_ADDRESS", PROVIDER)
+
+    output = tmp_path / "settled.json"
+    code = main([
+        "policy", PROVIDER, "--buyer", BUYER,
+        "--accept-by", "1900000000", "--reference-timestamp", "1899990000",
+        "--service-window", "600", "--payout-delay", "1800",
+        "--output", str(output),
+    ])
+    capsys.readouterr()
+    assert code == 0, "two profiles agree, so the run is not a failure"
+
+    body = json.loads(output.read_text())
+    refused = [n for n, b in body["buyer"]["profiles"].items() if not b["settlement"]["agreed"]]
+    assert refused == ["budget"]
+
+    profile = body["buyer"]["profiles"]["budget"]
+    for absent in ("terms", "policy_preimage", "policy_hash"):
+        assert absent not in profile, f"a refused profile still offers {absent}"
+
+    with pytest.raises(PolicyDocumentError, match="did not reach agreement"):
+        load_policy(output, profile="budget", chain_id=CHAIN_ID, contract_address=ESCROW,
+                    buyer=BUYER, provider=PROVIDER)
+
+    # And the one that did agree is still signable from the same file.
+    assert load_policy(output, profile="urgent", chain_id=CHAIN_ID, contract_address=ESCROW,
+                       buyer=BUYER, provider=PROVIDER).profile == "urgent"
+
+
+@pytest.mark.parametrize("profile", sorted(PROFILES))
+def test_a_worse_provider_never_worsens_the_buyers_own_outcome(both, profile):
+    """The inversion the fixed ceiling exists to remove, swept directly.
+
+    A buyer ceiling that fell with the provider's misconduct made the buyer pay *less* as it
+    was wronged *more*, which is an improvement, and then dropped it into refusal with nothing
+    at all. Worse conduct by the provider must never change what the buyer pays, and must
+    never turn its deal into a refusal: the party that suffered is not the party that pays.
+    """
+    from wrasse.cli import BilateralQuote, _positions_for
+    from wrasse.negotiation import settle
+
+    provider = produce_provider_terms(
+        evidence=both["provider"].recall(BUYER).evidence, dimensions=LIVE_DIMENSIONS,
+        persona=PERSONA, base_price_wei=BASE_PRICE, base_payout_delay=1_800,
+        base_service_window=600,
+    )
+
+    prices, agreed = [], []
+    for severity in [i / 20 for i in range(21)]:
+        dimension = DimensionDefinition(
+            dimension_id="non_delivery_after_payment",
+            source_event_type="timeout_claimed_without_delivery",
+            signal_direction="negative", severity=severity, confidence=1.0,
+            applies_when=("deadline_sensitive", "cost_sensitive", "quality_sensitive"),
+        )
+        buyer = produce_terms(
+            evidence=both["buyer"].recall(PROVIDER).evidence, dimensions=[dimension],
+            profile=PROFILES[profile], base_price_wei=BASE_PRICE,
+            base_bond_bps=BASE_BOND_BPS, base_service_window=600, base_payout_delay=1_800,
+        )
+        quote = BilateralQuote(
+            recall={}, persona=PERSONA, provider_terms=provider,
+            buyer_terms={profile: buyer}, baseline=BASELINE,
+        )
+        result = settle(_positions_for(quote, profile))
+        agreed.append(result.agreed)
+        if result.agreed:
+            prices.append(result.terms["price_bps"])
+
+    assert len(set(prices)) <= 1, (
+        "the provider's own misconduct moved what the buyer pays, which is the inversion: "
+        f"{sorted(set(prices))}"
+    )
+    assert agreed == sorted(agreed, reverse=True) or all(agreed), (
+        "a worse provider turned the buyer's deal into a refusal"
+    )

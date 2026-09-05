@@ -23,12 +23,16 @@ def test_same_history_changes_terms_by_task_profile():
         base_price_wei=10_000,
         base_bond_bps=500,
         base_service_window=3_600,
+        base_payout_delay=1_800,
     )
     urgent = produce_terms(profile=PROFILES["urgent"], **common)
     budget = produce_terms(profile=PROFILES["budget"], **common)
     assert urgent.provider_bond_bps > budget.provider_bond_bps
-    assert urgent.price_wei > budget.price_wei
     assert urgent.service_window < budget.service_window
+    # The limits each publishes differ too, and those carry no risk term: an urgent buyer will
+    # pay more for the same job and will wait less to be sure of it.
+    assert urgent.max_price_bps > budget.max_price_bps
+    assert urgent.min_payout_delay < budget.min_payout_delay
 
 
 def test_unknown_dimension_name_is_handled_without_code_changes():
@@ -52,6 +56,7 @@ def test_unknown_dimension_name_is_handled_without_code_changes():
         base_price_wei=10_000,
         base_bond_bps=0,
         base_service_window=100,
+        base_payout_delay=600,
     )
     assert terms.risk == 1
     assert terms.provider_bond_bps == 2_500
@@ -80,6 +85,7 @@ def test_a_repeated_recall_does_not_count_twice():
         base_price_wei=10_000,
         base_bond_bps=500,
         base_service_window=3_600,
+        base_payout_delay=1_800,
     )
     once = produce_terms(evidence=[event], **common)
     twice = produce_terms(evidence=[event, dict(event)], **common)
@@ -114,6 +120,7 @@ def test_the_same_receipt_spelled_differently_is_one_receipt():
         base_price_wei=10_000,
         base_bond_bps=500,
         base_service_window=3_600,
+        base_payout_delay=1_800,
     )
     once = produce_terms(
         evidence=[{"event_id": prefixed, "event_type": "timeout_claimed_without_delivery"}], **common
@@ -140,6 +147,7 @@ def test_two_different_stories_about_one_receipt_fail_closed():
         base_price_wei=10_000,
         base_bond_bps=500,
         base_service_window=3_600,
+        base_payout_delay=1_800,
     )
     with pytest.raises(ValueError, match="conflicting records"):
         produce_terms(

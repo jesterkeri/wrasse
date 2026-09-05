@@ -6,56 +6,67 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable
 
+from .constants import (
+    CONCESSION_DEN,
+    CONCESSION_NUM,
+    MAX_BOND_BPS,
+    MIN_PAYOUT_DELAY_SECONDS,
+    MIN_SERVICE_WINDOW_SECONDS,
+    PROFILE_FIELDS,
+)
 from .dimensions import DimensionDefinition
 from .evidence import SUBJECTS_OF
-from .policy_hash import canonical_event_id
+from .negotiation import clamp_bond_bps, clamp_duration
+from .policy_hash import BPS_DENOMINATOR, canonical_event_id
 from .providers import ProviderPersona
-
-#: A window this side may not tighten past, because a deadline the provider cannot physically
-#: meet is not a harder bargain, it is a broken deal. Base Sepolia's safe head trails the tip by
-#: roughly 66 seconds, and a provider has to clear its acceptance before it can deliver.
-#:
-#: It is a floor on the *adjustment*, never an override of a base the operator chose. A demo
-#: that deliberately asks for 60 seconds because it wants a timeout still gets 60 seconds.
-MIN_SERVICE_WINDOW_SECONDS = 300
-
-#: Same shape, for the provider's side of the bargain.
-MIN_PAYOUT_DELAY_SECONDS = 60
 
 
 @dataclass(frozen=True)
 class PriorityProfile:
+    """One task profile. Every field is in `PROFILE_FIELDS` and therefore in the digest.
+
+    `bond_sensitivity_bps` and `window_buffer_seconds` move this profile's own proposals with
+    its memory of the provider. `price_ceiling_premium_bps` and `payout_delay_floor_bps` are
+    the limits it publishes to the provider, and neither has a risk term: a limit that moved
+    with the *counterparty's* misconduct made this side better off as it was wronged more and
+    then refused outright, punishing the party that suffered rather than the one that caused it.
+    """
+
     name: str
     contexts: frozenset[str]
     risk_weight: Decimal
     bond_sensitivity_bps: int
-    discount_sensitivity_bps: int
     window_buffer_seconds: int
+    price_ceiling_premium_bps: int
+    payout_delay_floor_bps: int
 
 
-#: `window_buffer_seconds` is signed, and the sign is the whole point. Prior non-delivery does
-#: not universally imply a tighter deadline: an urgent buyer wants one, while a cost- or
-#: quality-sensitive buyer may rationally grant a longer realistic window instead. Urgent was 0
-#: before, which meant it could only decline to lengthen, never actually tighten.
 PROFILES = {
-    "urgent": PriorityProfile(
-        "urgent", frozenset({"deadline_sensitive"}), Decimal("1.40"), 3_000, 250, -1_800
-    ),
-    "budget": PriorityProfile(
-        "budget", frozenset({"cost_sensitive"}), Decimal("0.85"), 1_000, 1_500, 3_600
-    ),
-    "sensitive": PriorityProfile(
-        "sensitive", frozenset({"quality_sensitive"}), Decimal("1.20"), 2_500, 750, 1_800
-    ),
+    name: PriorityProfile(
+        name=name,
+        contexts=frozenset(fields["contexts"]),
+        risk_weight=Decimal(fields["risk_weight"]),
+        bond_sensitivity_bps=fields["bond_sensitivity_bps"],
+        window_buffer_seconds=fields["window_buffer_seconds"],
+        price_ceiling_premium_bps=fields["price_ceiling_premium_bps"],
+        payout_delay_floor_bps=fields["payout_delay_floor_bps"],
+    )
+    for name, fields in PROFILE_FIELDS.items()
 }
 
 
 @dataclass(frozen=True)
 class DealTerms:
+    """The buyer's half: what it proposes, and the limits it publishes to the provider."""
+
     profile: str
-    price_wei: int
     provider_bond_bps: int
     service_window: int
+    #: The most this profile will pay, in basis points of the operator's baseline. Baseline
+    #: relative rather than absolute wei, so it does not silently break when the baseline moves.
+    max_price_bps: int
+    #: The least payout delay this profile will accept, in seconds.
+    min_payout_delay: int
     risk: Decimal
     #: Everything this side holds about the counterparty.
     recalled_event_ids: tuple[str, ...]
@@ -73,11 +84,12 @@ def produce_terms(
     base_price_wei: int,
     base_bond_bps: int,
     base_service_window: int,
+    base_payout_delay: int,
 ) -> DealTerms:
     """Apply dimensions generically; no dimension identifier is hard-coded."""
 
-    if base_price_wei <= 0 or base_service_window <= 0:
-        raise ValueError("base price and service window must be positive")
+    if base_price_wei <= 0 or base_service_window <= 0 or base_payout_delay <= 0:
+        raise ValueError("base price, service window and payout delay must be positive")
     events = _unique_by_event_id(evidence)
     risk, used = _score(
         events,
@@ -92,7 +104,15 @@ def produce_terms(
     )
 
     def committed(subset) -> tuple[int, int]:
-        """The two numbers this side actually commits to."""
+        """Every number this side contributes that depends on risk.
+
+        Only these two. The buyer's limits are constants, and a constant cannot discriminate
+        between histories, so including them would add nothing to the minimality search but
+        cost. What is *not* here is the settlement: running the search over a function of the
+        counterparty's evidence would drop a receipt that genuinely moved this side's proposal
+        whenever the other side's limit happened to bind, and the document would then say the
+        buyer used nothing beside a risk of 1.0000.
+        """
 
         partial, _ = _score(
             subset, dimensions, about="provider", weight=profile.risk_weight,
@@ -102,22 +122,28 @@ def produce_terms(
             ),
         )
         return (
-            min(10_000, base_bond_bps + _round_decimal(partial * profile.bond_sensitivity_bps)),
-            max(
-                min(base_service_window, MIN_SERVICE_WINDOW_SECONDS),
-                base_service_window + _round_decimal(partial * profile.window_buffer_seconds),
+            clamp_bond_bps(
+                base_bond_bps + _round_decimal(partial * profile.bond_sensitivity_bps)
+            ),
+            clamp_duration(
+                max(
+                    min(base_service_window, MIN_SERVICE_WINDOW_SECONDS),
+                    base_service_window + _round_decimal(partial * profile.window_buffer_seconds),
+                )
             ),
         )
 
     bond, service_window = committed(events)
-    discount_bps = _round_decimal(risk * profile.discount_sensitivity_bps)
-    price = base_price_wei * (10_000 - discount_bps) // 10_000
 
     return DealTerms(
         profile=profile.name,
-        price_wei=price,
         provider_bond_bps=bond,
         service_window=service_window,
+        # No risk term in either limit. See `PriorityProfile`.
+        max_price_bps=BPS_DENOMINATOR + profile.price_ceiling_premium_bps,
+        min_payout_delay=clamp_duration(
+            base_payout_delay * profile.payout_delay_floor_bps // BPS_DENOMINATOR
+        ),
         risk=risk.quantize(Decimal("0.0001")),
         recalled_event_ids=tuple(sorted(canonical_event_id(str(e["event_id"])) for e in events)),
         used_evidence_ids=_minimal_causal_set(events, used, committed),
@@ -129,8 +155,24 @@ class ProviderTerms:
     """The provider's half of the bargain, from the provider's own memory of this buyer."""
 
     persona: str
-    price_wei: int
+    #: The ask, in basis points of the operator's baseline. Basis points rather than wei
+    #: because the comparison happens here and the conversion happens once, at the end: at a
+    #: small baseline two distinct rates floor to the same wei and the settlement would be a
+    #: coin toss.
+    price_bps: int
     payout_delay: int
+    #: The least this provider will take, above the baseline. It concedes most of what memory
+    #: added and not all of it, because the reason it added it has not gone away. This is the
+    #: one walk-away that is not simply the baseline, and it is what makes a refusal on price
+    #: possible at all.
+    price_floor_bps: int
+    #: The most bond it will post. Falls as its memory of *this buyer* worsens, which is
+    #: monotone against the party that caused it: a worse buyer gets less protection posted.
+    max_bond_bps: int
+    #: The least time it needs to deliver. A physical capability, so it carries no risk term:
+    #: a buyer that paid late does not make delivery take longer. Never above the operator's
+    #: own baseline, so a deliberately short window is not overridden.
+    min_service_window: int
     risk: Decimal
     recalled_event_ids: tuple[str, ...]
     used_evidence_ids: tuple[str, ...]
@@ -143,6 +185,7 @@ def produce_provider_terms(
     persona: ProviderPersona,
     base_price_wei: int,
     base_payout_delay: int,
+    base_service_window: int,
 ) -> ProviderTerms:
     """The same risk model, spent on the two terms the provider actually controls.
 
@@ -152,38 +195,67 @@ def produce_provider_terms(
     `cashflow_sensitivity` means.
     """
 
-    if base_price_wei <= 0 or base_payout_delay <= 0:
-        raise ValueError("base price and payout delay must be positive")
+    if base_price_wei <= 0 or base_payout_delay <= 0 or base_service_window <= 0:
+        raise ValueError("base price, payout delay and service window must be positive")
 
     events = _unique_by_event_id(evidence)
     risk, used = _score(
         events, dimensions, about="buyer", weight=Decimal("1"), relevance=lambda _: Decimal("1")
     )
 
-    def committed(subset) -> tuple[int, int]:
+    def committed(subset) -> tuple[int, int, int, int]:
+        """Every number this side contributes that depends on risk: four, not two.
+
+        The two limits are here because they can settle a term on their own. A receipt that
+        moved only the bond ceiling used to be recalled and never committed, so the hash
+        described less than the reasoning did.
+
+        `min_service_window` is absent on purpose: it is a constant and cannot discriminate.
+        """
+
         partial, _ = _score(
             subset, dimensions, about="buyer", weight=Decimal("1"),
             relevance=lambda _: Decimal("1"),
         )
+        premium = _round_decimal(partial * persona.price_sensitivity_bps)
         return (
-            base_price_wei
-            * (10_000 + _round_decimal(partial * persona.price_sensitivity_bps))
-            // 10_000,
-            max(
-                min(base_payout_delay, MIN_PAYOUT_DELAY_SECONDS),
-                base_payout_delay
-                - _round_decimal(
-                    partial * persona.delay_sensitivity_seconds * persona.cashflow_sensitivity
-                ),
+            BPS_DENOMINATOR + premium,
+            clamp_duration(
+                max(
+                    min(base_payout_delay, MIN_PAYOUT_DELAY_SECONDS),
+                    base_payout_delay
+                    - _round_decimal(
+                        partial * persona.delay_sensitivity_seconds * persona.cashflow_sensitivity
+                    ),
+                )
+            ),
+            clamp_bond_bps(
+                MAX_BOND_BPS
+                - _round_decimal(partial * MAX_BOND_BPS * persona.cashflow_sensitivity)
+            ),
+            # Three quarters of the way back, never further. `_round_decimal` is monotone and
+            # the share is below one, so the floor can never rise above the ask, which would
+            # have the provider refusing its own proposal.
+            BPS_DENOMINATOR
+            + _round_decimal(
+                partial
+                * persona.price_sensitivity_bps
+                * Decimal(CONCESSION_NUM)
+                / Decimal(CONCESSION_DEN)
             ),
         )
 
-    price, payout_delay = committed(events)
+    price_bps, payout_delay, max_bond_bps, price_floor_bps = committed(events)
 
     return ProviderTerms(
         persona=persona.name,
-        price_wei=price,
+        price_bps=price_bps,
         payout_delay=payout_delay,
+        price_floor_bps=price_floor_bps,
+        max_bond_bps=max_bond_bps,
+        min_service_window=clamp_duration(
+            min(MIN_SERVICE_WINDOW_SECONDS, base_service_window)
+        ),
         risk=risk.quantize(Decimal("0.0001")),
         recalled_event_ids=tuple(sorted(canonical_event_id(str(e["event_id"])) for e in events)),
         used_evidence_ids=_minimal_causal_set(events, used, committed),

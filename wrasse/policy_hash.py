@@ -17,13 +17,20 @@ from typing import Iterable
 from eth_abi import encode
 from web3 import Web3
 
+from .constants import ENGINE_VERSION as _ENGINE_VERSION
 
-#: Mirrors the constants of the same name in `WrasseEscrow`. Duplicated rather than read
-#: from a deployment because the terms have to be checkable before any contract exists;
-#: `tests/test_policy_rules.py` pins them against the Solidity fixture.
+
 #: Hashed into every commitment, so it is a term of the deal and not a label.
-ENGINE_VERSION = "wrasse/0.1.0"
+#:
+#: Derived rather than typed. It carries a digest of every constant that can move a term, so
+#: editing one of those constants changes this string, changes `engineVersionHash`, and changes
+#: every `policyHash` derived from it. A hand-typed version would have left that coupling to
+#: release discipline while the code claimed it was a commitment.
+ENGINE_VERSION = _ENGINE_VERSION
 
+#: Mirrors the constants of the same name in `WrasseEscrow`. Duplicated rather than read from a
+#: deployment because the terms have to be checkable before any contract exists;
+#: `tests/test_policy_rules.py` pins them against the Solidity fixture.
 BPS_DENOMINATOR = 10_000
 MAX_PROVIDER_BOND_BPS = 10_000
 MAX_DURATION = 30 * 24 * 60 * 60

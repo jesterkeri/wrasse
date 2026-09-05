@@ -744,6 +744,8 @@ def _forge(path: Path, mutate) -> Path:
     body = json.loads(path.read_text())
     mutate(body)
     for profile in body["buyer"]["profiles"].values():
+        if "policy_preimage" not in profile:
+            continue  # a refused profile has nothing to sign and nothing to re-hash
         preimage = PolicyPreimage(**profile["policy_preimage"])
         profile["policy_hash"] = policy_hash(preimage)
     path.write_text(json.dumps(body))
@@ -764,8 +766,9 @@ def test_a_forged_price_that_agrees_with_itself_is_still_not_signed(rehearsal, c
     ninefold = 900_000_000_000_000
 
     def raise_the_price(body):
-        body["provider"]["terms"]["price_wei"] = ninefold
         for profile in body["buyer"]["profiles"].values():
+            if not profile["settlement"]["agreed"]:
+                continue
             profile["terms"]["price_wei"] = ninefold
             profile["policy_preimage"]["price"] = ninefold
 
@@ -944,15 +947,16 @@ def test_a_receipt_arriving_before_the_signature_stops_it(rehearsal, capsys, mon
 @pytest.mark.parametrize(
     "field,edit",
     [
-        ("risk", lambda body: body["buyer"]["profiles"]["urgent"]["terms"].update({"risk": "0.9900"})),
+        ("risk", lambda body: body["buyer"]["profiles"]["urgent"]["buyer"].update(
+            {"risk": "0.9900"})),
         ("persona name", lambda body: body["provider"]["persona"].update({"name": "someone else"})),
         ("persona commitment", lambda body: body["provider"]["persona"].update(
             {"commitment": "b" * 64})),
         ("an unselected profile", lambda body: (
-            body["buyer"]["profiles"]["budget"]["terms"].update({"provider_bond_bps": 9_000}),
-            body["buyer"]["profiles"]["budget"]["policy_preimage"].update({"bond_bps": 9_000}),
+            body["buyer"]["profiles"]["sensitive"]["terms"].update({"provider_bond_bps": 9_000}),
+            body["buyer"]["profiles"]["sensitive"]["policy_preimage"].update({"bond_bps": 9_000}),
         )),
-        ("the set of profiles", lambda body: body["buyer"]["profiles"].pop("budget")),
+        ("the set of profiles", lambda body: body["buyer"]["profiles"].pop("sensitive")),
     ],
 )
 def test_the_whole_explanation_is_checked_not_only_the_signed_terms(

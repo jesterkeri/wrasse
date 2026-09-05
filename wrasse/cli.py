@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from sibyl_memory_client import MemoryClient, NotFoundError
 from web3 import HTTPProvider, Web3
 
-from . import chain, escrow
+from . import chain, escrow, negotiation
 from .chain_time import ChainObservation, observe_chain_time, past_lag, require_recent
 from .dimensions import (
     DIMENSION_CATEGORY,
@@ -29,7 +29,15 @@ from .dimensions import (
 )
 from .engine import PROFILES, produce_provider_terms, produce_terms
 from .memory_gate import recall_counterparty_evidence
-from .policy_document import PolicyDocumentError, ValidatedPolicy, load_policy
+from .constants import NEGOTIATION_MANIFEST
+from .policy_document import (
+    MAX_POLICY_BYTES,
+    SCHEMA_VERSION as POLICY_SCHEMA_VERSION,
+    PolicyDocumentError,
+    ValidatedPolicy,
+    load_policy,
+)
+from .policy_document import _no_duplicate_keys as no_duplicate_keys
 from .providers import ProviderPersona
 from .store import WrasseStore, persona_digest
 from .policy_hash import (
@@ -48,9 +56,9 @@ from .policy_hash import (
 from .reconciler import reconcile
 
 
-#: Bumped whenever the shape of policy.json changes. A consumer that does not recognise the
-#: version must refuse the document rather than guess which fields it is looking at.
-POLICY_SCHEMA_VERSION = 2
+#: Imported from the reader rather than typed here. Two literals with no import between them
+#: let the writer and the validator drift silently, and the drift is invisible until a
+#: document written by this build is refused by it.
 
 def _write_atomic(path: Path, text: str) -> None:
     """Replace a file in one step, or not at all.
@@ -322,6 +330,54 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _positions_for(quote: "BilateralQuote", profile: str) -> dict[str, negotiation.Position]:
+    """The eight numbers one profile's settlement is decided by.
+
+    A walk-away is the operator's baseline, widened to include the side's own proposal: a side
+    concedes back toward what it would have asked of a stranger, and never walks away from a
+    number it just offered. That second clause is what makes the service window work, because
+    `budget` and `sensitive` propose a *longer* window than the baseline and a walk-away pinned
+    to the baseline alone would be violated by their own opening.
+
+    Price is the one exception, and it is the exception that makes a refusal possible: the
+    provider concedes only three quarters of the way back, so its floor sits above the baseline
+    and can rise past a buyer's ceiling. With every walk-away at the baseline and every ceiling
+    above it, no term could ever refuse.
+    """
+
+    buyer, provider, base = quote.buyer_terms[profile], quote.provider_terms, quote.baseline
+    return {
+        "provider_bond_bps": negotiation.Position(
+            proposal=buyer.provider_bond_bps,
+            limit=provider.max_bond_bps,
+            walkaway=min(base["provider_bond_bps"], buyer.provider_bond_bps),
+            limit_name="provider_max_bond_bps",
+            limit_kind=negotiation.MEMORY,
+        ),
+        "service_window": negotiation.Position(
+            proposal=buyer.service_window,
+            limit=provider.min_service_window,
+            walkaway=max(base["service_window"], buyer.service_window),
+            limit_name="provider_min_service_window",
+            limit_kind=negotiation.RULE,
+        ),
+        "price_bps": negotiation.Position(
+            proposal=provider.price_bps,
+            limit=buyer.max_price_bps,
+            walkaway=provider.price_floor_bps,
+            limit_name="buyer_max_price_bps",
+            limit_kind=negotiation.RULE,
+        ),
+        "payout_delay": negotiation.Position(
+            proposal=provider.payout_delay,
+            limit=buyer.min_payout_delay,
+            walkaway=max(base["payout_delay"], provider.payout_delay),
+            limit_name="buyer_min_payout_delay",
+            limit_kind=negotiation.RULE,
+        ),
+    }
+
+
 def _document_halves(
     quote: "BilateralQuote",
     *,
@@ -334,45 +390,84 @@ def _document_halves(
 
     Written by `policy` and rebuilt by `create-deal`, from this one function, so the thing
     that is checked and the thing that was produced cannot drift apart. Everything here is a
-    function of the two stores, the committed persona and one deadline: nothing is read back
-    out of the document it is being compared against.
+    function of the two stores, the committed persona, the operator's baselines and one
+    deadline: nothing is read back out of the document it is being compared against.
     """
 
     provider_terms = quote.provider_terms
     provider_commitment = evidence_hash(provider_terms.used_evidence_ids)
+    base = quote.baseline
 
     profiles = {}
     for name, terms in quote.buyer_terms.items():
-        # The bilateral moment. Bond and window come from what the buyer remembers; price and
-        # payout delay from what the provider remembers. Negotiating between the two is gate 7;
-        # here each side simply opens where its own memory puts it.
-        preimage = PolicyPreimage(
-            buyer=buyer,
-            provider=provider,
-            price=provider_terms.price_wei,
-            bond_bps=terms.provider_bond_bps,
-            accept_by=accept_by,
-            service_window=terms.service_window,
-            payout_delay=provider_terms.payout_delay,
-            engine_version=ENGINE_VERSION,
-            # Each hash covers the receipts that moved that side's numbers, not everything it
-            # happens to hold. A commitment over unused evidence would describe the reading
-            # rather than the reasoning.
-            buyer_evidence_hash=evidence_hash(terms.used_evidence_ids),
-            provider_evidence_hash=provider_commitment,
-        )
-        profiles[name] = {
-            "terms": {
-                "price_wei": preimage.price,
-                "provider_bond_bps": terms.provider_bond_bps,
-                "service_window": terms.service_window,
-                "payout_delay": preimage.payout_delay,
+        settlement = negotiation.settle(_positions_for(quote, name))
+        body: dict[str, Any] = {
+            "baseline": dict(base),
+            "buyer": {
+                "proposes": {
+                    "provider_bond_bps": terms.provider_bond_bps,
+                    "service_window": terms.service_window,
+                },
+                "limits": {
+                    "max_price_bps": terms.max_price_bps,
+                    "min_payout_delay": terms.min_payout_delay,
+                },
                 "risk": str(terms.risk),
                 "used_evidence_ids": list(terms.used_evidence_ids),
             },
-            "policy_preimage": preimage.as_dict(),
-            "policy_hash": policy_hash(preimage),
+            "provider": {
+                "proposes": {
+                    "price_bps": provider_terms.price_bps,
+                    "payout_delay": provider_terms.payout_delay,
+                },
+                "limits": {
+                    "max_bond_bps": provider_terms.max_bond_bps,
+                    "min_service_window": provider_terms.min_service_window,
+                },
+                "walkaway": {"price_floor_bps": provider_terms.price_floor_bps},
+                "risk": str(provider_terms.risk),
+                "used_evidence_ids": list(provider_terms.used_evidence_ids),
+            },
+            "settlement": settlement.as_dict(),
         }
+
+        if settlement.agreed:
+            settled = settlement.terms
+            price = negotiation.price_wei(base["price_wei"], settled["price_bps"])
+            if not negotiation.bond_is_collectible(price, settled["provider_bond_bps"]):
+                raise RuntimeError(
+                    f"profile {name!r} settles at {settled['provider_bond_bps']} bps of "
+                    f"{price} wei, which rounds to a zero-wei bond the contract rejects. "
+                    "Price settles down and bond settles up independently, so this is a "
+                    "property of the pair rather than of either one."
+                )
+            # The bilateral moment. Bond and window come from what the buyer remembers, price
+            # and payout delay from what the provider remembers, and every one of them has
+            # been through a limit the other side published.
+            preimage = PolicyPreimage(
+                buyer=buyer,
+                provider=provider,
+                price=price,
+                bond_bps=settled["provider_bond_bps"],
+                accept_by=accept_by,
+                service_window=settled["service_window"],
+                payout_delay=settled["payout_delay"],
+                engine_version=ENGINE_VERSION,
+                # Each hash covers the receipts that moved that side's numbers, not everything
+                # it happens to hold. A commitment over unused evidence would describe the
+                # reading rather than the reasoning.
+                buyer_evidence_hash=evidence_hash(terms.used_evidence_ids),
+                provider_evidence_hash=provider_commitment,
+            )
+            body["terms"] = {
+                "price_wei": preimage.price,
+                "provider_bond_bps": preimage.bond_bps,
+                "service_window": preimage.service_window,
+                "payout_delay": preimage.payout_delay,
+            }
+            body["policy_preimage"] = preimage.as_dict()
+            body["policy_hash"] = policy_hash(preimage)
+        profiles[name] = body
 
     return {
         "buyer": {
@@ -393,12 +488,6 @@ def _document_halves(
                 "name": quote.persona.name,
                 "cashflow_sensitivity": str(quote.persona.cashflow_sensitivity),
                 "commitment": commitment,
-            },
-            "terms": {
-                "price_wei": provider_terms.price_wei,
-                "payout_delay": provider_terms.payout_delay,
-                "risk": str(provider_terms.risk),
-                "used_evidence_ids": list(provider_terms.used_evidence_ids),
             },
         },
     }
@@ -428,6 +517,9 @@ class BilateralQuote:
     persona: ProviderPersona
     provider_terms: Any
     buyer_terms: dict[str, Any]
+    #: The operator's baselines. Every walk-away is stated against them, so a reader cannot
+    #: check a settlement without seeing them.
+    baseline: dict[str, int]
 
 
 def _bilateral_quote(
@@ -509,6 +601,7 @@ def _bilateral_quote(
         persona=persona,
         base_price_wei=base_price_wei,
         base_payout_delay=base_payout_delay,
+        base_service_window=base_service_window,
     )
     # The signing path needs one profile and the quoting path needs all of them. The causal
     # set is quadratic in the evidence, so re-deriving three profiles at the last moment
@@ -524,10 +617,19 @@ def _bilateral_quote(
             base_price_wei=base_price_wei,
             base_bond_bps=base_bond_bps,
             base_service_window=base_service_window,
+            base_payout_delay=base_payout_delay,
         )
         for name, profile in wanted.items()
     }
-    return BilateralQuote(recall, persona, provider_terms, buyer_terms)
+    return BilateralQuote(
+        recall, persona, provider_terms, buyer_terms,
+        baseline={
+            "price_wei": base_price_wei,
+            "provider_bond_bps": base_bond_bps,
+            "service_window": base_service_window,
+            "payout_delay": base_payout_delay,
+        },
+    )
 
 
 def _memory() -> MemoryClient:
@@ -961,6 +1063,9 @@ def _create_deal(args) -> int:
     ledger = _ledger()
     web3 = _web3()
 
+    # `load_policy` raises for a profile whose settlement refused, before this line and so
+    # before either store is opened, before any provenance rebuild and before any chain read.
+    # There is no work worth doing on a deal that does not exist.
     policy = load_policy(
         args.policy,
         profile=args.profile,
@@ -1583,7 +1688,26 @@ def _rebind_policy(args) -> int:
     claim to be the same deal.
     """
 
-    document = json.loads(args.policy.read_text(encoding="utf-8"))
+    # Read the way every other consumer reads: size-capped, and refusing an object that names
+    # the same key twice. Rewriting a file this build has not validated would let `rebind` be
+    # the way a malformed document gets laundered into a well-formed one.
+    size = args.policy.stat().st_size
+    if size > MAX_POLICY_BYTES:
+        raise PolicyDocumentError(f"{args.policy} is {size} bytes, over the {MAX_POLICY_BYTES} cap")
+    try:
+        document = json.loads(
+            args.policy.read_text(encoding="utf-8"), object_pairs_hook=no_duplicate_keys
+        )
+    except json.JSONDecodeError as error:
+        raise PolicyDocumentError(f"{args.policy} is not valid JSON: {error}") from error
+
+    if document.get("schema_version") != POLICY_SCHEMA_VERSION:
+        raise PolicyDocumentError(
+            f"{args.policy} is schema {document.get('schema_version')!r}; this build binds "
+            f"schema {POLICY_SCHEMA_VERSION}. Re-run `policy` rather than rebinding a document "
+            "whose fields this build cannot name."
+        )
+
     address = Web3.to_checksum_address(_required_env("WRASSE_ESCROW_ADDRESS"))
     previous = document.get("request_id")
     document["chain_id"] = _chain_id()
@@ -1752,6 +1876,8 @@ def main(argv: list[str] | None = None) -> int:
             commitment=stores["provider"].persona_commitment()["sha256"],
         )
         for name, profile in halves["buyer"]["profiles"].items():
+            if not profile["settlement"]["agreed"]:
+                continue  # nothing to execute, so nothing to check against a chain
             preimage = PolicyPreimage(**profile["policy_preimage"])
             # A quote the chain would refuse is not a quote. Checking here, rather than at
             # broadcast, keeps the displayed policy and the executable policy the same thing.
@@ -1773,6 +1899,9 @@ def main(argv: list[str] | None = None) -> int:
             "chain_id": chain_id,
             "contract_address": escrow_address,
             "engine_version": ENGINE_VERSION,
+            # Published so a reader recomputes the digest inside `engine_version` rather than
+            # trusting it. Every constant that can move a term is in here.
+            "engine": {"negotiation_manifest": NEGOTIATION_MANIFEST},
             "executability": _executability(args, basis),
             "buyer": halves["buyer"],
             "provider": halves["provider"],
@@ -1781,6 +1910,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.output:
             _write_atomic(args.output, rendered + "\n")
         print(rendered)
+
+        agreed = [n for n, b in halves["buyer"]["profiles"].items() if b["settlement"]["agreed"]]
+        if not agreed:
+            # A document with nothing executable in it is a failed run, and the exit code is
+            # the only part of that a script can see. The document is still written: a refusal
+            # is an outcome worth showing, not an error to swallow.
+            print(
+                "no profile reached agreement: "
+                + "; ".join(
+                    f"{n} refused on {b['settlement']['failed_on']} by {b['settlement']['gap']}"
+                    for n, b in sorted(halves["buyer"]["profiles"].items())
+                ),
+                file=sys.stderr,
+            )
+            return 1
         return 0
     if getattr(args, "deal_action", None) is not None:
         return _deal_action(args)

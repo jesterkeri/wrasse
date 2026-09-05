@@ -22,6 +22,9 @@ from typing import Any
 
 from web3 import Web3
 
+from .constants import NEGOTIATION_MANIFEST
+from .negotiation import CONCESSION, MEMORY, RULE
+from .negotiation import TERMS as NEGOTIATED_TERMS
 from .engine import PROFILES
 from .policy_hash import (
     ENGINE_VERSION,
@@ -36,7 +39,7 @@ from .policy_hash import (
 #: This is a small document describing one quote. Anything larger is not one.
 MAX_POLICY_BYTES = 1 << 20
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
 
@@ -46,21 +49,48 @@ _TOP_LEVEL = {
     "chain_id",
     "contract_address",
     "engine_version",
+    "engine",
     "executability",
     "buyer",
     "provider",
 }
 
+_ENGINE_KEYS = {"negotiation_manifest"}
+
 _BUYER_KEYS = {"address", "counterparty", "verdict", "cold_start", "recalled_evidence", "profiles"}
 _PROVIDER_KEYS = {
-    "address", "counterparty", "verdict", "cold_start", "recalled_evidence", "persona", "terms",
+    "address", "counterparty", "verdict", "cold_start", "recalled_evidence", "persona",
 }
-_PROFILE_KEYS = {"terms", "policy_preimage", "policy_hash"}
-_TERMS_KEYS = {
-    "price_wei", "provider_bond_bps", "service_window", "payout_delay", "risk",
-    "used_evidence_ids",
+
+#: A profile that reached agreement, and one that did not. Two exact shapes rather than one
+#: shape with a flag: a refused profile **omits** the executable fields entirely, so there is
+#: nothing to sign and nothing to misread. A profile carrying both a refusal and a policy hash
+#: is a malformed document, not a choice.
+_AGREED_PROFILE_KEYS = {
+    "baseline", "buyer", "provider", "settlement", "terms", "policy_preimage", "policy_hash",
 }
-_PROVIDER_TERMS_KEYS = {"price_wei", "payout_delay", "risk", "used_evidence_ids"}
+_REFUSED_PROFILE_KEYS = {"baseline", "buyer", "provider", "settlement"}
+
+_BASELINE_KEYS = {"price_wei", "provider_bond_bps", "service_window", "payout_delay"}
+_TERMS_KEYS = {"price_wei", "provider_bond_bps", "service_window", "payout_delay"}
+
+_BUYER_HALF_KEYS = {"proposes", "limits", "risk", "used_evidence_ids"}
+_BUYER_PROPOSES_KEYS = {"provider_bond_bps", "service_window"}
+_BUYER_LIMITS_KEYS = {"max_price_bps", "min_payout_delay"}
+
+_PROVIDER_HALF_KEYS = {"proposes", "limits", "walkaway", "risk", "used_evidence_ids"}
+_PROVIDER_PROPOSES_KEYS = {"price_bps", "payout_delay"}
+_PROVIDER_LIMITS_KEYS = {"max_bond_bps", "min_service_window"}
+_PROVIDER_WALKAWAY_KEYS = {"price_floor_bps"}
+
+_AGREED_SETTLEMENT_KEYS = {"agreed", "moves"}
+_REFUSED_SETTLEMENT_KEYS = {"agreed", "failed_on", "gap"}
+_MOVE_KEYS = {"term", "from", "to", "kind", "because"}
+
+#: The three ways a number can move, and they are not interchangeable. A memory adjustment
+#: cites receipts, a concession cites the counterparty's published limit, a rule cites the
+#: constant by name. Collapsing them would let a constant masquerade as evidence.
+_MOVE_KINDS = {MEMORY, CONCESSION, RULE}
 _PERSONA_KEYS = {"name", "cashflow_sensitivity", "commitment"}
 _EXECUTABILITY_KEYS = {
     "basis", "reference_timestamp", "chain", "inclusion_margin_seconds",
@@ -298,11 +328,12 @@ def load_policy(
         raise PolicyDocumentError("the persona commitment is not a sha256 digest")
     _bounded_decimal(persona["cashflow_sensitivity"], "cashflow_sensitivity")
 
-    provider_terms = _exact_keys(
-        provider_side["terms"], _PROVIDER_TERMS_KEYS, "the provider's terms"
-    )
-    _bounded_decimal(provider_terms["risk"], "the provider's risk")
-    provider_used = _check_used(provider_terms, provider_side, "provider")
+    engine = _exact_keys(document["engine"], _ENGINE_KEYS, "the engine block")
+    if engine["negotiation_manifest"] != NEGOTIATION_MANIFEST:
+        raise PolicyDocumentError(
+            "the published negotiation manifest is not the one this build hashes into "
+            "engine_version, so the digest in that version does not describe these constants"
+        )
 
     profiles = buyer_side["profiles"]
     if not isinstance(profiles, dict) or profile not in profiles:
@@ -322,13 +353,18 @@ def load_policy(
                 f"{name!r} is not a profile this engine produces: {', '.join(sorted(PROFILES))}"
             )
         candidate = _check_profile(
-            profiles[name], name, document, buyer_side, provider_terms, provider_used,
+            profiles[name], name, document, buyer_side, provider_side,
             request_id=request_id, chain_id=chain_id, contract_address=contract_address,
         )
         if name == profile:
             validated = candidate
 
-    assert validated is not None
+    if validated is None:
+        raise PolicyDocumentError(
+            f"profile {profile!r} did not reach agreement: "
+            f"{profiles[profile]['settlement']['failed_on']} had no overlap by "
+            f"{profiles[profile]['settlement']['gap']}. There are no terms to sign."
+        )
     return validated
 
 
@@ -425,12 +461,87 @@ def _check_used(terms: dict[str, Any], side: dict[str, Any], role: str) -> list[
     return canonical
 
 
+def _check_settlement(settlement: Any, name: str) -> bool:
+    """The settlement block, and whether this profile is executable at all."""
+
+    if not isinstance(settlement, dict) or not isinstance(settlement.get("agreed"), bool):
+        raise PolicyDocumentError(f"profile {name!r} has no readable settlement")
+    agreed = settlement["agreed"]
+    keys = _AGREED_SETTLEMENT_KEYS if agreed else _REFUSED_SETTLEMENT_KEYS
+    settlement = _exact_keys(settlement, keys, f"profile {name!r} settlement")
+
+    if not agreed:
+        if settlement["failed_on"] not in NEGOTIATED_TERMS:
+            raise PolicyDocumentError(
+                f"profile {name!r} says it failed on {settlement['failed_on']!r}, which is not "
+                "a term this build negotiates"
+            )
+        _bounded_int(settlement["gap"], f"profile {name!r} gap", low=1, high=2**256 - 1)
+        return False
+
+    if not isinstance(settlement["moves"], list):
+        raise PolicyDocumentError(f"profile {name!r} settlement moves is not a list")
+    for move in settlement["moves"]:
+        move = _exact_keys(move, _MOVE_KEYS, f"a move in profile {name!r}")
+        if move["term"] not in NEGOTIATED_TERMS:
+            raise PolicyDocumentError(f"profile {name!r} moves {move['term']!r}, which is not a term")
+        if move["kind"] not in _MOVE_KINDS:
+            raise PolicyDocumentError(
+                f"profile {name!r} explains a move as {move['kind']!r}, which is not one of "
+                f"{', '.join(sorted(_MOVE_KINDS))}. A movement's cause is a receipt, a "
+                "counterparty's limit or a named rule, and those are not interchangeable."
+            )
+        if not isinstance(move["because"], str) or not move["because"]:
+            raise PolicyDocumentError(f"profile {name!r} moves {move['term']!r} for no stated reason")
+        if move["from"] == move["to"]:
+            raise PolicyDocumentError(
+                f"profile {name!r} reports {move['term']!r} as moved from {move['from']!r} to "
+                "itself, which is not a movement"
+            )
+    return True
+
+
+def _check_positions(body: dict[str, Any], name: str) -> None:
+    """Both sides' published numbers, so a reader can recompute the settlement itself."""
+
+    _exact_keys(body["baseline"], _BASELINE_KEYS, f"profile {name!r} baseline")
+
+    buyer = _exact_keys(body["buyer"], _BUYER_HALF_KEYS, f"profile {name!r} buyer half")
+    _exact_keys(buyer["proposes"], _BUYER_PROPOSES_KEYS, f"profile {name!r} buyer proposals")
+    _exact_keys(buyer["limits"], _BUYER_LIMITS_KEYS, f"profile {name!r} buyer limits")
+    _bounded_decimal(buyer["risk"], f"profile {name!r} buyer risk")
+
+    provider = _exact_keys(body["provider"], _PROVIDER_HALF_KEYS, f"profile {name!r} provider half")
+    _exact_keys(provider["proposes"], _PROVIDER_PROPOSES_KEYS, f"profile {name!r} provider proposals")
+    _exact_keys(provider["limits"], _PROVIDER_LIMITS_KEYS, f"profile {name!r} provider limits")
+    _exact_keys(provider["walkaway"], _PROVIDER_WALKAWAY_KEYS, f"profile {name!r} provider walkaway")
+    _bounded_decimal(provider["risk"], f"profile {name!r} provider risk")
+
+
 def _check_profile(
     chosen: Any, name: str, document: dict[str, Any], buyer_side: dict[str, Any],
-    provider_terms: dict[str, Any], provider_used: list[str], *,
+    provider_side: dict[str, Any], *,
     request_id: str, chain_id: int, contract_address: str,
-) -> ValidatedPolicy:
-    chosen = _exact_keys(chosen, _PROFILE_KEYS, f"profile {name!r}")
+) -> ValidatedPolicy | None:
+    """One profile. Returns `None` for a refused one, which has nothing to validate against.
+
+    A refused profile is checked for shape and then left alone: it carries no terms, no
+    preimage and no hash, by omission rather than by null, so there is nothing to sign and
+    nothing a reader can mistake for an offer.
+    """
+
+    if not isinstance(chosen, dict) or "settlement" not in chosen:
+        raise PolicyDocumentError(f"profile {name!r} has no settlement")
+    agreed = _check_settlement(chosen["settlement"], name)
+    keys = _AGREED_PROFILE_KEYS if agreed else _REFUSED_PROFILE_KEYS
+    chosen = _exact_keys(chosen, keys, f"profile {name!r}")
+    _check_positions(chosen, name)
+
+    buyer_used = _check_used(chosen["buyer"], buyer_side, "buyer")
+    provider_used = _check_used(chosen["provider"], provider_side, "provider")
+    if not agreed:
+        return None
+
     preimage = _exact_keys(chosen["policy_preimage"], _PREIMAGE_KEYS, f"profile {name!r} preimage")
 
     document_buyer = _address(preimage["buyer"], "buyer")
@@ -473,10 +584,9 @@ def _check_profile(
             f"profile {name!r} quotes {chosen['policy_hash']} but its own fields hash to {recomputed}"
         )
 
-    buyer_used = _check_used(
-        _exact_keys(chosen["terms"], _TERMS_KEYS, f"profile {name!r} terms"), buyer_side, "buyer"
+    _check_terms(
+        _exact_keys(chosen["terms"], _TERMS_KEYS, f"profile {name!r} terms"), validated, name
     )
-    _check_terms(chosen["terms"], validated, name)
 
     # Each side commits to what moved its own numbers. A hash over everything recalled would
     # describe the reading rather than the reasoning.
@@ -489,16 +599,6 @@ def _check_profile(
             raise PolicyDocumentError(
                 f"profile {name!r} commits {label} evidence {committed}, but the receipts it "
                 f"says it used hash to {expected}"
-            )
-
-    for field, displayed, committed in (
-        ("price_wei", provider_terms["price_wei"], price),
-        ("payout_delay", provider_terms["payout_delay"], payout_delay),
-    ):
-        if displayed != committed:
-            raise PolicyDocumentError(
-                f"the provider displays {field}={displayed!r} but profile {name!r} commits "
-                f"{committed!r}"
             )
     return validated
 
@@ -521,4 +621,5 @@ def _check_terms(terms: dict[str, Any], validated: ValidatedPolicy, profile: str
             raise PolicyDocumentError(
                 f"profile {profile!r} displays {name}={displayed!r} but commits to {committed!r}"
             )
-    _bounded_decimal(terms["risk"], f"profile {profile!r} risk")
+    # Risk moved to each side's own half in schema 3, because there are two of them and one
+    # displayed number could only ever have been one side's.

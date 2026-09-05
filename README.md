@@ -32,7 +32,11 @@ critical path, not an activity log attached after the decision.
 ## Current scope
 
 - One service type and three profiles: urgent, budget, and sensitive.
-- Three seeded simulated providers and exactly one counteroffer.
+- One simulated provider agent, `atlas`, whose persona is committed to git and whose
+  SHA-256 is written into its store before that store holds any receipt.
+- One negotiation round over four terms. Each side proposes two and publishes limits on the
+  other two; the settlement meets at the accepting side's limit, and where the two sides leave
+  no overlap it refuses and says which term and by how much.
 - One escrow contract on Base Sepolia.
 - One constrained OpenRouter call when a new behavioural dimension is first
   created. Stored dimensions are reused; the LLM is never called in the policy
@@ -88,6 +92,43 @@ the observed block may sit from now, and as lag spent out of that margin. Both
 can refuse a quote; neither can approve one. Each `policy.json` carries an
 `executability` block naming the basis, the block observed, the margin and the
 lag, so a consumer never has to infer what the check was worth.
+
+## The negotiation
+
+Four terms, and neither side sets any of them alone. Each side proposes two and publishes
+limits on the other two, and a settlement resolves the pair:
+
+| term | proposed by | limit published by |
+|---|---|---|
+| `provider_bond_bps` | buyer | provider, the most it will post |
+| `service_window` | buyer | provider, the least it needs |
+| `price_wei` | provider | buyer, the most it will pay |
+| `payout_delay` | provider | buyer, the least it will accept |
+
+Where the opposer publishes a ceiling the settlement is `min(proposal, ceiling)`; where it
+publishes a floor it is `max(proposal, floor)`. A side concedes back toward the baseline it
+would have quoted a stranger, never past it, and never past a number it proposed itself. When
+the two leave no value either would accept, the profile **refuses**, naming the term and the
+distance. That is an outcome rather than an error, and it is better than quoting terms one
+side has already declined.
+
+**A limit may move with its publisher's memory only if the movement is monotone against the
+party whose conduct moved it.** Two do: the provider's bond ceiling and its price floor, both
+driven by its record of *this buyer*. The buyer's price ceiling does not, because a ceiling
+that fell as the provider misbehaved made the buyer pay less as it was wronged more and then
+refused outright, punishing the party that suffered rather than the one that caused it.
+Willingness to pay is a fact about the job, not about the counterparty.
+
+**A number moves for one of three reasons and the document never confuses them.** A memory
+adjustment cites receipts. A concession cites the counterparty's published limit. A fixed
+limit binding cites the rule by name. "A receipt behind every number that moved" would be
+false: a constant window floor can lift a proposal with no receipt involved at all.
+
+The constants that decide a term are covered by the same commitment as the term.
+`ENGINE_VERSION` is derived from a digest of every one of them rather than typed, so editing
+one changes the version, the `engineVersionHash`, and every `policyHash` built from it. The
+manifest is published in the document so a reader recomputes the digest instead of trusting
+it.
 
 ## Sending transactions
 
