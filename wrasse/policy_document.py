@@ -24,7 +24,15 @@ from typing import Any
 from web3 import Web3
 
 from .constants import MANIFEST_DIGEST, canonical_manifest
-from .negotiation import CONCESSION, MEMORY, RULE, Position, bond_is_collectible, settle
+from .negotiation import (
+    CONCESSION,
+    MEMORY,
+    RULE,
+    Position,
+    baseline_fault,
+    bond_is_collectible,
+    settle,
+)
 from .negotiation import TERMS as NEGOTIATED_TERMS
 from .negotiation import price_wei as negotiation_price_wei
 from .engine import PROFILES
@@ -244,6 +252,16 @@ def _address(value: Any, name: str) -> str:
 
 def _same_address(left: str, right: str) -> bool:
     return Web3.to_checksum_address(left) == Web3.to_checksum_address(right)
+
+
+def _canonical(value: Any) -> str:
+    """Compare by encoding, because Python's equality is looser than JSON's types.
+
+    `2500.0 == 2500` and `True == 1` in Python. The document is JSON, the reader sees JSON,
+    and the digest is over JSON, so equality here has to mean what it means there.
+    """
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -515,6 +533,8 @@ def _check_settlement(settlement: Any, name: str) -> bool:
             )
         if not isinstance(move["because"], str) or not move["because"]:
             raise PolicyDocumentError(f"profile {name!r} moves {move['term']!r} for no stated reason")
+        for edge in ("from", "to"):
+            _bounded_int(move[edge], f"profile {name!r} move {edge}", low=0, high=2**256 - 1)
         if move["from"] == move["to"]:
             raise PolicyDocumentError(
                 f"profile {name!r} reports {move['term']!r} as moved from {move['from']!r} to "
@@ -533,13 +553,11 @@ def _check_positions(body: dict[str, Any], name: str) -> dict[str, Position]:
     """
 
     baseline = _exact_keys(body["baseline"], _BASELINE_KEYS, f"profile {name!r} baseline")
-    for field, high in (
-        ("price_wei", 2**256 - 1),
-        ("provider_bond_bps", MAX_PROVIDER_BOND_BPS),
-        ("service_window", MAX_DURATION),
-        ("payout_delay", MAX_DURATION),
-    ):
-        _bounded_int(baseline[field], f"profile {name!r} baseline {field}", low=1, high=high)
+    # One definition of the allowed domain, shared with the writer. Two implementations of it
+    # is how `--base-bond-bps 0` produced a document this same build then refused to read.
+    fault = baseline_fault(baseline)
+    if fault is not None:
+        raise PolicyDocumentError(f"profile {name!r} baseline {fault}")
 
     buyer = _exact_keys(body["buyer"], _BUYER_HALF_KEYS, f"profile {name!r} buyer half")
     proposes = _exact_keys(buyer["proposes"], _BUYER_PROPOSES_KEYS, f"profile {name!r} buyer proposals")
@@ -614,7 +632,10 @@ def _check_settlement_follows(body: dict[str, Any], positions: dict[str, Positio
 
     recomputed = settle(positions).as_dict()
     published = body["settlement"]
-    if recomputed != published:
+    # Canonical bytes, not Python equality. `2500.0 == 2500` here and not in JSON, so an
+    # equality check calls two documents the same when a reader and a hash would not. This is
+    # the same reason the manifest stopped being compared with `==`.
+    if _canonical(recomputed) != _canonical(published):
         raise PolicyDocumentError(
             f"profile {name!r} publishes a settlement its own numbers do not produce. It says "
             f"{published!r}; those positions settle to {recomputed!r}."
@@ -633,7 +654,7 @@ def _check_settlement_follows(body: dict[str, Any], positions: dict[str, Positio
         "payout_delay": settled["payout_delay"],
     }
     displayed = _exact_keys(body["terms"], _TERMS_KEYS, f"profile {name!r} terms")
-    if displayed != expected:
+    if _canonical(displayed) != _canonical(expected):
         raise PolicyDocumentError(
             f"profile {name!r} displays terms {displayed!r}, but its own settlement produces "
             f"{expected!r}"
@@ -746,7 +767,7 @@ def _check_terms(terms: dict[str, Any], validated: ValidatedPolicy, profile: str
         ("service_window", terms["service_window"], validated.service_window),
         ("payout_delay", terms["payout_delay"], validated.payout_delay),
     ):
-        if displayed != committed:
+        if _canonical(displayed) != _canonical(committed):
             raise PolicyDocumentError(
                 f"profile {profile!r} displays {name}={displayed!r} but commits to {committed!r}"
             )

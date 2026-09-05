@@ -205,6 +205,37 @@ def settle(positions: dict[str, Position]) -> Settlement:
 # --------------------------------------------------------------------------------------
 
 
+#: What an operator baseline may be, decided **once** and used by the writer and the reader.
+#:
+#: It was decided twice. The engines required a positive price, window and delay and said
+#: nothing about the bond, because a zero bond rate is valid on the deployed contract. The
+#: validator independently required every baseline field to be at least one. So
+#: `--base-bond-bps 0` produced a document that this same build then refused to read: a
+#: successful quote and an unusable receipt, from one command to the next.
+BASELINE_BOUNDS = {
+    "price_wei": (1, 2**256 - 1),
+    "provider_bond_bps": (0, MAX_PROVIDER_BOND_BPS),
+    "service_window": (1, MAX_DURATION),
+    "payout_delay": (1, MAX_DURATION),
+}
+
+
+def baseline_fault(values: dict[str, Any]) -> str | None:
+    """Name the first baseline field outside its domain, or `None` if they all fit.
+
+    Returns rather than raises, so the writer can refuse with its own error type and the
+    reader with its own, from one definition of what is allowed.
+    """
+
+    for field, (low, high) in sorted(BASELINE_BOUNDS.items()):
+        value = values.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"{field}={value!r} is not an integer"
+        if not low <= value <= high:
+            return f"{field}={value} is outside {low}..{high}"
+    return None
+
+
 def clamp_bond_bps(value: int) -> int:
     return max(0, min(MAX_PROVIDER_BOND_BPS, value))
 
@@ -236,6 +267,7 @@ def bond_is_collectible(price: int, bond_bps: int) -> bool:
 
 
 __all__ = [
+    "BASELINE_BOUNDS",
     "CEILING",
     "CONCESSION",
     "FLOOR",
@@ -247,6 +279,7 @@ __all__ = [
     "RULE",
     "Settlement",
     "TERMS",
+    "baseline_fault",
     "bond_is_collectible",
     "clamp_bond_bps",
     "clamp_duration",

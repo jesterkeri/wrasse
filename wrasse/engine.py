@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import Any, Iterable
 
 from .constants import (
@@ -12,11 +12,15 @@ from .constants import (
     IRRELEVANT_MULTIPLIER,
     MAX_BOND_BPS,
     MIN_PAYOUT_DELAY_SECONDS,
+    INTEGER_QUANTUM,
     MIN_SERVICE_WINDOW_SECONDS,
     PROFILE_FIELDS,
+    PROVIDER_RISK_WEIGHT,
     RELEVANT_MULTIPLIER,
     RISK_CEILING,
+    RISK_DISPLAY_QUANTUM,
     RISK_FLOOR,
+    ROUNDING,
 )
 from .dimensions import DimensionDefinition
 from .evidence import SUBJECTS_OF
@@ -149,7 +153,7 @@ def produce_terms(
         min_payout_delay=clamp_duration(
             base_payout_delay * profile.payout_delay_floor_bps // BPS_DENOMINATOR
         ),
-        risk=risk.quantize(Decimal("0.0001")),
+        risk=risk.quantize(Decimal(RISK_DISPLAY_QUANTUM)),
         recalled_event_ids=tuple(sorted(canonical_event_id(str(e["event_id"])) for e in events)),
         used_evidence_ids=_minimal_causal_set(events, used, committed),
     )
@@ -205,7 +209,8 @@ def produce_provider_terms(
 
     events = _unique_by_event_id(evidence)
     risk, used = _score(
-        events, dimensions, about="buyer", weight=Decimal("1"), relevance=lambda _: Decimal("1")
+        events, dimensions, about="buyer", weight=Decimal(PROVIDER_RISK_WEIGHT),
+        relevance=lambda _: Decimal(PROVIDER_RISK_WEIGHT)
     )
 
     def committed(subset) -> tuple[int, int, int, int]:
@@ -219,8 +224,8 @@ def produce_provider_terms(
         """
 
         partial, _ = _score(
-            subset, dimensions, about="buyer", weight=Decimal("1"),
-            relevance=lambda _: Decimal("1"),
+            subset, dimensions, about="buyer", weight=Decimal(PROVIDER_RISK_WEIGHT),
+            relevance=lambda _: Decimal(PROVIDER_RISK_WEIGHT),
         )
         premium = _round_decimal(partial * persona.price_sensitivity_bps)
         return (
@@ -261,7 +266,7 @@ def produce_provider_terms(
         min_service_window=clamp_duration(
             min(MIN_SERVICE_WINDOW_SECONDS, base_service_window)
         ),
-        risk=risk.quantize(Decimal("0.0001")),
+        risk=risk.quantize(Decimal(RISK_DISPLAY_QUANTUM)),
         recalled_event_ids=tuple(sorted(canonical_event_id(str(e["event_id"])) for e in events)),
         used_evidence_ids=_minimal_causal_set(events, used, committed),
     )
@@ -370,5 +375,8 @@ def _unique_by_event_id(evidence: Iterable[dict[str, Any]]) -> tuple[dict[str, A
 
 
 def _round_decimal(value: Decimal) -> int:
-    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    # The mode and the quantum both come from the manifest, so the numbers that are hashed
+    # are the numbers that round. Python's decimal rounding modes are plain strings, which is
+    # what makes the hashed value directly usable rather than merely descriptive.
+    return int(value.quantize(Decimal(INTEGER_QUANTUM), rounding=ROUNDING))
 

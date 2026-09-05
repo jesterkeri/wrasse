@@ -236,3 +236,44 @@ def test_a_nonzero_bond_rate_that_would_round_to_nothing_is_caught():
     assert bond_is_collectible(10**14, 3_500)
     assert bond_is_collectible(1, 0), "a zero rate owes no bond and is not a rounding failure"
     assert not bond_is_collectible(1, 9_999)
+
+
+# --------------------------------------------------------------------------------------
+# The baseline domain, decided once
+# --------------------------------------------------------------------------------------
+
+
+def test_a_zero_bond_baseline_is_allowed_because_the_contract_allows_it():
+    """The writer and the reader disagreed about this, and the writer was right.
+
+    A zero bond rate is valid on the deployed contract, the engines never rejected it, and the
+    validator independently demanded at least one. So `--base-bond-bps 0` produced a document
+    that the same build then refused to read: a successful quote and an unusable receipt, one
+    command apart.
+    """
+
+    from wrasse.negotiation import baseline_fault
+
+    good = {"price_wei": 10**14, "provider_bond_bps": 0, "service_window": 600, "payout_delay": 1_800}
+    assert baseline_fault(good) is None
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("price_wei", 0, "outside"),
+        ("provider_bond_bps", -1, "outside"),
+        ("provider_bond_bps", 10_001, "outside"),
+        ("service_window", 0, "outside"),
+        ("payout_delay", MAX_DURATION + 1, "outside"),
+        ("service_window", True, "not an integer"),
+        ("payout_delay", "1800", "not an integer"),
+    ],
+)
+def test_a_baseline_outside_the_domain_is_named(field, value, reason):
+    from wrasse.negotiation import baseline_fault
+
+    values = {"price_wei": 10**14, "provider_bond_bps": 500, "service_window": 600, "payout_delay": 1_800}
+    values[field] = value
+    fault = baseline_fault(values)
+    assert fault is not None and field in fault and reason in fault

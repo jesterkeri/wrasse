@@ -1860,6 +1860,20 @@ def main(argv: list[str] | None = None) -> int:
         buyer = Web3.to_checksum_address(args.buyer)
         provider = Web3.to_checksum_address(args.provider)
 
+        # Refused here, by the writer, rather than discovered later by the reader. The domain
+        # is defined once in `negotiation.BASELINE_BOUNDS` and both consult it.
+        fault = negotiation.baseline_fault({
+            "price_wei": args.base_price_wei,
+            "provider_bond_bps": args.base_bond_bps,
+            "service_window": args.service_window,
+            "payout_delay": args.payout_delay,
+        })
+        if fault is not None:
+            raise RuntimeError(
+                f"the baseline {fault}. A quote written from it could not be read back by "
+                "this build, so it is refused before it is written rather than after."
+            )
+
         stores = _open_stores(buyer=buyer, provider=provider)
         quote = _bilateral_quote(
             stores, buyer=buyer, provider=provider,

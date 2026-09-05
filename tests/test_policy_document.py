@@ -479,3 +479,105 @@ def test_a_document_that_hides_a_refusal_by_dropping_the_profile_is_refused(docu
 
     with pytest.raises(PolicyDocumentError, match="may not add, drop or rename"):
         _load(_rewrite(document, lambda body: body["buyer"]["profiles"].pop("budget")))
+
+
+def test_a_zero_bond_quote_can_be_read_back_by_the_build_that_wrote_it(
+    tmp_path, monkeypatch, capsys
+):
+    """The writer/reader split, closed end to end rather than at one of its two ends.
+
+    A zero bond rate is valid on the deployed contract. The command that writes a quote and
+    the code that reads one back must agree about that, and they did not.
+    """
+
+    monkeypatch.setenv("WRASSE_MEMORY_PATH", str(tmp_path / "memory.db"))
+    monkeypatch.setenv("WRASSE_ESCROW_ADDRESS", ESCROW)
+    monkeypatch.setenv("BASE_SEPOLIA_CHAIN_ID", str(CHAIN_ID))
+    path = tmp_path / "zero-bond.json"
+
+    assert main([
+        "policy", PROVIDER, "--buyer", BUYER, "--base-bond-bps", "0",
+        "--accept-by", "1700003600", "--reference-timestamp", "1700000000",
+        "--output", str(path),
+    ]) == 0
+    capsys.readouterr()
+
+    assert _load(path).bond_bps == 0
+
+
+def test_a_baseline_this_build_cannot_read_back_is_refused_before_it_is_written(
+    tmp_path, monkeypatch, capsys
+):
+    """Refused by the writer, not discovered later by the reader."""
+
+    monkeypatch.setenv("WRASSE_MEMORY_PATH", str(tmp_path / "memory.db"))
+    monkeypatch.setenv("WRASSE_ESCROW_ADDRESS", ESCROW)
+    monkeypatch.setenv("BASE_SEPOLIA_CHAIN_ID", str(CHAIN_ID))
+    path = tmp_path / "never-written.json"
+
+    with pytest.raises(RuntimeError, match="could not be read back by this build"):
+        main([
+            "policy", PROVIDER, "--buyer", BUYER, "--base-bond-bps", "99999",
+            "--accept-by", "1700003600", "--reference-timestamp", "1700000000",
+            "--output", str(path),
+        ])
+    assert not path.exists(), "a refused baseline must not leave a document behind"
+
+
+@pytest.mark.parametrize(
+    "mutate,where",
+    [
+        (lambda body: body["buyer"]["profiles"]["urgent"]["terms"].update(
+            {"provider_bond_bps": 500.0}), "terms"),
+        (lambda body: body["buyer"]["profiles"]["urgent"]["baseline"].update(
+            {"service_window": 3600.0}), "baseline"),
+    ],
+)
+def test_a_number_written_as_a_float_is_not_the_same_number(document, mutate, where):
+    """`2500.0 == 2500` in Python and not in JSON.
+
+    The validator claimed bounded integers and exact comparison, and then compared with
+    Python's `==`, so a document that encodes differently, hashes differently and reads
+    differently to any other implementation was accepted as identical.
+    """
+
+    with pytest.raises(PolicyDocumentError):
+        _load(_rewrite(document, mutate))
+
+
+def test_the_rounding_mode_the_manifest_hashes_is_the_one_the_engine_uses():
+    """A manifest entry nothing reads is a decoration, not a commitment.
+
+    Editing a decorative entry changes the version without changing a term; editing the real
+    rounding changes terms at half-unit boundaries without changing the version. Both
+    directions are wrong, and the value being a plain string is what lets one number do both
+    jobs.
+    """
+
+    import inspect
+    from decimal import Decimal
+
+    from wrasse import engine
+    from wrasse.constants import INTEGER_QUANTUM, ROUNDING
+
+    assert Decimal("2.5").quantize(Decimal(INTEGER_QUANTUM), rounding=ROUNDING) == Decimal("3")
+    source = inspect.getsource(engine)
+    assert "ROUND_HALF_UP" not in source, (
+        "the engine names a rounding mode directly again, so the manifest no longer drives it"
+    )
+    assert "rounding=ROUNDING" in source
+
+
+def test_the_provider_risk_weight_is_hashed_and_used():
+    """It decides the provider's price, delay, bond ceiling and floor, and it was a literal."""
+
+    import inspect
+
+    from wrasse import engine
+    from wrasse.constants import NEGOTIATION_MANIFEST
+
+    assert NEGOTIATION_MANIFEST["provider_risk_weight"] == "1"
+    source = inspect.getsource(engine)
+    assert source.count("PROVIDER_RISK_WEIGHT") >= 4, (
+        "both the score and its causal-set recomputation must read the hashed weight"
+    )

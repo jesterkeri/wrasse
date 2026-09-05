@@ -99,12 +99,30 @@ PROFILE_FIELDS: dict[str, dict[str, Any]] = {
 RELEVANT_MULTIPLIER = "1.5"
 IRRELEVANT_MULTIPLIER = "0.5"
 
-#: Risk is clamped to this interval before it is spent on anything, and every rounding in the
-#: engine uses this mode. Both decide terms, so both belong in the digest: `ROUND_HALF_UP`
-#: against Python's default banker's rounding is a whole basis point at exactly `.5`.
+#: Risk is clamped to this interval before it is spent on anything.
 RISK_FLOOR = "0"
 RISK_CEILING = "1"
+
+#: The provider has no task profile, so every dimension weighs the same to it. That "same" is
+#: a number, and changing it changes the provider's risk and therefore its price, its payout
+#: delay, its bond ceiling and its price floor. It was a literal in two places until a review
+#: pointed out that the version claiming to cover the arithmetic did not cover this.
+PROVIDER_RISK_WEIGHT = "1"
+
+#: The mode every rounding in the engine uses, and the quantum each rounds to. `ROUND_HALF_UP`
+#: against Python's default banker's rounding is a whole unit at exactly `.5`.
+#:
+#: These are *consumed* by `engine._round_decimal`, not merely described here. A manifest entry
+#: nothing reads is a decoration: editing it would change the version without changing a term,
+#: and editing the real mode would change terms without changing the version. Python's decimal
+#: rounding modes are plain strings, so the value that is hashed is the value that rounds.
 ROUNDING = "ROUND_HALF_UP"
+INTEGER_QUANTUM = "1"
+
+#: What a displayed risk is rounded to. Not a term, but it is compared by the provenance
+#: rebuild and read by a person, so a build that changed it would disagree with this one about
+#: a document while claiming the same engine version.
+RISK_DISPLAY_QUANTUM = "0.0001"
 
 #: Mirrored from `policy_hash`, which mirrors the deployed contract. Duplicated into the
 #: manifest rather than imported because this module has no intra-package imports by design,
@@ -128,7 +146,10 @@ NEGOTIATION_MANIFEST: dict[str, Any] = {
     "irrelevant_multiplier": IRRELEVANT_MULTIPLIER,
     "risk_floor": RISK_FLOOR,
     "risk_ceiling": RISK_CEILING,
+    "provider_risk_weight": PROVIDER_RISK_WEIGHT,
     "rounding": ROUNDING,
+    "integer_quantum": INTEGER_QUANTUM,
+    "risk_display_quantum": RISK_DISPLAY_QUANTUM,
     "bps_denominator": BPS_DENOMINATOR,
     "max_provider_bond_bps": MAX_PROVIDER_BOND_BPS,
     "max_duration_seconds": MAX_DURATION,
