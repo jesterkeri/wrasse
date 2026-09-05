@@ -224,9 +224,40 @@ held. Both halves are compared by canonical encoding.
 past run observed, so nothing in the stores can confirm it, and a supplied-reference fixture
 relabelled as a live Base quote passed every check. The nested chain fields are now bounded,
 the note is a closed set of the two sentences this build writes, and at signing the claimed
-block is read from the chain and its timestamp compared. A quote that says it was judged
-against Base is now checked against Base.
+block is read from the chain and its timestamp compared.
+
+Round five was right that this alone establishes very little: any genuine historical block
+satisfies it, and an editor with an RPC has as many of those as it likes. The check now also
+requires the quote's reference time to be that block's own timestamp, and the block to be
+recent. What it establishes is **a recent canonical Base block, matching this document's own
+reference**. It cannot prove who observed it: re-querying a public fact later says nothing
+about who read it first, and proving that needs an authenticated record made at the time.
 
 **The reconciler suite patched the integrity gate away for every test**, so deleting the
 production call changed nothing. The patch is opt-out now, and one test runs with the real
 verifier and a row whose bytes do not match its claims.
+
+
+## Gates 5 and 6, round five
+
+Two MAJOR, two MINOR. All four fixed. The first round in which nothing was a hole opened by
+the previous fold.
+
+**A document that says the same thing twice.** `json.loads` keeps the last of a repeated key
+and reports nothing, so a file carrying both a small price and the real one parses to whichever
+this build keeps while a reader, or any first-wins parser, sees the other. Canonical encoding
+could not catch it: by the time anything is compared the ambiguity has already been resolved
+and discarded. Decoding now refuses a repeated member outright.
+
+**A real block is not evidence of a live observation.** See above; the claim has been narrowed
+to what it establishes and the two relationships a genuine writer produces are now checked.
+
+**The ledger's busy timeout was shorter than the work it guards.** The signing callback holds
+the write transaction and both memory locks across several chain reads, so a second wallet
+failed with "database is locked" after fifteen seconds while the first command was working
+correctly. The failure was safe and retryable, but it read as a fault when nothing was faulty.
+The timeout is derived from the read budget now.
+
+**The README pointed the runbook at a command that no longer exists**, `reconcile-timeout`,
+and named the display-side module as the pricing path. Both corrected, and every documented
+command was checked against the parser.

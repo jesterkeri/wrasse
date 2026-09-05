@@ -176,6 +176,34 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 
+READ_ATTEMPTS = 3
+READ_BASE_DELAY_SECONDS = 0.25
+READ_MAX_DELAY_SECONDS = 4.0
+
+#: The per-request timeout configured on the HTTP provider. Named here because the retry
+#: budget has to reserve one of them before starting another attempt.
+READ_CALL_TIMEOUT_SECONDS = 20.0
+
+#: The retry budget, measured on the clock rather than in sleep, and **derived rather than
+#: guessed**. Honouring a server's own number is courteous until the number is 86400, at which
+#: point the courtesy is a hang; and a budget that counts only the waiting is no budget at all,
+#: because three calls that each stall until the provider's own timeout spend a minute without
+#: ever sleeping.
+#:
+#: It was 15 seconds, which no run of three twenty second attempts could ever have honoured.
+#: The number was describing an intention rather than the code. This is what the configuration
+#: actually permits: every attempt, each bounded by the provider, plus the waiting between
+#: them.
+#:
+#: **What it bounds, exactly.** No further attempt is *begun* once the elapsed time plus the
+#: wait plus one call's worth of patience would exceed it. It does not interrupt a call
+#: already running: that limit belongs to the HTTP provider, and cancelling a request
+#: mid-flight is not something a read wrapper can do safely.
+READ_TOTAL_BUDGET_SECONDS = (
+    READ_ATTEMPTS * READ_CALL_TIMEOUT_SECONDS + READ_ATTEMPTS * READ_MAX_DELAY_SECONDS
+)
+
+
 # --------------------------------------------------------------------------------------
 # Errors
 # --------------------------------------------------------------------------------------
@@ -369,9 +397,17 @@ class TransactionLedger:
     its own reason to keep it out of the memory database and behind restrictive permissions.
     """
 
-    #: The write lock is held across a chain-time read, so contention is expected rather than
-    #: exceptional. Waiting is correct; failing immediately is not.
-    BUSY_TIMEOUT_MS = 15_000
+    #: The write lock is held across the whole signing callback, so contention is expected
+    #: rather than exceptional. Waiting is correct; failing immediately is not.
+    #:
+    #: **Sized against what the callback can actually take.** It holds both memory locks and
+    #: makes several chain reads, each bounded by the retry budget, so a wallet waiting on
+    #: another wallet's `create-deal` has to be willing to wait about that long or it fails
+    #: with "database is locked" while the first command is still working correctly. Fifteen
+    #: seconds was less than one stalled provider timeout. The failure was safe, the first
+    #: transaction rolling back and the second being retryable, but it read as a fault when
+    #: nothing was faulty.
+    BUSY_TIMEOUT_MS = int((READ_TOTAL_BUDGET_SECONDS + 30.0) * 1_000)
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -899,33 +935,6 @@ UNKNOWN = "unknown"
 #: Reads are idempotent, so a flaky node is worth a second attempt. Bounded and jittered, so
 #: a rate-limited endpoint is not hammered into refusing harder.
 ZERO_ADDRESS = "0x" + "00" * 20
-
-READ_ATTEMPTS = 3
-READ_BASE_DELAY_SECONDS = 0.25
-READ_MAX_DELAY_SECONDS = 4.0
-
-#: The per-request timeout configured on the HTTP provider. Named here because the retry
-#: budget has to reserve one of them before starting another attempt.
-READ_CALL_TIMEOUT_SECONDS = 20.0
-
-#: The retry budget, measured on the clock rather than in sleep, and **derived rather than
-#: guessed**. Honouring a server's own number is courteous until the number is 86400, at which
-#: point the courtesy is a hang; and a budget that counts only the waiting is no budget at all,
-#: because three calls that each stall until the provider's own timeout spend a minute without
-#: ever sleeping.
-#:
-#: It was 15 seconds, which no run of three twenty second attempts could ever have honoured.
-#: The number was describing an intention rather than the code. This is what the configuration
-#: actually permits: every attempt, each bounded by the provider, plus the waiting between
-#: them.
-#:
-#: **What it bounds, exactly.** No further attempt is *begun* once the elapsed time plus the
-#: wait plus one call's worth of patience would exceed it. It does not interrupt a call
-#: already running: that limit belongs to the HTTP provider, and cancelling a request
-#: mid-flight is not something a read wrapper can do safely.
-READ_TOTAL_BUDGET_SECONDS = (
-    READ_ATTEMPTS * READ_CALL_TIMEOUT_SECONDS + READ_ATTEMPTS * READ_MAX_DELAY_SECONDS
-)
 
 #: Replaced in tests. Nothing here should ever sleep for real during a suite run.
 _sleep = time.sleep

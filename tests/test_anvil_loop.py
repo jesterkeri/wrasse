@@ -1148,3 +1148,84 @@ def test_an_executability_note_this_build_never_wrote_is_refused(rehearsal, caps
             contract_address=rehearsal["address"], buyer=rehearsal["buyer"].address,
             provider=PROVIDER,
         )
+
+
+def test_a_genuine_but_old_block_is_not_the_latest_observed_one(rehearsal, capsys, monkeypatch):
+    """Any real block satisfies "this block exists". Recency is what the label claims.
+
+    An editor with an RPC can read a historical block and write a self-consistent quote around
+    it, so checking that the coordinates are genuine establishes almost nothing on its own.
+
+    The age bound is narrowed here rather than the chain being aged, because the chain is
+    shared with every other test in this module and moving its clock is not this test's to do.
+    """
+
+    import wrasse.cli as cli
+    from wrasse.policy_document import _NOTES
+
+    web3 = rehearsal["web3"]
+    earlier = web3.eth.get_block(1)
+    web3.provider.make_request("evm_mine", [])
+    assert int(web3.eth.get_block("latest")["timestamp"]) > int(earlier["timestamp"])
+
+    output = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    monkeypatch.setattr(cli, "MAX_OBSERVATION_AGE_SECONDS", 0)
+
+    body = json.loads(output.read_text())
+    body["executability"] = {
+        "basis": "chain-observation",
+        "reference_timestamp": int(earlier["timestamp"]),
+        "chain": {
+            "chain_id": CHAIN_ID,
+            "block_number": int(earlier["number"]),
+            "block_timestamp": int(earlier["timestamp"]),
+        },
+        "inclusion_margin_seconds": 45,
+        "observed_lag_seconds": 0,
+        "executable": True,
+        "note": next(note for note in _NOTES if "latest observed Base block" in note),
+    }
+    output.write_text(json.dumps(body))
+
+    with pytest.raises(RuntimeError, match="not the latest observed block"):
+        main(["create-deal", "--policy", str(output), "--profile", "urgent"])
+
+
+def test_a_live_quote_must_reason_from_the_block_it_observed(rehearsal, capsys, monkeypatch):
+    """Two fields, one number. A writer that observed a block reasons from that block."""
+
+    output = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+
+    body = json.loads(output.read_text())
+    assert body["executability"]["basis"] == "chain-observation"
+    body["executability"]["reference_timestamp"] += 900
+    output.write_text(json.dumps(body))
+
+    with pytest.raises(RuntimeError, match="takes its reference from the block it observed"):
+        main(["create-deal", "--policy", str(output), "--profile", "urgent"])
+
+
+def test_a_document_that_says_the_same_thing_twice_is_refused(rehearsal, capsys):
+    """`json.loads` keeps the last of a repeated key and says nothing about it.
+
+    A file carrying both a small price and the real one parses to whichever this build keeps,
+    while a reader or a first-wins parser sees the other. Canonical encoding cannot see it:
+    by the time anything is compared, the ambiguity is already resolved and thrown away.
+    """
+
+    from wrasse.policy_document import PolicyDocumentError, load_policy
+
+    output = _quote(rehearsal, capsys)
+    raw = output.read_text()
+    doubled = raw.replace('"price_wei":', '"price_wei": 1, "price_wei":', 1)
+    assert doubled != raw
+    output.write_text(doubled)
+
+    with pytest.raises(PolicyDocumentError, match="twice in one object"):
+        load_policy(
+            output, profile="urgent", chain_id=CHAIN_ID,
+            contract_address=rehearsal["address"], buyer=rehearsal["buyer"].address,
+            provider=PROVIDER,
+        )

@@ -9,11 +9,17 @@ accepted terms on Base, and write the verified outcome back to Sibyl Memory.
 
 ## Why memory is load-bearing
 
-The policy path reads verified counterparty evidence from Sibyl in
-`wrasse/memory_gate.py`. If Sibyl raises an error, Wrasse raises
-`MemoryRequired` and produces no terms. A reachable store with no matching
-counterparty is an explicit cold start. The distinction between `EMPTY_STORE`
-and `NO_MATCH` uses Sibyl's exported `refine_zero` verdict step.
+The pricing path reads verified counterparty evidence through
+`WrasseStore.recall` in `wrasse/store.py`: an exact index of canonical event
+ids, resolved one lookup at a time. Fuzzy search is for display and never sets
+a price, because it can miss a matching row without reaching its limit, so
+validating what it returns proves nothing about what it left out.
+`wrasse/memory_gate.py` remains for the display-side `recall` command.
+
+If Sibyl raises an error, Wrasse raises `MemoryRequired` and produces no terms.
+A reachable store with no matching counterparty is an explicit cold start, and
+a store holding history about other counterparties is reported as no match
+rather than as empty.
 
 Verified Base outcomes are written in `wrasse/evidence.py`, after the receipt,
 chain, contract, event signature, deal, provider, and final state are checked in
@@ -47,7 +53,7 @@ The terminal interface currently exposes:
 
 ```bash
 uv run wrasse recall <provider-address>
-uv run wrasse reconcile-timeout <tx-hash> --deal-id <id> --provider <address>
+uv run wrasse reconcile --tx <tx-hash>
 uv run wrasse learn-dimension <event-id>
 uv run wrasse policy <provider-address> \
   --buyer <buyer-address> \

@@ -233,13 +233,25 @@ def _same_address(left: str, right: str) -> bool:
     return Web3.to_checksum_address(left) == Web3.to_checksum_address(right)
 
 
-def _require_observation_happened(web3, document: dict[str, Any], *, chain_id: int, where) -> None:
-    """A quote claiming it was checked against Base has to have been.
+#: How stale a "latest observed block" may be and still be called one. A quote written an hour
+#: ago was not judged against the block the chain is on now, whatever its label says.
+MAX_OBSERVATION_AGE_SECONDS = 3_600
 
-    `executability` is the label a reader trusts to know whether any of this was ever held
-    against a chain, and it is the one part of the document memory cannot rebuild: it records
-    what a past run saw. So it is checked against the thing it describes instead. A block
-    number and timestamp that Base does not agree with never came from Base.
+
+def _require_observation_happened(web3, document: dict[str, Any], *, chain_id: int, where) -> None:
+    """Check a live-quote label against the chain it names, and be exact about the limit.
+
+    `executability` is the label a reader trusts to know whether any of this was held against
+    a chain, and it is the one part of the document memory cannot rebuild: it records what a
+    past run saw. So it is checked against the thing it describes.
+
+    **What this establishes and what it cannot.** It establishes that the block coordinates are
+    a real Base block, that the reference time this quote reasoned from is that block's own
+    timestamp, and that the observation is recent rather than any block plucked from history.
+    It does **not** prove the document's author performed the observation: re-querying a public
+    fact later cannot show who read it first, and proving that would need an authenticated
+    record made at the time. Say "matches a recent canonical Base block and its own reference",
+    never "proves it was checked live".
 
     A supplied-reference quote is honest about being a fixture and needs no such check. What
     this stops is a fixture relabelled as a live quote.
@@ -260,19 +272,42 @@ def _require_observation_happened(web3, document: dict[str, Any], *, chain_id: i
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise RuntimeError(f"{where} records {name}={value!r}, which is not a block {name}")
 
-    try:
-        block = web3.eth.get_block(number)
-    except Exception as error:  # noqa: BLE001
+    # A genuine writer reasons from the block it observed, so these are the same number. They
+    # are two fields only because one of them is what the engine was given.
+    if executability["reference_timestamp"] != timestamp:
         raise RuntimeError(
-            f"{where} claims block {number} was observed on this chain, and it cannot be read: "
-            f"{error}"
-        ) from error
-    actual = int(block["timestamp"] if isinstance(block, dict) else block.timestamp)
+            f"{where} says it was judged against block {number} at {timestamp}, and then "
+            f"reasoned from {executability['reference_timestamp']}. A live quote takes its "
+            "reference from the block it observed."
+        )
+
+    def read(identifier):
+        try:
+            block = web3.eth.get_block(identifier)
+        except Exception as error:  # noqa: BLE001
+            raise RuntimeError(
+                f"{where} claims block {identifier} was observed on this chain, and it cannot "
+                f"be read: {error}"
+            ) from error
+        return int(block["timestamp"] if isinstance(block, dict) else block.timestamp)
+
+    actual = read(number)
     if actual != timestamp:
         raise RuntimeError(
             f"{where} says block {number} carried timestamp {timestamp}, and the chain says "
             f"{actual}. That observation did not happen, so the quote is a fixture wearing the "
             "label of a live one."
+        )
+
+    # Any genuine historical block would satisfy the comparison above, so recency is what makes
+    # "the latest observed block" mean anything. An hour-old observation is a real block and a
+    # false description.
+    age = read("latest") - timestamp
+    if age > MAX_OBSERVATION_AGE_SECONDS:
+        raise RuntimeError(
+            f"{where} was judged against a block {age}s old, which is not the latest observed "
+            f"block by any reading. Re-run `policy` rather than signing against a stale "
+            "description of the chain."
         )
 
 

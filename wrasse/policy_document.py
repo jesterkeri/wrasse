@@ -209,6 +209,29 @@ def _same_address(left: str, right: str) -> bool:
     return Web3.to_checksum_address(left) == Web3.to_checksum_address(right)
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Refuse a JSON object that says the same thing twice.
+
+    `json.loads` keeps the last of a repeated key and says nothing, so a document carrying
+    both `"price_wei": 1` and the real price parses to the real price here while a reader, or
+    any first-wins parser, sees the other one. Every check downstream then compares the value
+    this build happened to keep, which is why canonical encoding could not see it: by the time
+    the comparison runs, the ambiguity has already been resolved and discarded.
+
+    A document that cannot be read the same way twice is not a receipt.
+    """
+
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise PolicyDocumentError(
+                f"the document names {key!r} twice in one object. A file that reads differently "
+                "depending on the parser cannot explain anything."
+            )
+        seen.add(key)
+    return dict(pairs)
+
+
 def load_policy(
     path: Path | str,
     *,
@@ -226,7 +249,9 @@ def load_policy(
         raise PolicyDocumentError(f"{path} is {size} bytes, over the {MAX_POLICY_BYTES} cap")
 
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys
+        )
     except json.JSONDecodeError as error:
         raise PolicyDocumentError(f"{path} is not valid JSON: {error}") from error
 
