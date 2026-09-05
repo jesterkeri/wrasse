@@ -17,6 +17,15 @@ the provider's misconduct failed it: the buyer paid less as it was wronged more,
 improvement, and then fell off a cliff into refusal with nothing at all. So the buyer's
 ceiling is a profile constant and the inversion is gone.
 
+**The monotonicity claim is component-wise and it excludes the service window.** Stated
+exactly: a worse provider record cannot lower the price it is paid, cannot lower the bond it
+must post, and cannot turn a deal into a refusal. It *can* lengthen the service window,
+because `budget` and `sensitive` carry positive window buffers on purpose, and a cost- or
+quality-sensitive buyer that has been let down may rationally grant a longer realistic
+deadline rather than a tighter one. That is an improvement for a provider whose own limit on
+the term is a minimum, and it is a deliberate design choice rather than an oversight. Claiming
+blanket monotonicity would be false, and the honest statement is the narrow one.
+
 **Attribution.** A number moves for one of three reasons and they are not interchangeable. A
 memory adjustment cites receipts. A negotiation concession cites the counterparty's published
 limit. A fixed limit binding cites the rule by name. "A receipt behind every number that

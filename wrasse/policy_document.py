@@ -13,6 +13,7 @@ re-derived from chain time immediately before signing.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from decimal import Decimal, InvalidOperation
@@ -22,9 +23,10 @@ from typing import Any
 
 from web3 import Web3
 
-from .constants import NEGOTIATION_MANIFEST
-from .negotiation import CONCESSION, MEMORY, RULE
+from .constants import MANIFEST_DIGEST, canonical_manifest
+from .negotiation import CONCESSION, MEMORY, RULE, Position, bond_is_collectible, settle
 from .negotiation import TERMS as NEGOTIATED_TERMS
+from .negotiation import price_wei as negotiation_price_wei
 from .engine import PROFILES
 from .policy_hash import (
     ENGINE_VERSION,
@@ -214,6 +216,11 @@ def _bounded_decimal(value: Any, name: str) -> Decimal:
         number = Decimal(value)
     except InvalidOperation as error:
         raise PolicyDocumentError(f"{name} is not a decimal") from error
+    # `Decimal("NaN")` parses. Comparing it then raises `InvalidOperation` out of this
+    # function, so an untrusted document produced a traceback where it was promised a
+    # validation refusal. Finiteness is a property of the number, so it is checked as one.
+    if not number.is_finite():
+        raise PolicyDocumentError(f"{name} is {value!r}, which is not a finite number")
     if not Decimal("0") <= number <= Decimal("1"):
         raise PolicyDocumentError(f"{name} is outside 0..1")
     return number
@@ -328,17 +335,36 @@ def load_policy(
         raise PolicyDocumentError("the persona commitment is not a sha256 digest")
     _bounded_decimal(persona["cashflow_sensitivity"], "cashflow_sensitivity")
 
+    # Compared by canonical bytes, never by Python equality. `5000.0 == 5000` in Python and
+    # not in JSON, so an equality check accepts a manifest that hashes to something else
+    # entirely, and a reader following the README recomputes a digest the validator did not
+    # see. The digest is what the version claims to carry, so the digest is what is compared.
     engine = _exact_keys(document["engine"], _ENGINE_KEYS, "the engine block")
-    if engine["negotiation_manifest"] != NEGOTIATION_MANIFEST:
+    published = json.dumps(
+        engine["negotiation_manifest"], sort_keys=True, separators=(",", ":")
+    )
+    if published != canonical_manifest():
+        digest = hashlib.sha256(published.encode("utf-8")).hexdigest()
         raise PolicyDocumentError(
             "the published negotiation manifest is not the one this build hashes into "
-            "engine_version, so the digest in that version does not describe these constants"
+            f"engine_version: it digests to {digest[:12]}, this build to "
+            f"{MANIFEST_DIGEST[:12]}. The constants that decide a term are covered by the "
+            "same commitment as the term, and this document's are not."
         )
 
     profiles = buyer_side["profiles"]
-    if not isinstance(profiles, dict) or profile not in profiles:
-        available = ", ".join(sorted(profiles)) if isinstance(profiles, dict) else "none"
-        raise PolicyDocumentError(f"no profile named {profile!r}; the document has: {available}")
+    if not isinstance(profiles, dict):
+        raise PolicyDocumentError("the buyer's profiles are not an object")
+    # Exactly the set this engine publishes. A subset is how a refusal disappears: drop the
+    # profile that had no overlap and the document reads as though every choice worked.
+    if set(profiles) != set(PROFILES):
+        missing = sorted(set(PROFILES) - set(profiles))
+        extra = sorted(set(profiles) - set(PROFILES))
+        raise PolicyDocumentError(
+            f"the document offers profiles {sorted(profiles)}; this engine produces "
+            f"{sorted(PROFILES)}. Missing: {missing or 'none'}. Unknown: {extra or 'none'}. "
+            "A document may not add, drop or rename the choices a reader is given."
+        )
     if profile not in PROFILES:
         raise PolicyDocumentError(
             f"{profile!r} is not a profile this engine produces: {', '.join(sorted(PROFILES))}"
@@ -348,10 +374,6 @@ def load_policy(
     # unselected columns are unchecked can show a reader whatever it likes.
     validated = None
     for name in sorted(profiles):
-        if name not in PROFILES:
-            raise PolicyDocumentError(
-                f"{name!r} is not a profile this engine produces: {', '.join(sorted(PROFILES))}"
-            )
         candidate = _check_profile(
             profiles[name], name, document, buyer_side, provider_side,
             request_id=request_id, chain_id=chain_id, contract_address=contract_address,
@@ -501,21 +523,126 @@ def _check_settlement(settlement: Any, name: str) -> bool:
     return True
 
 
-def _check_positions(body: dict[str, Any], name: str) -> None:
-    """Both sides' published numbers, so a reader can recompute the settlement itself."""
+def _check_positions(body: dict[str, Any], name: str) -> dict[str, Position]:
+    """Both sides' published numbers, strictly, and the positions they add up to.
 
-    _exact_keys(body["baseline"], _BASELINE_KEYS, f"profile {name!r} baseline")
+    Shape-checking was not enough. A reader is told they can recompute the settlement from
+    this block, and a block whose proposals are strings supports no such thing: the document
+    would carry a validator-approved account of a negotiation that never happened, beside a
+    perfectly genuine signed preimage.
+    """
+
+    baseline = _exact_keys(body["baseline"], _BASELINE_KEYS, f"profile {name!r} baseline")
+    for field, high in (
+        ("price_wei", 2**256 - 1),
+        ("provider_bond_bps", MAX_PROVIDER_BOND_BPS),
+        ("service_window", MAX_DURATION),
+        ("payout_delay", MAX_DURATION),
+    ):
+        _bounded_int(baseline[field], f"profile {name!r} baseline {field}", low=1, high=high)
 
     buyer = _exact_keys(body["buyer"], _BUYER_HALF_KEYS, f"profile {name!r} buyer half")
-    _exact_keys(buyer["proposes"], _BUYER_PROPOSES_KEYS, f"profile {name!r} buyer proposals")
-    _exact_keys(buyer["limits"], _BUYER_LIMITS_KEYS, f"profile {name!r} buyer limits")
+    proposes = _exact_keys(buyer["proposes"], _BUYER_PROPOSES_KEYS, f"profile {name!r} buyer proposals")
+    limits = _exact_keys(buyer["limits"], _BUYER_LIMITS_KEYS, f"profile {name!r} buyer limits")
     _bounded_decimal(buyer["risk"], f"profile {name!r} buyer risk")
 
     provider = _exact_keys(body["provider"], _PROVIDER_HALF_KEYS, f"profile {name!r} provider half")
-    _exact_keys(provider["proposes"], _PROVIDER_PROPOSES_KEYS, f"profile {name!r} provider proposals")
-    _exact_keys(provider["limits"], _PROVIDER_LIMITS_KEYS, f"profile {name!r} provider limits")
-    _exact_keys(provider["walkaway"], _PROVIDER_WALKAWAY_KEYS, f"profile {name!r} provider walkaway")
+    offers = _exact_keys(provider["proposes"], _PROVIDER_PROPOSES_KEYS, f"profile {name!r} provider proposals")
+    caps = _exact_keys(provider["limits"], _PROVIDER_LIMITS_KEYS, f"profile {name!r} provider limits")
+    walkaway = _exact_keys(provider["walkaway"], _PROVIDER_WALKAWAY_KEYS, f"profile {name!r} provider walkaway")
     _bounded_decimal(provider["risk"], f"profile {name!r} provider risk")
+
+    numbers = {
+        "buyer bond proposal": (proposes["provider_bond_bps"], MAX_PROVIDER_BOND_BPS, 0),
+        "buyer window proposal": (proposes["service_window"], MAX_DURATION, 1),
+        "buyer max price": (limits["max_price_bps"], 2**32, 1),
+        "buyer min payout delay": (limits["min_payout_delay"], MAX_DURATION, 1),
+        "provider price proposal": (offers["price_bps"], 2**32, 1),
+        "provider payout delay proposal": (offers["payout_delay"], MAX_DURATION, 1),
+        "provider max bond": (caps["max_bond_bps"], MAX_PROVIDER_BOND_BPS, 0),
+        "provider min window": (caps["min_service_window"], MAX_DURATION, 1),
+        "provider price floor": (walkaway["price_floor_bps"], 2**32, 1),
+    }
+    for label, (value, high, low) in numbers.items():
+        _bounded_int(value, f"profile {name!r} {label}", low=low, high=high)
+
+    # The walk-aways the settlement is stated over. Three are derived, in the open, from the
+    # baseline and the side's own proposal: a side concedes back to what it would have asked a
+    # stranger and never past a number it offered itself. The fourth, price, is published,
+    # because the provider concedes only part of the way back and that is what makes a refusal
+    # possible at all.
+    return {
+        "provider_bond_bps": Position(
+            proposal=proposes["provider_bond_bps"],
+            limit=caps["max_bond_bps"],
+            walkaway=min(baseline["provider_bond_bps"], proposes["provider_bond_bps"]),
+            limit_name="provider_max_bond_bps",
+            limit_kind=MEMORY,
+        ),
+        "service_window": Position(
+            proposal=proposes["service_window"],
+            limit=caps["min_service_window"],
+            walkaway=max(baseline["service_window"], proposes["service_window"]),
+            limit_name="provider_min_service_window",
+            limit_kind=RULE,
+        ),
+        "price_bps": Position(
+            proposal=offers["price_bps"],
+            limit=limits["max_price_bps"],
+            walkaway=walkaway["price_floor_bps"],
+            limit_name="buyer_max_price_bps",
+            limit_kind=RULE,
+        ),
+        "payout_delay": Position(
+            proposal=offers["payout_delay"],
+            limit=limits["min_payout_delay"],
+            walkaway=max(baseline["payout_delay"], offers["payout_delay"]),
+            limit_name="buyer_min_payout_delay",
+            limit_kind=RULE,
+        ),
+    }
+
+
+def _check_settlement_follows(body: dict[str, Any], positions: dict[str, Position], name: str) -> None:
+    """Run the settlement again from the published numbers and require the same answer.
+
+    This is the whole of Gate 7's standalone claim. Without it the document says a
+    negotiation happened and nothing checks that it is the negotiation these numbers produce,
+    so an edited account passes validation beside a genuine signed preimage and a judge is
+    shown an explanation that is not the one that set the price.
+    """
+
+    recomputed = settle(positions).as_dict()
+    published = body["settlement"]
+    if recomputed != published:
+        raise PolicyDocumentError(
+            f"profile {name!r} publishes a settlement its own numbers do not produce. It says "
+            f"{published!r}; those positions settle to {recomputed!r}."
+        )
+
+    if not published["agreed"]:
+        return
+
+    settled = settle(positions).terms
+    baseline = body["baseline"]
+    price = negotiation_price_wei(baseline["price_wei"], settled["price_bps"])
+    expected = {
+        "price_wei": price,
+        "provider_bond_bps": settled["provider_bond_bps"],
+        "service_window": settled["service_window"],
+        "payout_delay": settled["payout_delay"],
+    }
+    displayed = _exact_keys(body["terms"], _TERMS_KEYS, f"profile {name!r} terms")
+    if displayed != expected:
+        raise PolicyDocumentError(
+            f"profile {name!r} displays terms {displayed!r}, but its own settlement produces "
+            f"{expected!r}"
+        )
+    if not bond_is_collectible(price, settled["provider_bond_bps"]):
+        raise PolicyDocumentError(
+            f"profile {name!r} settles {settled['provider_bond_bps']} bps of {price} wei, "
+            "which rounds to a zero-wei bond the contract rejects"
+        )
 
 
 def _check_profile(
@@ -535,7 +662,8 @@ def _check_profile(
     agreed = _check_settlement(chosen["settlement"], name)
     keys = _AGREED_PROFILE_KEYS if agreed else _REFUSED_PROFILE_KEYS
     chosen = _exact_keys(chosen, keys, f"profile {name!r}")
-    _check_positions(chosen, name)
+    positions = _check_positions(chosen, name)
+    _check_settlement_follows(chosen, positions, name)
 
     buyer_used = _check_used(chosen["buyer"], buyer_side, "buyer")
     provider_used = _check_used(chosen["provider"], provider_side, "provider")
@@ -584,9 +712,10 @@ def _check_profile(
             f"profile {name!r} quotes {chosen['policy_hash']} but its own fields hash to {recomputed}"
         )
 
-    _check_terms(
-        _exact_keys(chosen["terms"], _TERMS_KEYS, f"profile {name!r} terms"), validated, name
-    )
+    # `_check_settlement_follows` already bound the displayed terms to the settlement. This
+    # binds them to the signature, which is the other half: the numbers a person reads must be
+    # the numbers the key funds.
+    _check_terms(chosen["terms"], validated, name)
 
     # Each side commits to what moved its own numbers. A hash over everything recalled would
     # describe the reading rather than the reasoning.

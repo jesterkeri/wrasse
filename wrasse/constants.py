@@ -93,13 +93,45 @@ PROFILE_FIELDS: dict[str, dict[str, Any]] = {
     },
 }
 
+#: How much a dimension counts to a buyer whose profile shares one of its contexts, and how
+#: much when it does not. Literals in the scoring function until it turned out that editing
+#: one changed every buyer's terms without changing the version that claims to cover them.
+RELEVANT_MULTIPLIER = "1.5"
+IRRELEVANT_MULTIPLIER = "0.5"
+
+#: Risk is clamped to this interval before it is spent on anything, and every rounding in the
+#: engine uses this mode. Both decide terms, so both belong in the digest: `ROUND_HALF_UP`
+#: against Python's default banker's rounding is a whole basis point at exactly `.5`.
+RISK_FLOOR = "0"
+RISK_CEILING = "1"
+ROUNDING = "ROUND_HALF_UP"
+
+#: Mirrored from `policy_hash`, which mirrors the deployed contract. Duplicated into the
+#: manifest rather than imported because this module has no intra-package imports by design,
+#: and `test_the_manifest_mirrors_the_contract_bounds` pins the two together.
+BPS_DENOMINATOR = 10_000
+MAX_PROVIDER_BOND_BPS = 10_000
+MAX_DURATION = 30 * 24 * 60 * 60
+
 #: Everything above, in one object, in the order a reader can reproduce.
+#:
+#: The test of whether something belongs here is not "is it a negotiation constant". It is:
+#: **can editing this change a term?** A constant that can and is missing makes the claim on
+#: `ENGINE_VERSION` false, which is worse than not making the claim.
 NEGOTIATION_MANIFEST: dict[str, Any] = {
     "max_bond_bps": MAX_BOND_BPS,
     "concession_num": CONCESSION_NUM,
     "concession_den": CONCESSION_DEN,
     "min_service_window_seconds": MIN_SERVICE_WINDOW_SECONDS,
     "min_payout_delay_seconds": MIN_PAYOUT_DELAY_SECONDS,
+    "relevant_multiplier": RELEVANT_MULTIPLIER,
+    "irrelevant_multiplier": IRRELEVANT_MULTIPLIER,
+    "risk_floor": RISK_FLOOR,
+    "risk_ceiling": RISK_CEILING,
+    "rounding": ROUNDING,
+    "bps_denominator": BPS_DENOMINATOR,
+    "max_provider_bond_bps": MAX_PROVIDER_BOND_BPS,
+    "max_duration_seconds": MAX_DURATION,
     "profiles": PROFILE_FIELDS,
 }
 

@@ -42,7 +42,10 @@ critical path, not an activity log attached after the decision.
   created. Stored dimensions are reused; the LLM is never called in the policy
   path.
 
-The provider agents are simulations. Their seed is retained with every bid.
+The provider agent is a simulation. What makes its terms reproducible is not a retained
+random seed, which no longer exists: it is that the persona is committed to git before the
+store holds a receipt, its SHA-256 is recorded in that store, and every number it produces is
+a deterministic function of that persona and the receipts it can show you.
 
 ## Setup and tests
 
@@ -118,6 +121,13 @@ driven by its record of *this buyer*. The buyer's price ceiling does not, becaus
 that fell as the provider misbehaved made the buyer pay less as it was wronged more and then
 refused outright, punishing the party that suffered rather than the one that caused it.
 Willingness to pay is a fact about the job, not about the counterparty.
+
+The claim is component-wise and it has one stated exception. A worse provider record cannot
+lower the price it is paid, cannot lower the bond it must post, and cannot turn a deal into a
+refusal. It *can* lengthen the service window: `budget` and `sensitive` carry positive window
+buffers because a cost- or quality-sensitive buyer that has been let down may rationally grant
+a longer realistic deadline instead of a tighter one. That is better for a provider whose own
+limit on the term is a minimum, and it is a choice rather than an oversight.
 
 **A number moves for one of three reasons and the document never confuses them.** A memory
 adjustment cites receipts. A concession cites the counterparty's published limit. A fixed

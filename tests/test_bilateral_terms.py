@@ -764,7 +764,7 @@ def test_a_worse_provider_never_worsens_the_buyers_own_outcome(both, profile):
         base_service_window=600,
     )
 
-    prices, agreed = [], []
+    prices, bonds, windows, agreed = [], [], [], []
     for severity in [i / 20 for i in range(21)]:
         dimension = DimensionDefinition(
             dimension_id="non_delivery_after_payment",
@@ -785,11 +785,38 @@ def test_a_worse_provider_never_worsens_the_buyers_own_outcome(both, profile):
         agreed.append(result.agreed)
         if result.agreed:
             prices.append(result.terms["price_bps"])
+            bonds.append(result.terms["provider_bond_bps"])
+        # Tracked from the proposal rather than the settlement, so the window exception stays
+        # observable on a profile whose price refuses at every severity.
+        windows.append(buyer.service_window)
 
     assert len(set(prices)) <= 1, (
         "the provider's own misconduct moved what the buyer pays, which is the inversion: "
         f"{sorted(set(prices))}"
     )
-    assert agreed == sorted(agreed, reverse=True) or all(agreed), (
-        "a worse provider turned the buyer's deal into a refusal"
+    assert bonds == sorted(bonds), (
+        "a worse provider record lowered the bond it has to post, which is an improvement "
+        f"for the party that caused it: {bonds}"
     )
+    assert len(set(agreed)) == 1, (
+        "the provider's own misconduct changed whether the buyer has a deal at all. Whether "
+        "one exists is decided by the buyer's record against the provider's floor, and this "
+        f"sweep holds that fixed: {agreed}"
+    )
+
+    # The stated exception, asserted rather than assumed. `budget` and `sensitive` carry
+    # positive window buffers on purpose: a buyer that has been let down may rationally grant
+    # a longer realistic deadline instead of a tighter one. That is better for a provider
+    # whose own limit on the term is a minimum, so the monotonicity claim is component-wise
+    # and excludes this term. Pinning it here stops the exception being quietly widened, and
+    # stops anyone restoring the blanket claim without this test failing.
+    if PROFILES[profile].window_buffer_seconds > 0:
+        assert windows == sorted(windows), "a positive buffer must lengthen the window"
+        assert len(set(windows)) > 1, (
+            "this profile is supposed to grant more time as the record worsens; if it no "
+            "longer does, the exception in the docstring and the README is now false"
+        )
+    else:
+        assert windows == sorted(windows, reverse=True), (
+            "a negative buffer must tighten the window, never lengthen it"
+        )

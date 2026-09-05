@@ -9,10 +9,14 @@ from typing import Any, Iterable
 from .constants import (
     CONCESSION_DEN,
     CONCESSION_NUM,
+    IRRELEVANT_MULTIPLIER,
     MAX_BOND_BPS,
     MIN_PAYOUT_DELAY_SECONDS,
     MIN_SERVICE_WINDOW_SECONDS,
     PROFILE_FIELDS,
+    RELEVANT_MULTIPLIER,
+    RISK_CEILING,
+    RISK_FLOOR,
 )
 from .dimensions import DimensionDefinition
 from .evidence import SUBJECTS_OF
@@ -99,7 +103,8 @@ def produce_terms(
         about="provider",
         weight=profile.risk_weight,
         relevance=lambda dimension: (
-            Decimal("1.5") if profile.contexts.intersection(dimension.applies_when) else Decimal("0.5")
+            Decimal(RELEVANT_MULTIPLIER) if profile.contexts.intersection(dimension.applies_when)
+            else Decimal(IRRELEVANT_MULTIPLIER)
         ),
     )
 
@@ -117,8 +122,8 @@ def produce_terms(
         partial, _ = _score(
             subset, dimensions, about="provider", weight=profile.risk_weight,
             relevance=lambda dimension: (
-                Decimal("1.5") if profile.contexts.intersection(dimension.applies_when)
-                else Decimal("0.5")
+                Decimal(RELEVANT_MULTIPLIER) if profile.contexts.intersection(dimension.applies_when)
+                else Decimal(IRRELEVANT_MULTIPLIER)
             ),
         )
         return (
@@ -334,7 +339,7 @@ def _score(events, dimensions, *, about: str, weight: Decimal, relevance) -> tup
                 continue
             risk += contribution
             used.add(canonical_event_id(str(event["event_id"])))
-    return max(Decimal("0"), min(Decimal("1"), risk)), used
+    return max(Decimal(RISK_FLOOR), min(Decimal(RISK_CEILING), risk)), used
 
 
 def _unique_by_event_id(evidence: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ...]:

@@ -763,16 +763,25 @@ def test_a_forged_price_that_agrees_with_itself_is_still_not_signed(rehearsal, c
 
     policy_path = _quote(rehearsal, capsys)
     monkeypatch.setenv(chain.BROADCAST_ENV, "1")
-    ninefold = 900_000_000_000_000
+    ninefold = 9
 
-    def raise_the_price(body):
+    def raise_the_baseline(body):
+        """Move the baseline, not the settled price.
+
+        Raising the price alone is caught by the document itself now: the settlement is
+        recomputed from the published positions and no longer produces the displayed terms.
+        The baseline is the one input the document cannot check against itself, because every
+        number in the profile is consistent with it. Only rebuilding from the two memories,
+        against the operator's own arguments, can tell.
+        """
         for profile in body["buyer"]["profiles"].values():
+            profile["baseline"]["price_wei"] *= ninefold
             if not profile["settlement"]["agreed"]:
                 continue
-            profile["terms"]["price_wei"] = ninefold
-            profile["policy_preimage"]["price"] = ninefold
+            profile["terms"]["price_wei"] *= ninefold
+            profile["policy_preimage"]["price"] *= ninefold
 
-    _forge(policy_path, raise_the_price)
+    _forge(policy_path, raise_the_baseline)
 
     # It passes validation, which is exactly why validation is not enough.
     from wrasse.policy_document import load_policy
@@ -782,7 +791,7 @@ def test_a_forged_price_that_agrees_with_itself_is_still_not_signed(rehearsal, c
         contract_address=rehearsal["address"], buyer=rehearsal["buyer"].address,
         provider=PROVIDER,
     )
-    assert validated.price_wei == ninefold
+    assert validated.price_wei == 10**14 * ninefold
 
     with pytest.raises(RuntimeError, match="disagree about 'profiles'"):
         main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
@@ -974,7 +983,15 @@ def test_the_whole_explanation_is_checked_not_only_the_signed_terms(
     monkeypatch.setenv(chain.BROADCAST_ENV, "1")
     _forge(policy_path, edit)
 
-    with pytest.raises(RuntimeError, match="disagree about|may not add, drop or rename"):
+    # Either layer may catch it. The document checks what it can check against itself, and
+    # what it cannot is caught by rebuilding from memory. What matters is that no edit to the
+    # explanation survives to a signature.
+    from wrasse.policy_document import PolicyDocumentError
+
+    with pytest.raises(
+        (RuntimeError, PolicyDocumentError),
+        match="disagree about|may not add, drop or rename|its own settlement produces",
+    ):
         main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
 
 
