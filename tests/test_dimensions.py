@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 
-import json
-
 import pytest
 from sibyl_memory_client import MemoryClient
 

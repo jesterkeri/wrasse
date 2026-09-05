@@ -15,6 +15,7 @@ dependencies = [
 dev = [
     "pytest>=8.4,<9",
     "pytest-cov>=6.2,<7",
+    "ruff>=0.14,<0.15",
 ]
 
 [project.scripts]
@@ -30,6 +31,26 @@ addopts = "-q"
 markers = [
     "real_integrity: run with the production ledger-integrity check in place",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Deliberately narrow. This is here to catch dead code and stale imports, which is what it
+# actually found: two variables and an import left behind by the Gate 7 refactor, and an
+# import stranded below a helper. It is not here to have opinions about style.
+select = ["E", "F", "W"]
+ignore = [
+    # Long lines are already bounded at 100 and the prose in these modules is load-bearing.
+    "E501",
+]
+
+# Import sorting is deliberately not enabled. It would rewrite the import block of ten
+# modules, several of them under active adversarial review, for no correctness gain, and a
+# reviewer reading that diff has to separate churn from substance. The rules kept here are the
+# ones that found something real: dead variables, stale imports, an import stranded below a
+# helper by an earlier edit.
 
 [tool.coverage.run]
 branch = true

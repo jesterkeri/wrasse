@@ -51,10 +51,15 @@ a deterministic function of that persona and the receipts it can show you.
 
 ```bash
 uv sync --extra dev
+uv run ruff check wrasse tests
 uv run pytest
 cd contracts
 forge test -vv
 ```
+
+There is no CI. Everything above runs locally and every commit in this repository
+was made with the two suites green. `ruff` is configured narrowly, to catch dead
+code and stale imports rather than to have opinions about style.
 
 The terminal interface currently exposes:
 

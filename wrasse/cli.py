@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterator, NamedTuple
 
 from dotenv import load_dotenv
-from sibyl_memory_client import MemoryClient, NotFoundError
+from sibyl_memory_client import MemoryClient
 from web3 import HTTPProvider, Web3
 
 from . import chain, escrow, negotiation
@@ -1880,8 +1880,6 @@ def main(argv: list[str] | None = None) -> int:
             base_price_wei=args.base_price_wei, base_bond_bps=args.base_bond_bps,
             base_service_window=args.service_window, base_payout_delay=args.payout_delay,
         )
-        persona, recall = quote.persona, quote.recall
-
         basis = _resolve_time_basis(args)
         reference_timestamp, accept_by, observation = basis.reference, basis.accept_by, basis.observation
 

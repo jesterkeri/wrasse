@@ -17,7 +17,6 @@ from wrasse.negotiation import (
     CONCESSION,
     MEMORY,
     RULE,
-    NoOverlap,
     Position,
     bond_is_collectible,
     clamp_bond_bps,

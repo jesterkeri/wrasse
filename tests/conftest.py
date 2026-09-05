@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from wrasse.evidence import ChainEvent
+
 #: The provider most tests quote against. The shipped persona names the real provider A wallet,
 #: and the persona is deliberately bound to the address it describes, so a test using a
 #: different provider has to write its own.
@@ -24,8 +26,6 @@ def write_persona(directory: Path, address: str, *, name: str = "atlas") -> Path
         "delay_sensitivity_seconds": 1800,
     }))
     return path
-
-from wrasse.evidence import ChainEvent
 
 
 @pytest.fixture
