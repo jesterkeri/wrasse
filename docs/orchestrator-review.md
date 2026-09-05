@@ -161,7 +161,13 @@ memories are now held, in a fixed order by lock path, across both recalls and th
 command decrypted a keystore, read the deployment, observed chain time, estimated gas and read
 fees. A `reconcile` landing a newly confirmed receipt in that window meant the signature
 committed terms the memories no longer produced, and the operator saw a success rather than
-the promised refusal. The check now runs again as the last thing before signing.
+the promised refusal. The check now runs again inside the signing callback.
+
+Round four found that this was still a snapshot: the check returned, and two chain-time
+reads, an on-chain hash call and transaction construction happened before the signature, so
+the same reconciliation simply landed a moment later. Both memories are now **held** for the
+whole callback, until the signed bytes exist. "Immediately before signing" has to mean the
+memories cannot move in between.
 
 **A lock on the object is not a lock for the caller.** `_exclusive` counted depth on the store,
 so while one thread held the file lock a second thread read that counter as its own
@@ -188,3 +194,39 @@ compared, including the exact set of profiles offered.
 **The identity validator did not require the field that dates it.** And the read budget was 15
 seconds where three twenty second attempts were permitted, a number describing an intention
 rather than the code. It is derived now, and no attempt is begun without room to pay for it.
+
+
+## Gates 5 and 6, round four
+
+Two CRITICAL, two MAJOR, one MINOR. All five fixed. Both criticals were holes opened by the
+previous round's fixes rather than survivals of the original defects.
+
+**The narrowed recheck dropped every profile, including the selected one.** The reasoning
+written for it was that any memory movement shows up in the recalled evidence, so the profiles
+could be skipped at signing time. That is false for the ontology: `learn-dimension --relearn`
+changes what a receipt is worth without changing which receipts exist. Every field being
+compared stayed identical while the bond and the window moved, and the old terms were signed.
+The narrowed mode now compares the selected profile in full and skips only the profiles that
+cannot reach a signature.
+
+**The provenance check was still a snapshot, one boundary later.** See above.
+
+**The two-store lock was also released too early inside the quote.** The ontology was read
+after it, so a relearn between the recall and the term production would produce a quote whose
+receipts came from one moment and whose readings came from another. Dimensions are read inside
+the snapshot now.
+
+**Comparison was Python equality, which is looser than JSON's types.** `True == 1`, so a
+receipt whose `deal_id` was rewritten from `1` to `true` compared equal to the body actually
+held. Both halves are compared by canonical encoding.
+
+**`executability` is the one part of the document memory cannot rebuild.** It records what a
+past run observed, so nothing in the stores can confirm it, and a supplied-reference fixture
+relabelled as a live Base quote passed every check. The nested chain fields are now bounded,
+the note is a closed set of the two sentences this build writes, and at signing the claimed
+block is read from the chain and its timestamp compared. A quote that says it was judged
+against Base is now checked against Base.
+
+**The reconciler suite patched the integrity gate away for every test**, so deleting the
+production call changed nothing. The patch is opt-out now, and one test runs with the real
+verifier and a row whose bytes do not match its claims.

@@ -934,7 +934,7 @@ def test_a_receipt_arriving_before_the_signature_stops_it(rehearsal, capsys, mon
 
     monkeypatch.setattr(chain, "load_signer", deliver_then_load)
 
-    with pytest.raises(RuntimeError, match="a receipt has been reconciled since"):
+    with pytest.raises(RuntimeError, match="memory has moved since"):
         main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
 
     ledger = chain.TransactionLedger(Path(os.environ["WRASSE_TX_DB"]))
@@ -972,3 +972,179 @@ def test_the_whole_explanation_is_checked_not_only_the_signed_terms(
 
     with pytest.raises(RuntimeError, match="disagree about|may not add, drop or rename"):
         main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
+
+
+def test_a_reading_that_changes_before_the_signature_stops_it(rehearsal, capsys, monkeypatch):
+    """Memory moving is not only receipts arriving.
+
+    A `learn-dimension --relearn` changes what a receipt is *worth* without changing which
+    receipts exist. The recalled evidence, the verdicts and the cold-start flags all stay
+    identical, so a recheck that drops the profiles compares everything except the numbers
+    that moved, passes, and signs the old bond and window.
+    """
+
+    from wrasse.dimensions import DIMENSION_CATEGORY, DimensionDefinition
+    from wrasse.evidence import ChainEvent
+    from wrasse.store import WrasseStore
+
+    address, buyer = rehearsal["address"], rehearsal["buyer"].address
+
+    def reading(severity: float) -> DimensionDefinition:
+        return DimensionDefinition(
+            dimension_id="abandoned_after_accepting",
+            source_event_type="timeout_claimed_without_delivery",
+            signal_direction="negative",
+            severity=severity,
+            confidence=0.9,
+            applies_when=("deadline_sensitive",),
+        )
+
+    receipt = ChainEvent(
+        chain_id=CHAIN_ID, contract_address=address, tx_hash="0x" + "d1" * 32, log_index=0,
+        block_number=1, event_type="timeout_claimed_without_delivery", deal_id=17,
+        buyer=buyer, provider=PROVIDER, observed_at="2026-09-05T00:00:00+00:00",
+    )
+
+    def store_for(role: str) -> WrasseStore:
+        owner = buyer if role == "buyer" else PROVIDER
+        path = os.environ[f"WRASSE_{role.upper()}_MEMORY_PATH"]
+        return WrasseStore.open(
+            path, role=role, owner_address=owner, chain_id=CHAIN_ID, escrow_address=address,
+        )
+
+    # The persona is committed before any receipt exists, which is the claim it makes, so it
+    # has to be written before this test plants one.
+    from wrasse.store import persona_digest
+
+    digest, document = persona_digest(os.environ["WRASSE_PROVIDER_PERSONA"])
+    store_for("provider").commit_persona(name=document["name"], digest=digest)
+
+    for role in ("buyer", "provider"):
+        store = store_for(role)
+        store.ingest(receipt)
+        store.memory.set_entity(
+            DIMENSION_CATEGORY, "abandoned_after_accepting", reading(0.2).body(), status="active"
+        )
+
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+
+    # The receipts do not move. Only the reading of them does, in the memory that owns the
+    # terms this profile commits to.
+    relearned = []
+    original = chain.load_signer
+
+    def relearn_then_load(*args, **kwargs):
+        if not relearned:
+            relearned.append(True)
+            store_for("buyer").memory.set_entity(
+                DIMENSION_CATEGORY, "abandoned_after_accepting", reading(0.9).body(),
+                status="active",
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(chain, "load_signer", relearn_then_load)
+
+    with pytest.raises(RuntimeError, match="disagree about 'profiles'"):
+        main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
+
+    ledger = chain.TransactionLedger(Path(os.environ["WRASSE_TX_DB"]))
+    assert ledger.rows() == [], "terms nobody can reproduce must not reach a signature"
+
+
+def test_both_memories_are_held_until_the_bytes_exist(rehearsal, capsys, monkeypatch):
+    """Checking provenance and then releasing is still a snapshot.
+
+    A reconciliation waiting on the lock ingests the moment it is freed and finishes while
+    this observes chain time, asks the contract for its own hash and builds the transaction.
+    "Immediately before signing" has to mean the memories cannot move in between.
+    """
+
+    import fcntl
+
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+
+    observed = {}
+    original = chain.sign_transaction
+
+    def watch(*args, **kwargs):
+        observed["open"] = sorted(
+            path.name for path in Path(rehearsal["tmp"]).glob("*-memory.db.lock")
+            if _unlocked(path)
+        )
+        return original(*args, **kwargs)
+
+    def _unlocked(path: Path) -> bool:
+        with open(path, "w") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            return True
+
+    monkeypatch.setattr(chain, "sign_transaction", watch)
+    assert main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"]) == 0
+    capsys.readouterr()
+
+    assert observed["open"] == [], (
+        f"a memory could be written while the transaction was being signed: {observed['open']}"
+    )
+
+
+def test_a_fixture_relabelled_as_a_live_quote_is_refused(rehearsal, capsys, monkeypatch):
+    """`executability` is the label a reader trusts, and memory cannot rebuild it.
+
+    It records what a past run saw, so nothing in the two stores can confirm or deny it. A
+    document that says it was judged against the latest Base block is therefore checked
+    against the thing it describes: a block number and timestamp the chain does not agree with
+    never came from the chain.
+    """
+
+    output = rehearsal["tmp"] / "fixture.json"
+    assert main([
+        "policy", PROVIDER, "--buyer", rehearsal["buyer"].address,
+        "--accept-by", "1900000000", "--reference-timestamp", "1899990000",
+        "--output", str(output),
+    ]) == 0
+    capsys.readouterr()
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+
+    body = json.loads(output.read_text())
+    assert body["executability"]["basis"] == "supplied-reference"
+
+    from wrasse.policy_document import _NOTES
+
+    live_note = next(note for note in _NOTES if "latest observed Base block" in note)
+    body["executability"] = {
+        "basis": "chain-observation",
+        "reference_timestamp": body["executability"]["reference_timestamp"],
+        "chain": {"chain_id": CHAIN_ID, "block_number": 1, "block_timestamp": 1_899_990_000},
+        "inclusion_margin_seconds": 45,
+        "observed_lag_seconds": 0,
+        "executable": True,
+        "note": live_note,
+    }
+    output.write_text(json.dumps(body))
+
+    with pytest.raises(RuntimeError, match="did not happen|cannot be read"):
+        main(["create-deal", "--policy", str(output), "--profile", "urgent"])
+
+
+def test_an_executability_note_this_build_never_wrote_is_refused(rehearsal, capsys):
+    """The sentence a reader is given is a closed set, not free text."""
+
+    from wrasse.policy_document import PolicyDocumentError, load_policy
+
+    output = _quote(rehearsal, capsys)
+    body = json.loads(output.read_text())
+    body["executability"]["note"] = "LIVE-CHECKED ON BASE"
+    output.write_text(json.dumps(body))
+
+    with pytest.raises(PolicyDocumentError, match="not one this build writes"):
+        load_policy(
+            output, profile="urgent", chain_id=CHAIN_ID,
+            contract_address=rehearsal["address"], buyer=rehearsal["buyer"].address,
+            provider=PROVIDER,
+        )

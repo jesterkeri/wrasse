@@ -106,7 +106,7 @@ same comparison, but reporting is not enough on the path that moves money: a con
 implement one matching pure function and still make `createDeal` do something else.
 
 It also **derives both sides' terms again, from the two memories, and refuses a document it
-cannot reproduce.** `policy.json` is checked against itself first, and everything in it agrees
+cannot reproduce**, with both memories held from that check until the signed bytes exist. `policy.json` is checked against itself first, and everything in it agrees
 with everything else by construction: the displayed price matches the preimage, the preimage
 hashes to the quoted commitment, and that commitment is what the deployed contract would
 compute. None of that says where the numbers came from. The commitment is a public unkeyed
@@ -114,7 +114,10 @@ hash of the document's own fields, so an edit applied consistently and re-hashed
 file in which nothing disagrees with anything, funding a price no memory ever produced.
 Consistency is not provenance. The quote is therefore rebuilt from the stores at signing time
 and the document is accepted only if this machine reaches the same numbers, recalled evidence
-included.
+included. The one part that cannot be rebuilt is `executability`, which records what the
+quoting run observed rather than anything memory holds: that is checked against the chain
+instead, by reading the block it names and comparing the timestamp, so a fixture cannot be
+relabelled as a live quote.
 
 The baselines it rebuilds against are its own arguments rather than fields of the document,
 because a baseline read out of the file would be one more number an editor gets to choose. So

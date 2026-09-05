@@ -130,8 +130,16 @@ class _Row:
 
 
 @pytest.fixture(autouse=True)
-def _skip_integrity(monkeypatch):
-    """Row integrity has its own suite; here the ledger row is a stand-in."""
+def _skip_integrity(request, monkeypatch):
+    """Row integrity has its own suite; here the ledger row is a stand-in.
+
+    Opt out with `@pytest.mark.real_integrity` where the point is that reconciliation calls
+    it. Proving the helper works is a different claim from proving this path invokes it, and
+    a blanket patch meant deleting the production call changed no test at all.
+    """
+
+    if "real_integrity" in request.keywords:
+        return
     monkeypatch.setattr(chain, "verify_row_integrity", lambda row: None)
 
 
@@ -263,3 +271,47 @@ def test_an_unreadable_block_stops_rather_than_assuming_it_is_canonical():
     web3.eth.get_block = unavailable
     with pytest.raises(ChainVerificationError, match="still canonical"):
         _verify(web3)
+
+
+@pytest.mark.real_integrity
+def test_a_row_whose_bytes_do_not_match_its_claims_cannot_become_memory():
+    """Reconciliation has to invoke the integrity check, not merely be near it.
+
+    The ledger row is what says this build sent the transaction. A row whose recorded signed
+    bytes do not hash to the transaction it names is not evidence that anything was sent, and
+    memory built on it would be memory of somebody else's transaction.
+    """
+
+    corrupt = chain.LedgerRow(
+        chain_id=CHAIN_ID,
+        wallet=BUYER,
+        contract_address=CONTRACT,
+        intent_id="deal:0:claimTimeout",
+        nonce=0,
+        calldata="0x",
+        value_wei=0,
+        max_fee_wei=1,
+        max_priority_wei=1,
+        gas_limit=21_000,
+        accept_by=0,
+        preimage={},
+        tx_hash=TX,
+        raw="0x02f8",  # not a transaction, and certainly not the one named above
+        status=chain.CONFIRMED_SUCCESS,
+        block_number=BLOCK,
+        block_hash=BLOCK_HASH,
+        attempts=1,
+        last_error=None,
+        created_at="2026-09-05T00:00:00+00:00",
+        updated_at="2026-09-05T00:00:00+00:00",
+    )
+
+    class Corrupted(FakeLedger):
+        def find_by_tx_hash(self, *, chain_id, tx_hash):
+            return corrupt
+
+    with pytest.raises(Exception) as raised:
+        _verify(FakeWeb3(logs=[_timeout_log()]), Corrupted())
+    assert not isinstance(raised.value, ChainVerificationError) or "integrity" in str(raised.value), (
+        f"the row was accepted or refused for the wrong reason: {raised.value}"
+    )

@@ -68,6 +68,14 @@ _EXECUTABILITY_KEYS = {
 }
 _CHAIN_KEYS = {"chain_id", "block_number", "block_timestamp"}
 
+#: The two sentences this build writes about what an executability check was worth. A closed
+#: set, because it is the line a reader trusts to know whether any of this was held against a
+#: chain, and free text there is a place to write something flattering.
+_NOTES = {
+    'Judged against a supplied time, not against Base. Reproducible, but not a live quote: re-derive the deadline from chain time before signing.',
+    "Judged against the latest observed Base block, with an inclusion margin that already absorbs the node's observed lag. Re-validate immediately before signing; inclusion time is not guaranteed.",
+}
+
 _PREIMAGE_KEYS = {
     "buyer",
     "provider",
@@ -308,12 +316,26 @@ def _check_executability(executability: Any) -> None:
         raise PolicyDocumentError(f"executability basis {basis!r} is not one this build writes")
 
     live = basis == "chain-observation"
+    if executability["note"] not in _NOTES:
+        raise PolicyDocumentError(
+            "the executability note is not one this build writes. It is the sentence a reader "
+            "is given about whether any of this was checked against a chain, so it is a closed "
+            "set rather than free text."
+        )
     if executability["executable"] is not live:
         raise PolicyDocumentError(
             f"a {basis} quote cannot be marked executable={executability['executable']}"
         )
     if live:
-        _exact_keys(executability["chain"], _CHAIN_KEYS, "the observed chain")
+        chain = _exact_keys(executability["chain"], _CHAIN_KEYS, "the observed chain")
+        # The nested fields too. Checking the key set and leaving the values alone let a
+        # document carry a string block number and a null timestamp under a label claiming
+        # they came off Base.
+        _bounded_int(chain["chain_id"], "the observed chain_id", low=1, high=2**64 - 1)
+        _bounded_int(chain["block_number"], "the observed block_number", low=0, high=2**64 - 1)
+        _bounded_int(
+            chain["block_timestamp"], "the observed block_timestamp", low=0, high=2**64 - 1
+        )
         for field in ("inclusion_margin_seconds", "observed_lag_seconds"):
             _bounded_int(executability[field], field, low=0, high=2**32)
     elif executability["chain"] is not None:

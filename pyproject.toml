@@ -27,6 +27,9 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "real_integrity: run with the production ledger-integrity check in place",
+]
 
 [tool.coverage.run]
 branch = true

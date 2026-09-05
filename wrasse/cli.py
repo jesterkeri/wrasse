@@ -233,6 +233,60 @@ def _same_address(left: str, right: str) -> bool:
     return Web3.to_checksum_address(left) == Web3.to_checksum_address(right)
 
 
+def _require_observation_happened(web3, document: dict[str, Any], *, chain_id: int, where) -> None:
+    """A quote claiming it was checked against Base has to have been.
+
+    `executability` is the label a reader trusts to know whether any of this was ever held
+    against a chain, and it is the one part of the document memory cannot rebuild: it records
+    what a past run saw. So it is checked against the thing it describes instead. A block
+    number and timestamp that Base does not agree with never came from Base.
+
+    A supplied-reference quote is honest about being a fixture and needs no such check. What
+    this stops is a fixture relabelled as a live quote.
+    """
+
+    executability = document["executability"]
+    if executability["basis"] != "chain-observation":
+        return
+
+    observed = executability["chain"]
+    if observed.get("chain_id") != chain_id:
+        raise RuntimeError(
+            f"{where} claims a live observation of chain {observed.get('chain_id')}, but this "
+            f"run is on chain {chain_id}"
+        )
+    number, timestamp = observed.get("block_number"), observed.get("block_timestamp")
+    for name, value in (("block_number", number), ("block_timestamp", timestamp)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"{where} records {name}={value!r}, which is not a block {name}")
+
+    try:
+        block = web3.eth.get_block(number)
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError(
+            f"{where} claims block {number} was observed on this chain, and it cannot be read: "
+            f"{error}"
+        ) from error
+    actual = int(block["timestamp"] if isinstance(block, dict) else block.timestamp)
+    if actual != timestamp:
+        raise RuntimeError(
+            f"{where} says block {number} carried timestamp {timestamp}, and the chain says "
+            f"{actual}. That observation did not happen, so the quote is a fixture wearing the "
+            "label of a live one."
+        )
+
+
+def _canonical(value: Any) -> str:
+    """Compare by encoding, because Python's equality is looser than JSON's types.
+
+    `True == 1` and `1.0 == 1` in Python, so a receipt whose `deal_id` was rewritten from `1`
+    to `true` compared equal to the body actually held in memory. The document is JSON and the
+    reader sees JSON, so the comparison is over what JSON says these are.
+    """
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _document_halves(
     quote: "BilateralQuote",
     *,
@@ -393,20 +447,26 @@ def _bilateral_quote(
                 "before quoting rather than pricing across the gap."
             )
 
-    # Each side reads its own ontology. They tend to agree, because both were shown the same
-    # public receipts, and that is different from sharing one database. A provider reading the
-    # buyer's dimensions would not be an independently held memory.
-    dimensions = {side: load_dimensions(stores[side].memory) for side in recall}
-    for side, recalled in recall.items():
-        missing = sorted({
-            event["event_type"]
-            for event in recalled.evidence
-            if not any(d.source_event_type == event["event_type"] for d in dimensions[side])
-        })
-        if missing:
-            raise RuntimeError(
-                f"the {side} holds verified events with no dimension yet: {missing}"
-            )
+        # The ontology is read inside the same snapshot. Releasing here and reading it after
+        # would leave a quote whose receipts came from one moment and whose readings of them
+        # came from another: a `learn-dimension --relearn` landing in between changes what a
+        # receipt is worth without changing which receipts exist, and every check that watches
+        # the evidence would see nothing move.
+        #
+        # Each side reads its own ontology. They tend to agree, because both were shown the
+        # same public receipts, and that is different from sharing one database. A provider
+        # reading the buyer's dimensions would not be an independently held memory.
+        dimensions = {side: load_dimensions(stores[side].memory) for side in recall}
+        for side, recalled in recall.items():
+            missing = sorted({
+                event["event_type"]
+                for event in recalled.evidence
+                if not any(d.source_event_type == event["event_type"] for d in dimensions[side])
+            })
+            if missing:
+                raise RuntimeError(
+                    f"the {side} holds verified events with no dimension yet: {missing}"
+                )
 
     provider_terms = produce_provider_terms(
         evidence=recall["provider"].evidence,
@@ -786,8 +846,13 @@ def _require_document_came_from_memory(
     reason beside a genuine transaction is the failure this entry exists to rule out.
 
     `every_profile` is false only for the recheck immediately before signing, where the
-    question is narrower: has memory moved since the document was written. Any movement
-    changes the recalled evidence, which is compared either way.
+    question is narrower: the profiles nobody chose cannot reach the signature, so re-deriving
+    all three at that moment would spend time the deadline check has already accounted for.
+    **The selected profile is still compared in full.** Dropping every profile there, on the
+    reasoning that any memory movement shows up in the recalled evidence, was wrong: a
+    `learn-dimension --relearn` changes what a receipt is worth without changing which
+    receipts exist, so the bond and window moved while everything being compared stayed
+    identical, and the old terms were signed.
     """
 
     wanted = None if every_profile else (policy.profile,)
@@ -814,23 +879,29 @@ def _require_document_came_from_memory(
     for side in ("buyer", "provider"):
         written = dict(policy.document[side])
         derived = dict(rebuilt[side])
-        if not every_profile:
-            written.pop("profiles", None)
-            derived.pop("profiles", None)
-        elif side == "buyer" and set(written.get("profiles", {})) != set(derived["profiles"]):
-            raise RuntimeError(
-                f"{args.policy} offers profiles {sorted(written.get('profiles', {}))}, and "
-                f"quoting from these two memories produces {sorted(derived['profiles'])}. A "
-                "document may not add, drop or rename the choices a reader is given."
-            )
+        if "profiles" in derived:
+            offered = written.get("profiles")
+            if not isinstance(offered, dict):
+                raise RuntimeError(f"{args.policy} has no readable {side} profiles")
+            if every_profile and set(offered) != set(derived["profiles"]):
+                raise RuntimeError(
+                    f"{args.policy} offers profiles {sorted(offered)}, and quoting from these "
+                    f"two memories produces {sorted(derived['profiles'])}. A document may not "
+                    "add, drop or rename the choices a reader is given."
+                )
+            # Narrowed to the one that can reach a signature, never emptied.
+            written["profiles"] = {
+                name: body for name, body in offered.items() if name in derived["profiles"]
+            }
+
         for field in sorted(derived):
-            if written.get(field) != derived[field]:
+            if _canonical(written.get(field)) != _canonical(derived[field]):
                 raise RuntimeError(
                     f"{args.policy} and the {side} memory disagree about {field!r}. Refusing "
                     "to sign against a document this build cannot reproduce. Either it was "
-                    "edited, or a receipt has been reconciled since it was written, or the "
-                    "baselines differ from the ones it was produced with: re-run `policy` "
-                    "with the same arguments and use the document it writes."
+                    "edited, or memory has moved since it was written, or the baselines differ "
+                    "from the ones it was produced with: re-run `policy` with the same "
+                    "arguments and use the document it writes."
                 )
 
 
@@ -895,6 +966,7 @@ def _create_deal(args) -> int:
     _require_document_came_from_memory(
         policy, stores=stores, buyer=buyer, provider=provider, args=args
     )
+    _require_observation_happened(web3, policy.document, chain_id=chain_id, where=args.policy)
 
     _require_deployment_identity(web3, address, _deployment_record())
 
@@ -945,7 +1017,23 @@ def _create_deal(args) -> int:
 
         This is the last moment the deadline can be judged, so it is judged here rather than
         before gas estimation, which can take long enough to eat the margin.
+
+        **Both memories are held for the whole of it.** Checking provenance and then releasing
+        was still a snapshot: a `reconcile` waiting on the lock could ingest the moment it was
+        freed and finish while this observed chain time, asked the contract for its own hash
+        and built the transaction, and the signature would then commit terms neither store
+        produces. "Immediately before signing" has to mean the memories cannot move in
+        between, which means holding them until the bytes exist.
+
+        Lock order is the ledger's write transaction first, then the two stores. Nothing takes
+        a store lock and then writes the ledger: `reconcile` reads the ledger before it
+        touches either store.
         """
+
+        with _both_locked(stores):
+            return _sign_under_memory(nonce)
+
+    def _sign_under_memory(nonce: int) -> chain.SignedIntent:
 
         # Provenance again, here rather than only above. The earlier call is a fast refusal
         # for an edited file; it is not a binding between the memories and the signature. A
