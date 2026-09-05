@@ -21,6 +21,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -135,36 +136,54 @@ class WrasseStore:
         self._memory = memory
         self.identity = identity
         self._lock_path = lock
-        self._held = 0
+        #: Recursion is a property of the *caller*, not of the object. A counter on the object
+        #: says "somebody holds this", which a second thread then reads as "I hold this" and
+        #: walks straight into the section the lock exists to protect. An `RLock` answers the
+        #: question actually being asked, which is whether *this* thread already owns it.
+        self._guard = threading.RLock()
+        self._depth = 0
+
+    @contextmanager
+    def lock(self) -> Iterator[None]:
+        """Public form of the write lock, for a caller that needs two stores at once."""
+
+        with self._exclusive():
+            yield
 
     @contextmanager
     def _exclusive(self) -> Iterator[None]:
-        """Serialise every read-modify-write on this store, across processes.
+        """Serialise every read-modify-write on this store, in this process and across them.
 
         The index entry is a read-modify-write and the SDK offers no transaction, so two
         concurrent writers would otherwise lose one another's ids. The transaction ledger gets
         this from SQLite's own write lock; here there is nothing to borrow, so it takes an OS
         lock. POSIX only, which is where this runs.
 
-        Re-entrant within a process, because `flock` on a second descriptor for the same file
-        blocks against the first. Without the counter, a repair that finished a pending ingest
-        would deadlock against itself, and the fix for that would be to leave one of the two
-        unlocked, which is the defect this exists to remove.
+        Two locks, because they answer different questions. `flock` excludes other *processes*
+        and is per open file description, so a second `open` of the same path contends. It does
+        not exclude other threads of this process, and it cannot be taken twice here without
+        blocking against itself. The `RLock` therefore excludes threads and permits the same
+        thread to recurse, and the file lock is taken only on the outermost entry that thread
+        makes.
         """
 
-        if self._lock_path is None or self._held:
-            self._held += 1
-            try:
-                yield
-            finally:
-                self._held -= 1
-            return
-        with _file_lock(self._lock_path):
-            self._held += 1
-            try:
-                yield
-            finally:
-                self._held -= 1
+        with self._guard:
+            # The guard is held across the yield, so no other thread is inside at all, and
+            # `_depth` is therefore only ever nonzero for the thread that owns it. That makes
+            # it an honest answer to "am I already in here" rather than "is somebody".
+            if self._lock_path is None or self._depth:
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
+                return
+            with _file_lock(self._lock_path):
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
 
     # -- opening --------------------------------------------------------------------------
 
@@ -185,7 +204,9 @@ class WrasseStore:
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        lock = path.with_suffix(path.suffix + ".lock")
+        # Resolved first. Two names for one database, a symlink or a relative path, would
+        # otherwise derive two different lock files and exclude nothing at all.
+        lock = path.resolve().with_suffix(path.suffix + ".lock")
         wanted = StoreIdentity(
             schema_version=STORE_SCHEMA_VERSION,
             role=role,
@@ -237,12 +258,15 @@ class WrasseStore:
         if not isinstance(body, dict):
             raise StoreError(f"{path} carries an identity with no readable body")
         expected_fields = set(wanted.body()) | {"created_at"}
-        unknown = sorted(set(body) - expected_fields)
-        if unknown:
+        if set(body) != expected_fields:
+            unknown = sorted(set(body) - expected_fields)
+            missing = sorted(expected_fields - set(body))
             raise StoreError(
-                f"{path} carries an identity with fields this build does not write: "
-                f"{', '.join(unknown)}"
+                f"{path} carries an identity that is not the shape this build writes. "
+                f"Unexpected: {unknown or 'none'}. Missing: {missing or 'none'}."
             )
+        if not isinstance(body.get("created_at"), str) or not body["created_at"]:
+            raise StoreError(f"{path} carries an identity with no readable created_at")
         for field, expected in wanted.body().items():
             if body.get(field) != expected:
                 raise StoreError(
@@ -508,6 +532,34 @@ class WrasseStore:
         else:
             verdict = "empty_store"
         return Recall(counterparty, self.identity.role, tuple(evidence), verdict)
+
+    def verified_event(self, identifier: str) -> dict[str, Any]:
+        """One receipt, resolved exactly and validated the way the pricing path validates.
+
+        Learning an ontology from a row the pricing path would refuse is the same defect as
+        pricing against it, one step earlier: the definition it produces is written as active
+        and then moves real terms the moment a genuine receipt of that type is recalled. So the
+        two paths share one notion of what counts as a receipt.
+        """
+
+        with self._exclusive():
+            try:
+                row = self._memory.get_entity(CHAIN_EVENT_CATEGORY, identifier)
+            except NotFoundError:
+                raise EvidenceRejected(f"{identifier} is not in the {self.identity.role} memory") from None
+            except SibylMemoryError as error:
+                raise MemoryRequired("Sibyl Memory is required") from error
+
+        body = row.get("body")
+        if not isinstance(body, dict):
+            raise EvidenceRejected(f"{identifier} has no readable body")
+        counterparty = self.counterparty_of(body)
+        if counterparty is None:
+            raise EvidenceRejected(
+                f"{identifier} does not name {self.identity.owner_address} as the "
+                f"{self.identity.role}, so this memory is not entitled to learn from it"
+            )
+        return self._validated(row, identifier, counterparty)
 
     def indexed_event_ids(self, counterparty: str) -> tuple[str, ...]:
         """What this store believes it holds about a relationship, before validating any of it.

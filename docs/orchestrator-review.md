@@ -92,15 +92,12 @@ retry only what a retry could fix.
 The model no longer decides which way an outcome points, and no longer sees a stored record.
 Both changes came from a live call that read a provider's non-delivery as positive.
 
-**Narrowed and deferred to Gate 7.** Schema 2 checks that the displayed economic terms match
-the committed ones, that used evidence is held, that the persona commitment is a digest, that
-risk is a bounded decimal, and that a side's verdict, cold-start flag and evidence agree. It
-does **not** yet verify each recalled evidence body against the store it came from. An edited
-document could therefore keep the genuine ids and the real signed preimage while showing an
-invented description of a receipt. Funds still follow the committed terms, so this cannot
-misdirect money; it can misdescribe a reason. Gate 7 rebuilds this document for the negotiation
-receipt and folds body verification then. **Until it does, schema 2 should be described as
-validating the terms rather than the whole explanation.**
+**~~Narrowed and deferred to Gate 7.~~ SUPERSEDED, see round two and round three below.**
+Schema 2's own checks are all internal: displayed terms against committed ones, used evidence
+against recalled, a digest-shaped persona, a bounded risk, agreement between verdict,
+cold-start flag and evidence. None of that establishes where any of it came from, which is the
+question that matters. It is now settled at the signing boundary instead, by rebuilding both
+halves of the document from the two memories, so nothing here is deferred to Gate 7 any more.
 
 
 ## Gates 5 and 6, round two
@@ -146,3 +143,48 @@ row no block metadata at all; they now carry it.
 **The persona precedence check ran outside the lock its claim depends on**, so a receipt
 landing between the check and the write would leave a record claiming a precedence it did not
 have. Now under the same lock, with the existing entity's status and shape validated.
+
+
+## Gates 5 and 6, round three
+
+Two CRITICAL, four MAJOR, two MINOR. All eight fixed. Two of them were defects I had already
+claimed to fix, which is the useful part of the round.
+
+**Comparing two snapshots is not taking one.** The bilateral agreement check read the buyer,
+released its lock, read the provider, and compared. That catches a receipt landing in the
+provider in between and misses the same receipt landing in the buyer, because both returned
+sets are then the old one and they agree. The test written for it injected into the side not
+yet read, so reversing the injection made the property vanish without failing the test. Both
+memories are now held, in a fixed order by lock path, across both recalls and the comparison.
+
+**Provenance at one instant is not a binding.** The rebuild-from-memory check ran, and then the
+command decrypted a keystore, read the deployment, observed chain time, estimated gas and read
+fees. A `reconcile` landing a newly confirmed receipt in that window meant the signature
+committed terms the memories no longer produced, and the operator saw a success rather than
+the promised refusal. The check now runs again as the last thing before signing.
+
+**A lock on the object is not a lock for the caller.** `_exclusive` counted depth on the store,
+so while one thread held the file lock a second thread read that counter as its own
+re-entrancy and walked in. The round-two repair and ingest interleaving came straight back
+through it. Threads are now excluded by an `RLock` held across the whole section, and the file
+lock is taken on the outermost entry that thread makes. The lock path is resolved first, so
+two names for one database cannot take two different locks.
+
+**Learning was neither serialised nor validated.** The lock was released before the model call
+and the write took a fresh one without re-reading, so two learners could leave two active rows
+and `load_dimensions` would then refuse every quote: the command meant to make a store
+quoteable was able to stop it quoting. `--relearn` retired only the first of them, so it could
+not repair what it caused. And the event it learned from was fetched raw from whichever store
+answered first, without status, id recomputation or participants checked, so an unverified row
+could choose the template sent to the model. All active rows are now retired and re-checked
+under the write lock, and the receipt goes through the same fail-closed validation the pricing
+path uses, from both memories.
+
+**The rebuild covered the terms, not the explanation.** Risk scores, the persona block and the
+profiles nobody selected were outside it, so an invented reason could still stand beside a
+genuine transaction. Both halves of the document are now rebuilt whole from memory and
+compared, including the exact set of profiles offered.
+
+**The identity validator did not require the field that dates it.** And the read budget was 15
+seconds where three twenty second attempts were permitted, a number describing an intention
+rather than the code. It is derived now, and no attempt is begun without room to pay for it.

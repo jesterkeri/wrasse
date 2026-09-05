@@ -554,5 +554,54 @@ def test_an_identity_carrying_fields_this_build_never_wrote_is_refused(tmp_path)
     body["also_provider"] = True
     store.memory.set_entity(IDENTITY_CATEGORY, "self", body, status="verified")
 
-    with pytest.raises(StoreError, match="fields this build does not write"):
+    with pytest.raises(StoreError, match="not the shape this build writes"):
         _open(tmp_path, "buyer", BUYER, "buyer.db")
+
+
+def test_an_identity_missing_the_field_that_dates_it_is_refused(tmp_path):
+    """Exactly this build's shape means exactly, not "at least the parts we look at"."""
+
+    store = _open(tmp_path, "buyer", BUYER, "buyer.db")
+    body = dict(store.memory.get_entity(IDENTITY_CATEGORY, "self")["body"])
+    body.pop("created_at")
+    store.memory.set_entity(IDENTITY_CATEGORY, "self", body, status="verified")
+
+    with pytest.raises(StoreError, match="Missing: \\['created_at'\\]"):
+        _open(tmp_path, "buyer", BUYER, "buyer.db")
+
+
+def test_a_second_thread_cannot_walk_into_a_held_store(tmp_path):
+    """Recursion is a property of the caller, never of the object.
+
+    A counter on the store answers "is somebody inside", and a second thread reads that as
+    "I am inside" and enters the section the lock exists to protect. That is how the repair
+    and ingest interleaving came back after the file lock was added: both were locked, and
+    neither lock excluded the other thread.
+    """
+
+    import threading
+
+    store = _open(tmp_path, "buyer", BUYER, "buyer.db")
+    inside = threading.Event()
+    release = threading.Event()
+    overlapped = []
+
+    def hold():
+        with store._exclusive():
+            inside.set()
+            release.wait(5)
+
+    def intrude():
+        inside.wait(5)
+        with store._exclusive():
+            overlapped.append(release.is_set())
+
+    holder, intruder = threading.Thread(target=hold), threading.Thread(target=intrude)
+    holder.start()
+    intruder.start()
+    inside.wait(5)
+    release.set()
+    holder.join(5)
+    intruder.join(5)
+
+    assert overlapped == [True], "a second thread entered while the first still held the store"

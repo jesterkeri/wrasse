@@ -781,7 +781,7 @@ def test_a_forged_price_that_agrees_with_itself_is_still_not_signed(rehearsal, c
     )
     assert validated.price_wei == ninefold
 
-    with pytest.raises(RuntimeError, match="commits price_wei=900000000000000"):
+    with pytest.raises(RuntimeError, match="disagree about 'profiles'"):
         main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
 
     ledger = chain.TransactionLedger(Path(os.environ["WRASSE_TX_DB"]))
@@ -810,56 +810,165 @@ def test_a_forged_reason_beside_a_genuine_price_is_refused(rehearsal, capsys, mo
 
     _forge(policy_path, invent_a_reason)
 
-    with pytest.raises(RuntimeError, match="does not describe the same way"):
+    with pytest.raises(RuntimeError, match="disagree about 'cold_start'"):
         main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
 
 
-def test_a_receipt_landing_between_the_two_recalls_is_caught(rehearsal, capsys, monkeypatch):
-    """Comparing the two indexes before reading them is a different question from what was read.
+def test_neither_memory_can_change_between_the_two_recalls(rehearsal, capsys, monkeypatch):
+    """Comparing two sequential snapshots cannot establish a common one.
 
-    Both indexes can be equal at the moment they are compared, and an ingest finishing a
-    moment later leaves one side pricing on a receipt the other has not seen. The document
-    would look complete on both halves. The comparison therefore has to be over what the terms
-    were actually computed from, not over what the stores looked like beforehand.
+    Reading the buyer, releasing it, then reading the provider catches a receipt that lands in
+    the provider in between and misses the same receipt landing in the buyer: both returned
+    sets are then the old one, they agree, and the quote proceeds on a history the code
+    already knows has reached only one memory. One ordering of a race is not a check.
+
+    So the property is not "we compare afterwards", it is that no writer can be inside either
+    memory while the quote reads them. `flock` is per open file description, so a second
+    `open` contends exactly as another process would.
+    """
+
+    import fcntl
+
+    from wrasse.store import WrasseStore
+
+    observed = {}
+    original = WrasseStore.recall
+
+    def watch(self, counterparty):
+        if self.identity.role == "buyer":
+            observed["between"] = sorted(
+                path.name for path in Path(rehearsal["tmp"]).glob("*-memory.db.lock")
+                if _can_lock(path)
+            )
+        return original(self, counterparty)
+
+    def _can_lock(path: Path) -> bool:
+        with open(path, "w") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            return True
+
+    monkeypatch.setattr(WrasseStore, "recall", watch)
+    assert main([
+        "policy", PROVIDER, "--buyer", rehearsal["buyer"].address, "--accept-window", "600",
+        "--output", str(rehearsal["tmp"] / "snapshot.json"),
+    ]) == 0
+    capsys.readouterr()
+
+    assert observed["between"] == [], (
+        "a memory was open to writers while the quote was reading the other one, so the two "
+        f"halves could be priced on different histories: {observed['between']}"
+    )
+
+
+def test_a_receipt_arriving_before_the_signature_stops_it(rehearsal, capsys, monkeypatch):
+    """Provenance at one instant is not a binding between memory and a signature.
+
+    Between the check and the signing callback this command decrypts a keystore, reads the
+    deployment, observes chain time, estimates gas and reads fees and balance. A `reconcile`
+    running alongside it can land a newly confirmed receipt in both memories inside that
+    window, and the terms would be signed against a history that had already moved. The
+    operator would see a successful transaction rather than the refusal they were promised.
     """
 
     from wrasse.evidence import ChainEvent
     from wrasse.store import WrasseStore
 
-    address = rehearsal["address"]
-    buyer = rehearsal["buyer"].address
-    late = ChainEvent(
+    from wrasse.dimensions import DIMENSION_CATEGORY, DimensionDefinition
+
+    address, buyer = rehearsal["address"], rehearsal["buyer"].address
+    reading = DimensionDefinition(
+        dimension_id="abandoned_after_accepting",
+        source_event_type="timeout_claimed_without_delivery",
+        signal_direction="negative",
+        severity=0.8,
+        confidence=0.9,
+        applies_when=("deadline_sensitive",),
+    )
+    for role, path, owner in (
+        ("buyer", os.environ["WRASSE_BUYER_MEMORY_PATH"], buyer),
+        ("provider", os.environ["WRASSE_PROVIDER_MEMORY_PATH"], PROVIDER),
+    ):
+        WrasseStore.open(
+            path, role=role, owner_address=owner, chain_id=CHAIN_ID, escrow_address=address,
+        ).memory.set_entity(
+            DIMENSION_CATEGORY, reading.dimension_id, reading.body(), status="active"
+        )
+
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    arriving = ChainEvent(
         chain_id=CHAIN_ID,
         contract_address=address,
-        tx_hash="0x" + "e1" * 32,
+        tx_hash="0x" + "f1" * 32,
         log_index=0,
         block_number=1,
         event_type="timeout_claimed_without_delivery",
-        deal_id=99,
+        deal_id=41,
         buyer=buyer,
         provider=PROVIDER,
-        observed_at="2026-09-04T00:00:00+00:00",
+        observed_at="2026-09-05T00:00:00+00:00",
     )
 
-    original = WrasseStore.recall
+    # Land it in both memories after the first check has passed, the way a separate
+    # reconciliation would. Both stores stay in agreement, so this is not the disagreement
+    # refusal: it is a history that legitimately moved.
     landed = []
+    original = chain.load_signer
 
-    def recall_then_deliver(self, counterparty):
-        """Let the buyer read, then let a reconciliation finish before the provider reads."""
-        result = original(self, counterparty)
-        if self.identity.role == "buyer" and not landed:
+    def deliver_then_load(*args, **kwargs):
+        if not landed:
             landed.append(True)
-            provider = WrasseStore.open(
-                os.environ["WRASSE_PROVIDER_MEMORY_PATH"], role="provider",
-                owner_address=PROVIDER, chain_id=CHAIN_ID, escrow_address=address,
-            )
-            provider.ingest(late)
-        return result
+            for role, path, owner in (
+                ("buyer", os.environ["WRASSE_BUYER_MEMORY_PATH"], buyer),
+                ("provider", os.environ["WRASSE_PROVIDER_MEMORY_PATH"], PROVIDER),
+            ):
+                WrasseStore.open(
+                    path, role=role, owner_address=owner,
+                    chain_id=CHAIN_ID, escrow_address=address,
+                ).ingest(arriving)
+        return original(*args, **kwargs)
 
-    monkeypatch.setattr(WrasseStore, "recall", recall_then_deliver)
+    monkeypatch.setattr(chain, "load_signer", deliver_then_load)
 
-    with pytest.raises(RuntimeError, match="disagree about what happened"):
-        main([
-            "policy", PROVIDER, "--buyer", buyer, "--accept-window", "600",
-            "--output", str(rehearsal["tmp"] / "raced.json"),
-        ])
+    with pytest.raises(RuntimeError, match="a receipt has been reconciled since"):
+        main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
+
+    ledger = chain.TransactionLedger(Path(os.environ["WRASSE_TX_DB"]))
+    assert ledger.rows() == [], "nothing may be signed once the terms are known to be stale"
+
+
+@pytest.mark.parametrize(
+    "field,edit",
+    [
+        ("risk", lambda body: body["buyer"]["profiles"]["urgent"]["terms"].update({"risk": "0.9900"})),
+        ("persona name", lambda body: body["provider"]["persona"].update({"name": "someone else"})),
+        ("persona commitment", lambda body: body["provider"]["persona"].update(
+            {"commitment": "b" * 64})),
+        ("an unselected profile", lambda body: (
+            body["buyer"]["profiles"]["budget"]["terms"].update({"provider_bond_bps": 9_000}),
+            body["buyer"]["profiles"]["budget"]["policy_preimage"].update({"bond_bps": 9_000}),
+        )),
+        ("the set of profiles", lambda body: body["buyer"]["profiles"].pop("budget")),
+    ],
+)
+def test_the_whole_explanation_is_checked_not_only_the_signed_terms(
+    rehearsal, capsys, monkeypatch, field, edit
+):
+    """The money follows the committed terms; the judge reads everything else.
+
+    A risk score, a persona, or the profile a reader was not shown are not covered by the
+    signature, so a validator that checks only the selected economics leaves an invented
+    account of the deal beside a genuine transaction. That is the explainability claim
+    failing, even though nothing was misdirected.
+    """
+
+    policy_path = _quote(rehearsal, capsys)
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    _forge(policy_path, edit)
+
+    with pytest.raises(RuntimeError, match="disagree about|may not add, drop or rename"):
+        main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])

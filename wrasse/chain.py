@@ -904,11 +904,28 @@ READ_ATTEMPTS = 3
 READ_BASE_DELAY_SECONDS = 0.25
 READ_MAX_DELAY_SECONDS = 4.0
 
-#: The whole operation's patience, measured on the clock rather than in sleep. Honouring a
-#: server's own number is courteous until the number is 86400, at which point the courtesy is
-#: a hang; and a budget that counts only the waiting is no budget at all, because three calls
-#: that each stall until the provider's own timeout spend a minute without ever sleeping.
-READ_TOTAL_BUDGET_SECONDS = 15.0
+#: The per-request timeout configured on the HTTP provider. Named here because the retry
+#: budget has to reserve one of them before starting another attempt.
+READ_CALL_TIMEOUT_SECONDS = 20.0
+
+#: The retry budget, measured on the clock rather than in sleep, and **derived rather than
+#: guessed**. Honouring a server's own number is courteous until the number is 86400, at which
+#: point the courtesy is a hang; and a budget that counts only the waiting is no budget at all,
+#: because three calls that each stall until the provider's own timeout spend a minute without
+#: ever sleeping.
+#:
+#: It was 15 seconds, which no run of three twenty second attempts could ever have honoured.
+#: The number was describing an intention rather than the code. This is what the configuration
+#: actually permits: every attempt, each bounded by the provider, plus the waiting between
+#: them.
+#:
+#: **What it bounds, exactly.** No further attempt is *begun* once the elapsed time plus the
+#: wait plus one call's worth of patience would exceed it. It does not interrupt a call
+#: already running: that limit belongs to the HTTP provider, and cancelling a request
+#: mid-flight is not something a read wrapper can do safely.
+READ_TOTAL_BUDGET_SECONDS = (
+    READ_ATTEMPTS * READ_CALL_TIMEOUT_SECONDS + READ_ATTEMPTS * READ_MAX_DELAY_SECONDS
+)
 
 #: Replaced in tests. Nothing here should ever sleep for real during a suite run.
 _sleep = time.sleep
@@ -974,13 +991,18 @@ def _read(call: Callable[[], Any], *, describe: str) -> Any:
             # The clock, not the sum of the sleeps. The attempt that just failed may have sat
             # on a socket for the provider's whole timeout, and a budget blind to that would
             # let three of them run to a minute while reporting nothing spent.
+            #
+            # The next call is reserved for as well as the wait. Checking only the wait meant
+            # half a second of budget was enough to start another twenty second request, which
+            # is how a fifteen second bound became a minute.
             remaining = deadline - _monotonic()
-            if delay > remaining:
+            if delay + READ_CALL_TIMEOUT_SECONDS > remaining:
                 spent = READ_TOTAL_BUDGET_SECONDS - max(0.0, remaining)
                 raise RpcUnavailable(
                     f"{describe}: gave up {spent:.1f}s in, with {max(0.0, remaining):.1f}s of "
-                    f"the {READ_TOTAL_BUDGET_SECONDS:.0f}s budget left and "
-                    f"{named if named is not None else delay:.0f}s more to wait"
+                    f"the {READ_TOTAL_BUDGET_SECONDS:.0f}s retry budget left, "
+                    f"{named if named is not None else delay:.0f}s more to wait and no room "
+                    f"for another {READ_CALL_TIMEOUT_SECONDS:.0f}s call"
                 ) from error
             _sleep(delay)
     raise AssertionError("unreachable")

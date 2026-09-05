@@ -1240,22 +1240,54 @@ def test_a_retry_budget_bounds_the_whole_operation(monkeypatch):
 def test_the_budget_counts_a_stalled_call_and_not_only_the_waiting(monkeypatch):
     """A call that sits on a socket spends the budget without sleeping a second of it.
 
-    Counting only the backoff made the number a fiction: three attempts each stalling until
-    the provider's own twenty second timeout take a minute, and a fifteen second budget that
-    watches the sleeps sees nothing spent at all. The clock is what the caller experiences.
+    Counting only the backoff made the number a fiction: attempts that each stall until the
+    provider's timeout cost real minutes while a budget watching the sleeps sees nothing
+    spent. The clock is what the caller experiences.
     """
 
     now = [0.0]
     monkeypatch.setattr(chain, "_monotonic", lambda: now[0])
     monkeypatch.setattr(chain, "_sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    # Room for two stalled calls and not a third.
+    monkeypatch.setattr(chain, "READ_TOTAL_BUDGET_SECONDS", 45.0)
+
+    attempts = []
 
     def stalls():
-        now[0] += 20.0  # the provider's own timeout, spent without sleeping
+        attempts.append(now[0])
+        now[0] += chain.READ_CALL_TIMEOUT_SECONDS
         raise TimeoutError("read timed out")
 
-    with pytest.raises(chain.RpcUnavailable, match="budget left"):
+    with pytest.raises(chain.RpcUnavailable, match="retry budget left"):
         chain._read(stalls, describe="probe")
-    assert now[0] < 25.0, "it should stop after the first stall, not attempt three of them"
+    assert len(attempts) == 2, "the stalled calls were not counted against the budget"
+
+
+def test_an_attempt_is_not_begun_without_room_to_pay_for_it(monkeypatch):
+    """Checking only the wait let half a second of budget start a twenty second request.
+
+    That is how a fifteen second bound became a minute: three attempts, each cheap to *start*
+    and expensive to finish. The budget now reserves a call before beginning one, so what it
+    bounds is stated truthfully rather than approximately.
+    """
+
+    now = [0.0]
+    monkeypatch.setattr(chain, "_monotonic", lambda: now[0])
+    monkeypatch.setattr(chain, "_sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(chain, "READ_TOTAL_BUDGET_SECONDS", 21.0)
+
+    attempts = []
+
+    def stalls():
+        attempts.append(now[0])
+        now[0] += chain.READ_CALL_TIMEOUT_SECONDS
+        raise TimeoutError("read timed out")
+
+    with pytest.raises(chain.RpcUnavailable, match="no room for another"):
+        chain._read(stalls, describe="probe")
+    assert len(attempts) == 1, (
+        "a second call was started with less budget left than one call costs"
+    )
 
 
 def test_a_date_form_retry_after_is_understood(monkeypatch):

@@ -113,10 +113,18 @@ class ValidatedPolicy:
     provider_evidence_hash: str
     quoted_accept_by: int
     quoted_policy_hash: str
-    #: What each half of the document says it recalled, exactly as written. Carried out so the
-    #: signer can hold it against the stores. Internal consistency proves a document is not
-    #: self-contradictory; it cannot prove the numbers came from anyone's memory.
-    recalled_evidence: dict[str, tuple[dict[str, Any], ...]]
+    #: The document as written, carried out whole so the signer can hold every part of it
+    #: against the stores. Internal consistency proves a document is not self-contradictory; it
+    #: cannot prove any of it came from anyone's memory, and the half a judge reads is a
+    #: different object from the half a signature covers.
+    document: dict[str, Any]
+
+    @property
+    def recalled_evidence(self) -> dict[str, tuple[dict[str, Any], ...]]:
+        return {
+            side: tuple(self.document[side]["recalled_evidence"])
+            for side in ("buyer", "provider")
+        }
 
     @property
     def intent_id(self) -> str:
@@ -409,10 +417,7 @@ def _check_profile(
         provider_evidence_hash=preimage["provider_evidence_hash"],
         quoted_accept_by=accept_by,
         quoted_policy_hash=chosen["policy_hash"],
-        recalled_evidence={
-            "buyer": tuple(buyer_side["recalled_evidence"]),
-            "provider": tuple(document["provider"]["recalled_evidence"]),
-        },
+        document=document,
     )
 
     recomputed = policy_hash(validated.preimage_for(accept_by))
