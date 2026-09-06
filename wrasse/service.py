@@ -57,7 +57,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from sibyl_memory_client import MemoryClient
+
 from . import cli
+from .evidence import CHAIN_EVENT_CATEGORY
 from .page import page_view
 from .negotiation import BASELINE_BOUNDS
 
@@ -107,11 +110,39 @@ def prepare_working_copies() -> None:
                 "remembers nothing rather than as a broken mount."
             )
         path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(origin, path)
-        # `shutil.copy` carries the source's permission bits, and the source is deliberately
-        # read-only. Without this the working copy inherits that and the store cannot open it
-        # either, which is the exact failure the copy exists to avoid.
-        path.chmod(0o600)
+
+        # Every sidecar, not just the main file. SQLite writes through a write-ahead log, so a
+        # source whose log has not been checkpointed keeps its most recent rows in
+        # `<name>-wal`. Copying the `.db` alone loses them silently and the service answers
+        # from what looks like an empty memory: the same indistinguishable failure the missing
+        # check above exists to prevent, arriving through a door that check cannot see.
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = origin.with_name(origin.name + suffix)
+            if not sidecar.is_file():
+                continue
+            destination = path.with_name(path.name + suffix)
+            shutil.copy(sidecar, destination)
+            # `shutil.copy` carries the source's permission bits and the source is deliberately
+            # read-only. Without this the working copy inherits that and cannot be opened
+            # either, which is the exact failure the copy exists to avoid.
+            destination.chmod(0o600)
+
+    # And then check the copy actually carried a memory, rather than trusting that it did.
+    #
+    # A source is configured only when someone means to supply the two memories, so an empty
+    # result is a broken mount and never a cold start. Distinguishing them matters because they
+    # are identical from the outside: both answer `memory=on` with no receipts, and only one is
+    # fixed by restarting. The likeliest cause is a mount that carried `<name>.db` without
+    # `<name>.db-wal`, which loses every row still in the log and reports nothing.
+    for role, path in _PATHS[WARM].items():
+        held = MemoryClient.local(path).list_entities(CHAIN_EVENT_CATEGORY, limit=1)
+        if not held:
+            raise RuntimeError(
+                f"{path} holds no receipts after copying from {source}. A configured source "
+                "means the memories were meant to be supplied, so this is a broken mount "
+                "rather than a cold start. The usual cause is copying the database without "
+                "its write-ahead log, which loses every row still in it and says nothing."
+            )
 
 
 app = FastAPI(
