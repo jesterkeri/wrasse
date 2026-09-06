@@ -37,7 +37,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .constants import MAX_BOND_BPS
+from .constants import (
+    BASELINE_BOUNDS,
+    CEILING,
+    FLOOR,
+    MAX_BOND_BPS,
+    TERM_SHAPES,
+    TERMS,
+)
 from .policy_hash import BPS_DENOMINATOR, MAX_DURATION, MAX_PROVIDER_BOND_BPS
 
 #: How a movement is explained. The three are disjoint and a reader has to be able to tell
@@ -46,20 +53,15 @@ MEMORY = "memory"
 CONCESSION = "concession"
 RULE = "rule"
 
-#: Which way the opposer's limit points. A ceiling admits proposals at or below it; a floor
-#: admits proposals at or above it. Bond and price are ceilings, window and delay are floors.
-CEILING = "ceiling"
-FLOOR = "floor"
-
-#: The four terms, in the fixed order they are settled and displayed in.
-TERMS = ("provider_bond_bps", "service_window", "price_bps", "payout_delay")
-
-_SHAPE = {
-    "provider_bond_bps": CEILING,
-    "price_bps": CEILING,
-    "service_window": FLOOR,
-    "payout_delay": FLOOR,
-}
+#: `CEILING` and `FLOOR` say which way an opposer's limit points: a ceiling admits proposals at
+#: or below it, a floor admits proposals at or above it. `TERMS` is the fixed order the four are
+#: settled and displayed in. `TERM_SHAPES` pairs them up.
+#:
+#: All three come from `constants`, and that is the point of this line rather than an accident
+#: of layout. They sat here as a private dict, outside the manifest, which meant flipping
+#: `price_bps` from a ceiling to a floor would invert every price outcome this build produces
+#: and leave `ENGINE_VERSION` exactly as it was. A constant that can change a settled term
+#: belongs to the digest that claims to cover the settled term.
 
 
 class NoOverlap(ValueError):
@@ -139,10 +141,10 @@ def _settle_one(term: str, position: Position) -> tuple[int, Move | None]:
     settles at that value. That is a deliberate choice at a boundary one unit wide.
     """
 
-    shape = _SHAPE[term]
+    shape = TERM_SHAPES[term]
     proposal, limit, walkaway = position.proposal, position.limit, position.walkaway
 
-    if shape is CEILING:
+    if shape == CEILING:
         if proposal <= limit:
             return proposal, None
         if limit < walkaway:
@@ -155,7 +157,7 @@ def _settle_one(term: str, position: Position) -> tuple[int, Move | None]:
             raise NoOverlap(term, limit - walkaway)
         settled = limit
 
-    kind = CONCESSION if position.limit_kind is MEMORY else RULE
+    kind = CONCESSION if position.limit_kind == MEMORY else RULE
     return settled, Move(
         term=term,
         from_value=proposal,
@@ -203,21 +205,6 @@ def settle(positions: dict[str, Position]) -> Settlement:
 # other, and nothing in the settlement would otherwise look at it: the window and delay limits
 # are floors while the contract's binding constraint on both is a ceiling.
 # --------------------------------------------------------------------------------------
-
-
-#: What an operator baseline may be, decided **once** and used by the writer and the reader.
-#:
-#: It was decided twice. The engines required a positive price, window and delay and said
-#: nothing about the bond, because a zero bond rate is valid on the deployed contract. The
-#: validator independently required every baseline field to be at least one. So
-#: `--base-bond-bps 0` produced a document that this same build then refused to read: a
-#: successful quote and an unusable receipt, from one command to the next.
-BASELINE_BOUNDS = {
-    "price_wei": (1, 2**256 - 1),
-    "provider_bond_bps": (0, MAX_PROVIDER_BOND_BPS),
-    "service_window": (1, MAX_DURATION),
-    "payout_delay": (1, MAX_DURATION),
-}
 
 
 def baseline_fault(values: dict[str, Any]) -> str | None:

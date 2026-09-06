@@ -389,6 +389,13 @@ def test_every_constant_that_can_move_a_term_is_in_the_manifest():
     on `ENGINE_VERSION` false, which is worse than not making the claim at all. These are the
     ones a review found missing: the contract-mirroring bounds used by every clamp and by the
     price conversion, the two relevance multipliers, the risk clamp, and the rounding mode.
+
+    A later round found the largest hole of the set. The table deciding which way each
+    opposer's limit points was a private dict in `negotiation.py`, so flipping `price_bps`
+    from a ceiling to a floor inverted every price outcome the build produces and changed no
+    version at all. It was easy to miss because it holds no numbers, which is exactly the
+    reason the membership test asks what a change would do rather than what the value looks
+    like.
     """
 
     from wrasse.constants import NEGOTIATION_MANIFEST
@@ -399,8 +406,56 @@ def test_every_constant_that_can_move_a_term_is_in_the_manifest():
         "risk_floor", "risk_ceiling", "rounding",
         "max_bond_bps", "concession_num", "concession_den",
         "min_service_window_seconds", "min_payout_delay_seconds", "profiles",
+        "settlement_order", "term_shapes", "baseline_bounds",
     ):
         assert required in NEGOTIATION_MANIFEST, f"{required} can move a term and is not hashed"
+
+
+def test_flipping_a_settlement_shape_changes_the_version():
+    """The same proof as the constant above, for the entry that carries no number.
+
+    A shape is a word, so nothing about it looks like a term. It decides one completely: the
+    ceiling that drags a price down to the buyer's limit becomes a floor that leaves the
+    provider's ask standing.
+    """
+
+    import hashlib
+    import json as _json
+
+    from wrasse import constants
+
+    edited = _json.loads(constants.canonical_manifest())
+    edited["term_shapes"]["price_bps"] = constants.FLOOR
+    digest = hashlib.sha256(
+        _json.dumps(edited, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    assert digest[:12] != constants.MANIFEST_DIGEST[:12], (
+        "a flipped shape must produce a flipped version, or every price outcome can be "
+        "inverted under a version claiming to cover it"
+    )
+
+
+def test_the_settlement_order_is_hashed_because_it_decides_what_a_refusal_names():
+    """Two terms with no overlap, and the order picks which one the document reports.
+
+    `failed_on` and `gap` are the whole content of a refused profile, so reordering the four
+    changes what the same pair of memories is told. That is a published outcome moving under
+    an unchanged version.
+    """
+
+    import hashlib
+    import json as _json
+
+    from wrasse import constants
+
+    edited = _json.loads(constants.canonical_manifest())
+    edited["settlement_order"].reverse()
+    digest = hashlib.sha256(
+        _json.dumps(edited, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    assert digest[:12] != constants.MANIFEST_DIGEST[:12]
 
 
 def test_the_manifest_mirrors_the_contract_bounds():
@@ -412,6 +467,11 @@ def test_the_manifest_mirrors_the_contract_bounds():
     assert NEGOTIATION_MANIFEST["bps_denominator"] == BPS_DENOMINATOR
     assert NEGOTIATION_MANIFEST["max_provider_bond_bps"] == MAX_PROVIDER_BOND_BPS
     assert NEGOTIATION_MANIFEST["max_duration_seconds"] == MAX_DURATION
+    assert NEGOTIATION_MANIFEST["baseline_bounds"]["provider_bond_bps"] == [
+        0,
+        MAX_PROVIDER_BOND_BPS,
+    ], "a zero bond rate is valid on the deployed contract and the published domain says so"
+    assert NEGOTIATION_MANIFEST["baseline_bounds"]["service_window"] == [1, MAX_DURATION]
 
 
 def test_the_engine_uses_the_multipliers_it_publishes():

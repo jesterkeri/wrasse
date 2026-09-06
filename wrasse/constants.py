@@ -131,6 +131,46 @@ BPS_DENOMINATOR = 10_000
 MAX_PROVIDER_BOND_BPS = 10_000
 MAX_DURATION = 30 * 24 * 60 * 60
 
+#: The four terms, in the order they are settled, and which way each opposer's limit points.
+#:
+#: These decide a settled term as completely as any number here does, and they were not hashed.
+#: Flipping `price_bps` from a ceiling to a floor inverts every price outcome in the build while
+#: leaving `ENGINE_VERSION` untouched, which is precisely the claim this module exists to make
+#: true. A review found them sitting in `negotiation.py` as a private dict.
+#:
+#: The order is hashed for the same reason. When two terms both have no overlap, the order
+#: decides which one the document names in `failed_on`, so editing it changes what a refusal
+#: says about the very same pair of memories.
+CEILING = "ceiling"
+FLOOR = "floor"
+
+TERMS = ("provider_bond_bps", "service_window", "price_bps", "payout_delay")
+
+TERM_SHAPES: dict[str, str] = {
+    "provider_bond_bps": CEILING,
+    "price_bps": CEILING,
+    "service_window": FLOOR,
+    "payout_delay": FLOOR,
+}
+
+#: What an operator baseline may be, decided **once** and used by the writer and the reader.
+#:
+#: It was decided twice. The engines required a positive price, window and delay and said
+#: nothing about the bond, because a zero bond rate is valid on the deployed contract. The
+#: validator independently required every baseline field to be at least one. So
+#: `--base-bond-bps 0` produced a document that this same build then refused to read: a
+#: successful quote and an unusable receipt, from one command to the next.
+#:
+#: Hashed, because widening it admits baselines that settle differently. Dropping the price
+#: floor to zero would let a settlement land on `price_wei`'s own clamp rather than on the
+#: number either side published.
+BASELINE_BOUNDS: dict[str, tuple[int, int]] = {
+    "price_wei": (1, 2**256 - 1),
+    "provider_bond_bps": (0, MAX_PROVIDER_BOND_BPS),
+    "service_window": (1, MAX_DURATION),
+    "payout_delay": (1, MAX_DURATION),
+}
+
 #: Everything above, in one object, in the order a reader can reproduce.
 #:
 #: The test of whether something belongs here is not "is it a negotiation constant". It is:
@@ -154,6 +194,9 @@ NEGOTIATION_MANIFEST: dict[str, Any] = {
     "max_provider_bond_bps": MAX_PROVIDER_BOND_BPS,
     "max_duration_seconds": MAX_DURATION,
     "profiles": PROFILE_FIELDS,
+    "settlement_order": list(TERMS),
+    "term_shapes": TERM_SHAPES,
+    "baseline_bounds": {field: list(bounds) for field, bounds in BASELINE_BOUNDS.items()},
 }
 
 

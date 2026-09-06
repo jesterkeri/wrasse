@@ -148,6 +148,12 @@ one changes the version, the `engineVersionHash`, and every `policyHash` built f
 manifest is published in the document so a reader recomputes the digest instead of trusting
 it.
 
+That covers the rule as well as the numbers. Which way each opposer's limit points, and the
+order the four terms settle in, are in the digest too. They hold no numbers, so they read like
+structure rather than like constants, and a review found them sitting outside it: flipping
+`price_bps` from a ceiling to a floor inverts every price this build produces and would have
+left the version untouched.
+
 ## Sending transactions
 
 Four commands sit between a quote and a settled deal.

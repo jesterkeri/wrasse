@@ -181,6 +181,75 @@ def test_the_refused_term_is_the_same_one_every_time():
 
 
 # --------------------------------------------------------------------------------------
+# The shape table, which is published and therefore has to be the one that decides
+# --------------------------------------------------------------------------------------
+
+
+def test_the_shape_the_manifest_publishes_is_the_shape_that_settles(monkeypatch):
+    """A manifest entry nothing reads is a decoration. A rule nothing hashes is a hole.
+
+    The table saying which way each limit points lived here as a private dict, outside the
+    digest that `ENGINE_VERSION` claims covers every constant deciding a term. It holds no
+    numbers, which is why it survived three rounds of looking for numbers.
+
+    Flip one entry and the outcome inverts: the ceiling that drags an ask down to the buyer's
+    limit becomes a floor the ask already clears, and the buyer pays the full 11 800 it had
+    published a refusal to pay. Before the fix that flip changed no version, no
+    `engineVersionHash`, and no `policyHash`.
+    """
+
+    from wrasse import constants
+
+    ceiling_below_the_ask = Position(11_800, 11_500, 11_350, "buyer_max_price_bps", RULE)
+    assert settle(_positions(price_bps=ceiling_below_the_ask)).terms["price_bps"] == 11_500
+
+    monkeypatch.setitem(constants.TERM_SHAPES, "price_bps", constants.FLOOR)
+    assert settle(_positions(price_bps=ceiling_below_the_ask)).terms["price_bps"] == 11_800
+
+
+def test_the_settlement_order_the_manifest_publishes_is_the_order_that_refuses(monkeypatch):
+    """Two terms with no overlap, and the published order decides which one is named."""
+
+    from wrasse import constants, negotiation
+
+    assert negotiation.TERMS is constants.TERMS, (
+        "one order, hashed and read. A second private copy is how the shape table got out of "
+        "the manifest in the first place."
+    )
+    assert negotiation.TERM_SHAPES is constants.TERM_SHAPES
+    assert negotiation.BASELINE_BOUNDS is constants.BASELINE_BOUNDS
+
+    positions = _positions(
+        provider_bond_bps=Position(3_500, 400, 500, "provider_max_bond_bps", MEMORY),
+        price_bps=Position(11_800, 10_500, 11_350, "buyer_max_price_bps", RULE),
+    )
+    assert settle(positions).failed_on == "provider_bond_bps"
+
+    monkeypatch.setattr(
+        "wrasse.negotiation.TERMS", tuple(reversed(constants.TERMS)), raising=True
+    )
+    assert settle(positions).failed_on == "price_bps"
+
+
+def test_the_baseline_domain_the_manifest_publishes_is_the_one_that_refuses(monkeypatch):
+    """The published bounds are read, not described alongside a second private copy."""
+
+    from wrasse import constants
+    from wrasse.negotiation import baseline_fault
+
+    values = {
+        "price_wei": 10**14,
+        "provider_bond_bps": 500,
+        "service_window": 600,
+        "payout_delay": 1_800,
+    }
+    assert baseline_fault({**values, "service_window": 0}) is not None
+
+    monkeypatch.setitem(constants.BASELINE_BOUNDS, "service_window", (0, MAX_DURATION))
+    assert baseline_fault({**values, "service_window": 0}) is None
+
+
+# --------------------------------------------------------------------------------------
 # Purity and bounds
 # --------------------------------------------------------------------------------------
 
