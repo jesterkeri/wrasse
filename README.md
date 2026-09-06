@@ -184,10 +184,20 @@ labelled `executable: false`. That is honest rather than weaker: a live quote st
 executable minutes after it is written, and no tracked file can keep that claim. The settled
 terms are identical either way, because the settlement does not depend on a clock.
 
-Four tests hold it to the build: it must be tracked, its `engine_version` must be this build's,
-its published manifest must recompute to the digest inside that version, and both agreed
-profiles must load through the production validator at the terms it prints. Change a constant
-and those fail until the sample is regenerated, so it cannot quietly go stale.
+Six tests hold it to the build. It must be tracked, checked through git rather than by looking
+on disk. Its `engine_version` must be this build's and its published manifest must recompute to
+the digest inside that version. Both agreed profiles must load through the production validator
+at the terms it prints, and the refusal must stay structurally unsignable. Its persona
+commitment must equal the hash of the tracked persona file. And the whole document is pinned by
+a digest over its canonical bytes, so a field that explains rather than binds cannot drift
+either. Change a constant and those fail until the sample is regenerated.
+
+**What it proves, and what it does not.** It proves the schema, the published arithmetic, the
+commitment consistency and this example's outcomes. It does not prove its own history. The risk
+values came from the two receipts on Base, and a third party cannot derive that from this
+repository alone, because the learned dimensions and both memory stores are deliberately not
+part of the artifact. Reproducing the numbers needs the persona, the receipts, the operator
+baselines and those dimensions, which is the same list the reproducibility note above gives.
 
 ## Sending transactions
 

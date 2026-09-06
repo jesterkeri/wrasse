@@ -1001,6 +1001,57 @@ def test_the_golden_sample_still_carries_the_refusal():
     assert "terms" not in budget and "policy_hash" not in budget
 
 
+#: SHA-256 over the sample's canonical JSON. Regenerate both together:
+#:
+#:     uv run wrasse policy 0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0 \
+#:       --buyer 0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22 \
+#:       --accept-by 1788666920 --reference-timestamp 1788666320 \
+#:       --base-bond-bps 500 --service-window 600 --payout-delay 1800 \
+#:       --output docs/examples/policy.schema3.json
+SAMPLE_DIGEST = "f46f5fe3fdffdf2da8bc4a506ed8dacaacf1638e1b9f90f2f9903b7605fabbdd"
+
+
+def test_the_golden_sample_is_pinned_whole_and_not_only_where_it_binds():
+    """The other four tests pin what decides the outcome. This one pins everything else.
+
+    A review demonstrated the gap without touching the repository: editing the displayed
+    persona sensitivity from 0.70 to 0.71, both provider risks from 0.7200 to 0.7100, and
+    urgent's non-binding price ceiling from 12000 to 12001 left every advertised property
+    passing. The terms still settled where they were pinned and the refusal was untouched,
+    because none of those fields binds anything. They are the *explanation*, and a sample whose
+    explanation can drift while its numbers hold is a worse artifact than one that cannot.
+
+    The README says the sample cannot quietly go stale. This is the test that makes the
+    sentence true as written rather than true if read narrowly.
+    """
+
+    import hashlib
+
+    canonical = json.dumps(
+        json.loads(SAMPLE.read_text()), sort_keys=True, separators=(",", ":")
+    )
+    assert hashlib.sha256(canonical.encode()).hexdigest() == SAMPLE_DIGEST, (
+        "the golden sample changed. If that was deliberate, regenerate it with the command "
+        "above and update SAMPLE_DIGEST in the same commit."
+    )
+
+
+def test_the_golden_sample_commits_to_the_tracked_persona():
+    """The provider's persona hash in the sample must be the tracked file's, byte for byte.
+
+    That is the claim the persona commitment exists to make: the provider did not tune itself
+    to this counterparty, because the file predates every receipt. A sample carrying some other
+    hash would be making the claim about a persona nobody can read.
+    """
+
+    import hashlib
+
+    persona = SAMPLE.parents[2] / "personas" / "provider-a.json"
+    expected = hashlib.sha256(persona.read_bytes()).hexdigest()
+    published = json.loads(SAMPLE.read_text())["provider"]["persona"]["commitment"]
+    assert published == expected
+
+
 def test_the_golden_sample_is_a_fixture_and_says_so():
     """It is judged against a supplied time, so it is reproducible and NOT executable.
 
