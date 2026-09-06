@@ -820,3 +820,220 @@ def test_a_worse_provider_never_worsens_the_buyers_own_outcome(both, profile):
         assert windows == sorted(windows, reverse=True), (
             "a negative buffer must tighten the window, never lengthen it"
         )
+
+
+# --------------------------------------------------------------------------------------
+# Gate 8: the closing beat, which is restoration rather than forgetting
+#
+# Nothing is rewritten. The timeout and the late claim stay in both stores, stay recalled and
+# stay cited. What changes is that a third receipt, a delivery released promptly by the buyer,
+# is evidence about *both* parties: the provider did deliver, and the buyer did not make it
+# wait. So one receipt softens both sides, for two different reasons, and the terms move back
+# toward the baseline without any history being edited.
+#
+# The tests below pin where that becomes visible, because it is not visible everywhere at once
+# and pretending otherwise would design a demo around an outcome the model might not produce.
+# --------------------------------------------------------------------------------------
+
+
+PROMPT_RELEASE = _event("delivered_and_released_by_buyer", tx="0x" + "cc" * 32)
+
+
+def _restored_dimension(severity: float, confidence: float = 0.9) -> DimensionDefinition:
+    """What the model would learn from a prompt release, at a stated strength.
+
+    Severity and confidence are the model's call, and the direction is not: `VALENCE_OF` says
+    this outcome is positive because the contract says what happened. So the sign is fixed and
+    only the magnitude is uncertain, which is exactly the axis these tests sweep.
+    """
+
+    return DimensionDefinition(
+        dimension_id="prompt_release",
+        source_event_type="delivered_and_released_by_buyer",
+        signal_direction="positive",
+        severity=severity,
+        confidence=confidence,
+        applies_when=("deadline_sensitive", "cost_sensitive", "quality_sensitive"),
+    )
+
+
+def _after(severity: float | None, profile: str = "urgent"):
+    """Both sides' terms, before the good deal when `severity` is None and after when it is not."""
+
+    dimensions = list(LIVE_DIMENSIONS)
+    evidence = [TIMEOUT.canonical_body(), LATE_RELEASE.canonical_body()]
+    if severity is not None:
+        dimensions.append(_restored_dimension(severity))
+        evidence.append(PROMPT_RELEASE.canonical_body())
+
+    provider = produce_provider_terms(
+        evidence=evidence, dimensions=dimensions, persona=PERSONA,
+        base_price_wei=BASELINE["price_wei"], base_payout_delay=BASELINE["payout_delay"],
+        base_service_window=BASELINE["service_window"],
+    )
+    buyer = produce_terms(
+        evidence=evidence, dimensions=dimensions, profile=PROFILES[profile],
+        base_price_wei=BASELINE["price_wei"], base_bond_bps=BASELINE["provider_bond_bps"],
+        base_service_window=BASELINE["service_window"],
+        base_payout_delay=BASELINE["payout_delay"],
+    )
+    return buyer, provider
+
+
+def _settlement(severity: float | None, profile: str):
+    from wrasse import negotiation
+
+    buyer, provider = _after(severity, profile)
+    proposals = {
+        "provider_bond_bps": buyer.provider_bond_bps, "service_window": buyer.service_window,
+        "price_bps": provider.price_bps, "payout_delay": provider.payout_delay,
+    }
+    return negotiation.settle(negotiation.build_positions(
+        baseline=BASELINE,
+        proposals=proposals,
+        limits={
+            "provider_bond_bps": provider.max_bond_bps,
+            "service_window": provider.min_service_window,
+            "price_bps": buyer.max_price_bps, "payout_delay": buyer.min_payout_delay,
+        },
+        walkaways=negotiation.walkaways_for(
+            BASELINE, proposals, {"price_bps": provider.price_floor_bps}
+        ),
+    ))
+
+
+def test_one_good_deal_softens_the_provider_at_any_strength(both):
+    """The provider side has no clamp in the way, so it moves the moment there is anything to
+    move it. Price down, floor down, bond ceiling up, payout delay back toward the baseline.
+
+    All four in the direction that favours the counterparty, which is the point: this is the
+    buyer's good conduct being paid back, not the provider being generous.
+    """
+
+    _, before = _after(None)
+    _, after = _after(0.1)
+
+    assert after.risk < before.risk
+    assert after.price_bps < before.price_bps, "a buyer who paid promptly is charged less"
+    assert after.price_floor_bps < before.price_floor_bps
+    assert after.max_bond_bps > before.max_bond_bps, "and is asked to be protected against less"
+    assert after.payout_delay > before.payout_delay, "and the provider will wait longer again"
+
+
+@pytest.mark.parametrize(
+    "profile,invisible_at,visible_at",
+    [
+        # The clamp holds every buyer risk at 1.0000 on the live data, so a positive receipt
+        # spends itself paying down an unclamped total nobody can see before it moves a term.
+        # How much it has to pay down first differs by profile, because the profile's own risk
+        # weight decides how far above the ceiling the raw score sits.
+        # Severities, at the fixed confidence of 0.9 the helper uses. The magnitude that
+        # actually moves the score is the product, so 0.3 severity is 0.27 of movement.
+        ("budget", None, 0.1),
+        ("sensitive", 0.2, 0.3),
+        ("urgent", 0.3, 0.4),
+    ],
+)
+def test_the_buyer_side_stays_still_until_the_positive_outweighs_the_clamp(
+    both, profile, invisible_at, visible_at
+):
+    """The known limit of this design, tested rather than left in a footnote.
+
+    Risk is a clamped sum with no stored state, so a counterparty two receipts deep and one ten
+    receipts deep both display 1.0000. A buyer already at the ceiling therefore shows no change
+    at all from a good deal that genuinely did move its position, until the raw total drops
+    back under the ceiling.
+
+    `budget` recovers almost immediately because its risk weight of 0.85 leaves it barely above
+    the ceiling. `urgent` at 1.40 sits furthest above and recovers last. Anyone reading the
+    document sees the cheap buyer forgive first, which is a real property of the design and not
+    a bug, but it is worth knowing before it is presented as one.
+    """
+
+    baseline_terms, _ = _after(None, profile)
+    assert baseline_terms.risk == Decimal("1.0000")
+
+    if invisible_at is not None:
+        hidden, _ = _after(invisible_at, profile)
+        assert hidden.risk == Decimal("1.0000"), "still clamped, so still invisible"
+        assert hidden.provider_bond_bps == baseline_terms.provider_bond_bps
+
+    shown, _ = _after(visible_at, profile)
+    assert shown.risk < Decimal("1.0000")
+    assert shown.provider_bond_bps < baseline_terms.provider_bond_bps, (
+        "once it is visible the bond demand has to fall"
+    )
+
+
+@pytest.mark.parametrize(
+    "severity,gap",
+    [(None, 850), (0.1, 681), (0.2, 513), (0.3, 344), (0.4, 175), (0.5, 6)],
+)
+def test_the_refused_deal_closes_the_distance_before_it_agrees(both, severity, gap):
+    """The beat itself. `budget` refuses on price by 850 basis points, and each good deal
+    narrows that distance rather than flipping a switch.
+
+    The refusal is honest in its direction throughout: it is this buyer's own payment record
+    that raised the provider's floor above what a cost-sensitive buyer will pay, so it is that
+    buyer's own conduct that has to bring it back down.
+    """
+
+    outcome = _settlement(severity, "budget")
+    assert not outcome.agreed
+    assert (outcome.failed_on, outcome.gap) == ("price_bps", gap)
+
+
+def test_the_deal_that_could_not_happen_becomes_possible(both):
+    """Six basis points short at 0.45, and agreed at 0.54. Nothing was forgotten in between."""
+
+    assert not _settlement(0.5, "budget").agreed
+    restored = _settlement(0.6, "budget")
+    assert restored.agreed
+    assert restored.terms["price_bps"] <= 10_500, "settled inside what this buyer would pay"
+
+
+def test_nothing_is_rewritten_when_terms_improve(both):
+    """The claim the whole project rests on, checked at the moment it is most tempting to break.
+
+    A system that improved terms by dropping the receipt would be indistinguishable from this
+    one at the level of the numbers. It is distinguishable at the level of the evidence, so
+    that is where it is checked: both original receipts are still recalled after the good deal,
+    and the timeout is still named as having moved the buyer's numbers.
+    """
+
+    from wrasse.policy_hash import canonical_event_id
+
+    def identity(event):
+        return canonical_event_id(str(event.canonical_body()["event_id"]))
+
+    buyer, provider = _after(0.6)
+
+    recalled = set(buyer.recalled_event_ids)
+    assert identity(TIMEOUT) in recalled
+    assert identity(LATE_RELEASE) in recalled
+    assert identity(PROMPT_RELEASE) in recalled
+
+    assert identity(TIMEOUT) in buyer.used_evidence_ids, (
+        "the timeout still moves the buyer's numbers, so it is still committed to"
+    )
+    assert identity(LATE_RELEASE) in provider.used_evidence_ids
+
+
+def test_recovery_never_reverses(both):
+    """Monotonicity, in the direction Gate 7 established and this gate has to preserve.
+
+    Better conduct may never make the outcome worse for the party that earned it. Swept rather
+    than spot-checked, because a rounding boundary is exactly where a monotone claim breaks.
+    """
+
+    strengths = [round(0.05 * step, 2) for step in range(1, 17)]
+    prices, floors, ceilings = [], [], []
+    for strength in strengths:
+        _, provider = _after(strength)
+        prices.append(provider.price_bps)
+        floors.append(provider.price_floor_bps)
+        ceilings.append(provider.max_bond_bps)
+
+    assert prices == sorted(prices, reverse=True), "a better record never raises the price"
+    assert floors == sorted(floors, reverse=True)
+    assert ceilings == sorted(ceilings), "nor lowers what the provider will post"
