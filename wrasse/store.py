@@ -401,6 +401,19 @@ class WrasseStore:
 
         identifier = event.canonical_body()["event_id"]
         with self._exclusive():
+            # Whether a mark is already standing decides who may clear it. One left by an
+            # earlier crash says an ingest died in the middle and the store cannot say what it
+            # holds; this call did not create it and must not forget it. A review found that
+            # the conflict handler below deleted it either way, which turned a refusal into a
+            # quote over a possibly missing index entry. The crash-then-conflict order is
+            # ordinary: an ingest is interrupted, and the receipt is later replayed after a
+            # re-inclusion changed its block number.
+            owned = True
+            try:
+                self._memory.get_entity(PENDING_CATEGORY, identifier)
+                owned = False
+            except NotFoundError:
+                pass
             self._memory.set_entity(
                 PENDING_CATEGORY, identifier,
                 {"event_id": identifier, "started_at": _now()}, status="verified",
@@ -418,7 +431,8 @@ class WrasseStore:
                 #
                 # The conflict is still raised. Two bodies for one id must never be resolved
                 # by arrival order. What must not happen is the store dying alongside it.
-                self._memory.delete_entity(PENDING_CATEGORY, identifier)
+                if owned:
+                    self._memory.delete_entity(PENDING_CATEGORY, identifier)
                 raise
             body = result.entity["body"]
             counterparty = self.counterparty_of(body)

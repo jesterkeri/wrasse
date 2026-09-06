@@ -1,8 +1,18 @@
 """The hosted quote service: one route, no keys, nothing written.
 
-**The rule this module exists to keep.** The service holds no keys, signs nothing and writes
-nothing. Everything else here follows from it, and every constraint below has a reason attached
-so none of them get traded away at two in the morning.
+**The rule this module exists to keep.** The service holds no keys, signs nothing, and writes
+no receipt, no learned dimension and no outcome. Everything else here follows from it, and
+every constraint below has a reason attached so none of them get traded away at two in the
+morning.
+
+The claim used to read "writes nothing", and an adversarial pass showed that is false on a
+cold deployment. Opening a store that does not exist writes its identity record, and the first
+quote writes the provider's persona commitment when it is absent, so a fresh `memory=off` pair
+creates a database, a lock file and two metadata entities. None of that touches a term or a
+receipt, and stating it as "writes nothing" was still a guarantee the code does not keep.
+
+So the metadata is written once at startup, before anything is served, and the health endpoint
+says what is actually true rather than what is convenient.
 
 An earlier design had this service driving transactions so a judge could execute a deal from
 the page. That reinherits three problems the read-only split deletes outright. The ledger
@@ -62,6 +72,7 @@ from sibyl_memory_client import MemoryClient
 from . import cli
 from .evidence import CHAIN_EVENT_CATEGORY
 from .page import page_view
+from .store import persona_digest
 from .negotiation import BASELINE_BOUNDS
 
 #: The two memory settings the page toggles between. `on` is what the two agents actually
@@ -162,6 +173,7 @@ def _open(memory: str) -> dict[str, Any]:
     if memory not in _stores:
         if not _stores:
             prepare_working_copies()
+            _initialise_metadata()
         _stores[memory] = cli._open_stores(
             buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
             provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
@@ -176,6 +188,28 @@ def _open(memory: str) -> dict[str, Any]:
 WEB_ROOT = Path(os.getenv("WRASSE_WEB_ROOT", "web"))
 
 
+def _initialise_metadata() -> None:
+    """Write the identity record and persona commitment once, before anything is served.
+
+    A store that does not exist yet gets both written on its first open, and the first quote
+    writes the persona commitment when it is absent. Doing it here rather than inside a request
+    means the serving path really is read-only, so "writes no receipt, dimension or outcome" is
+    a property of every request rather than of every request after the first.
+
+    The cold pair is the one this matters to. It is created empty on purpose and stays empty:
+    nothing on this path ingests, so there is nothing to fill it.
+    """
+
+    digest, persona = persona_digest(cli._persona_path())
+    for paths in _PATHS.values():
+        stores = cli._open_stores(
+            buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
+            provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
+            paths=paths,
+        )
+        stores["provider"].commit_persona(name=persona["name"], digest=digest)
+
+
 @app.get("/api/health")
 def health() -> dict:
     """Enough to tell a deploy from a corpse, and nothing that touches a wallet."""
@@ -186,7 +220,11 @@ def health() -> dict:
         "chain_id": cli._chain_id(),
         "contract_address": cli._escrow_address(),
         "signs": False,
-        "writes": False,
+        "holds_keys": False,
+        # Not `writes: false`, which was untrue on a cold deployment. Store identity and the
+        # persona commitment are written when a store is first opened, and both happen at
+        # startup rather than while serving.
+        "writes_receipts_or_outcomes": False,
     }
 
 

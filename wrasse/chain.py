@@ -1179,8 +1179,21 @@ def resolve(
     if chain_now is not None and NO_DEADLINE < row.accept_by <= chain_now:
         return Verdict(STUCK, "the acceptance deadline has passed; resending cannot succeed")
 
+    # The age bound, and the third gate to read `accept_by` as a reason to give up.
+    #
+    # It is right for a row that may still be live: after long enough with no receipt and no
+    # nonce conflict, saying so is better than pretending to know. It is wrong as a terminal
+    # answer for an action with no deadline. `stuck` never reaches `unknown`, `unknown` is the
+    # only verdict carrying `may_rebroadcast`, so a dropped `acceptDeal` nobody resolved for
+    # thirty minutes held its wallet exactly as it did before the first two fixes, and every
+    # visitor after that was blocked behind it.
+    #
+    # Resending identical bytes for an action with no deadline is as safe as the first send.
+    # Every receipt and nonce check above has already fallen through, so the slot is not known
+    # to be spent, and the contract reverts safely if the state moved on. The bound still
+    # applies to `createDeal`, which does expire and cannot be resent afterwards.
     age = (datetime.now(UTC) - datetime.fromisoformat(row.updated_at)).total_seconds()
-    if age > stuck_after_seconds:
+    if age > stuck_after_seconds and row.accept_by != NO_DEADLINE:
         return Verdict(STUCK, f"unresolved for {int(age)}s, past the {stuck_after_seconds}s bound")
 
     return Verdict(UNKNOWN, "no receipt and no transaction; the identical bytes may be resent",

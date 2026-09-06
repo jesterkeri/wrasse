@@ -801,3 +801,45 @@ def test_store_repair_puts_back_a_lost_index_entry(tmp_path, monkeypatch, capsys
     assert len(_open(tmp_path, "buyer", BUYER, "buyer.db").recall(PROVIDER).evidence) == 1, (
         "and the history is priceable again"
     )
+
+
+def test_a_conflict_does_not_erase_a_marker_left_by_an_earlier_crash(buyer_store, monkeypatch):
+    """The hole in my own fix for the bricking bug, found by an adversarial pass.
+
+    Clearing the marker on a conflict is right when this call created it, because nothing
+    started. It is wrong when a marker was already standing: that one says an earlier ingest
+    died somewhere in the middle and the store cannot say what it holds. Deleting it turns a
+    refusal into a quote from a history that may be missing its index entry, which is the
+    fail-closed guarantee inverted.
+
+    The crash-then-conflict order is the realistic one. An ingest is interrupted between the
+    record and the index, and the receipt is later replayed after a re-inclusion has changed
+    its block number. Two independently ordinary events.
+    """
+
+    from wrasse.evidence import EventConflict
+
+    event = _event(tx_hash="0x" + "c9" * 32, block_number=100)
+
+    # An ingest that dies during the index write, which is the interruption that matters: the
+    # record is stored and the projection is not, so the store holds evidence the pricing path
+    # cannot find. That is exactly what the marker exists to announce.
+    def interrupted(*_args, **_kwargs):
+        raise RuntimeError("interrupted between the record and the index")
+
+    monkeypatch.setattr(type(buyer_store), "_add_to_index", interrupted)
+    with pytest.raises(RuntimeError):
+        buyer_store.ingest(event)
+    stranded = buyer_store.pending_ingestions()
+    assert stranded == [event.canonical_body()["event_id"]], "the mark must survive a crash"
+
+    monkeypatch.undo()
+
+    # and then the same receipt arrives with a body a re-inclusion changed
+    with pytest.raises(EventConflict):
+        buyer_store.ingest(_event(tx_hash="0x" + "c9" * 32, block_number=101))
+
+    assert buyer_store.pending_ingestions() == stranded, (
+        "the conflict cleared a marker it did not create, so an unfinished ingest was "
+        "forgotten and the store would price over the gap"
+    )

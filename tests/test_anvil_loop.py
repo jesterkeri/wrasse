@@ -1351,3 +1351,51 @@ def test_a_deal_action_whose_bytes_vanished_is_actually_resent(both_roles, capsy
     assert escrow_state(web3, both_roles["address"], deal_id) == "Accepted", (
         "the recovery has to reach the chain, not merely leave stuck"
     )
+
+
+def test_an_aged_deal_action_is_resent_rather_than_abandoned(both_roles, capsys, monkeypatch):
+    """The same recovery as the vanished-bytes case, after the age bound has passed.
+
+    A third gate read `accept_by` as a reason to give up, and neither earlier fix reached it.
+    Thirty minutes without a resolve turned a deal action into `stuck`, which cannot reach the
+    verdict that authorises a resend, so the wallet was held exactly as before. This drives the
+    command against a row aged past that bound and requires a real recovery: a resent
+    transaction, a receipt, and a mined state change.
+    """
+
+    from datetime import UTC, datetime, timedelta
+
+    deal_id = _open_deal(both_roles, capsys)
+    web3 = both_roles["web3"]
+    real_broadcast = chain.broadcast
+
+    def swallow(_web3, row, **_kwargs):
+        return chain.BroadcastOutcome(chain.PENDING, "intercepted; these bytes never left")
+
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    monkeypatch.setattr(chain, "broadcast", swallow)
+    assert main(["accept-deal", "--deal-id", str(deal_id)]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(chain, "broadcast", real_broadcast)
+
+    # age the row past the bound, which is what an unattended service does on its own
+    ledger = chain.TransactionLedger(os.environ["WRASSE_TX_DB"])
+    provider = chain.canonical_address(os.environ["WRASSE_PROVIDER_A_ADDRESS"])
+    stale = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    import sqlite3
+
+    with sqlite3.connect(os.environ["WRASSE_TX_DB"]) as connection:
+        connection.execute(
+            "UPDATE transactions SET updated_at = ? WHERE wallet = ?", (stale, provider)
+        )
+
+    assert main(["tx-resolve", "--rebroadcast"]) == 0
+    capsys.readouterr()
+
+    recovered = [row for row in ledger.rows() if row.wallet == provider][0]
+    assert recovered.status != chain.STUCK, "an aged action with no deadline is still resendable"
+
+    web3.eth.wait_for_transaction_receipt(recovered.tx_hash)
+    assert main(["tx-resolve"]) == 0
+    capsys.readouterr()
+    assert escrow_state(web3, both_roles["address"], deal_id) == "Accepted"

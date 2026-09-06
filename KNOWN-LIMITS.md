@@ -37,6 +37,12 @@ genuinely read-only file does not open. The source is mounted read-only and copi
 writable working directory at startup instead. The deployed artifact cannot be mutated and the
 working copy is recreated on every restart.
 
+**The service writes metadata at startup, and nothing while serving.** A store that does not
+exist gets its identity record written on first open, and the persona commitment is written
+when it is absent. Both happen before the first request, so the serving path writes no receipt,
+no learned dimension and no outcome. The module used to claim it wrote nothing at all, which
+was false on a cold deployment.
+
 **The service holds no keys and signs nothing.** Settlement runs on the operator's machine.
 That is a design constraint rather than a limitation, and it is recorded here because removing
 it reintroduces the wallet serialisation and wallet-death problems it was chosen to delete.

@@ -1037,3 +1037,61 @@ def test_recovery_never_reverses(both):
     assert prices == sorted(prices, reverse=True), "a better record never raises the price"
     assert floors == sorted(floors, reverse=True)
     assert ceilings == sorted(ceilings), "nor lowers what the provider will post"
+
+
+def test_the_clamp_threshold_is_swept_rather_than_sampled(both):
+    """The claim, checked across the range instead of at two points.
+
+    The earlier tests pin one hidden and one visible severity per profile, which shows the
+    threshold exists and does not establish where it is or that the behaviour either side of it
+    is monotone. A review called that sampled rather than swept, correctly.
+
+    Two properties across the whole range. Below its threshold a profile shows no change at
+    all, because the clamp is absorbing the whole positive contribution. At and above it, the
+    bond falls and keeps falling. A threshold that moved, or a profile that flickered either
+    side of it, fails here rather than passing two lucky points.
+    """
+
+    strengths = [round(0.02 * step, 2) for step in range(0, 51)]
+
+    # The thresholds, derived rather than sampled. A buyer's raw risk is
+    # 0.81 x 1.5 x risk_weight, the positive contribution is m x 1.5 x risk_weight, and the
+    # profile becomes visible when the difference falls under the ceiling of 1.0000. The
+    # numbers first reported here, 0.09, 0.27 and 0.36, were the first points a coarse probe
+    # happened to sample above each threshold. Two were close; budget's was out by a factor of
+    # three, which is exactly what a review meant by sampled rather than swept.
+    for profile, threshold in (
+        ("budget", 0.0257),      # weight 0.85, raw 1.03275, barely above the ceiling
+        ("sensitive", 0.2544),   # weight 1.20, raw 1.45800
+        ("urgent", 0.3338),      # weight 1.40, raw 1.70100, furthest above and last to recover
+    ):
+        baseline_terms, _ = _after(None, profile)
+        seen = []
+        for strength in strengths:
+            terms, _ = _after(strength, profile) if strength else (baseline_terms, None)
+            moved = terms.risk < Decimal("1.0000")
+            seen.append((round(strength * 0.9, 4), moved, terms.provider_bond_bps))
+
+        hidden = [m for m, moved, _ in seen if not moved]
+        shown = [m for m, moved, _ in seen if moved]
+        assert hidden and shown, f"{profile} never crossed its threshold in this range"
+        assert max(hidden) < min(shown), (
+            f"{profile} flickered across the clamp instead of crossing it once"
+        )
+        assert max(hidden) <= threshold <= min(shown), (
+            f"{profile} crosses between {max(hidden)} and {min(shown)}, which does not bracket "
+            f"the derived threshold {threshold}"
+        )
+
+        # and below it nothing moves at all, which is the property the clamp creates
+        for magnitude, moved, bond in seen:
+            if not moved:
+                assert bond == baseline_terms.provider_bond_bps, (
+                    f"{profile} at {magnitude} shows a clamped risk and a moved bond"
+                )
+
+        # above it the bond only ever falls
+        falling = [bond for _, moved, bond in seen if moved]
+        assert falling == sorted(falling, reverse=True), (
+            f"{profile} raised its bond demand as the record improved"
+        )

@@ -1439,3 +1439,52 @@ def test_a_row_that_actually_mined_leaves_stuck_on_its_own(tmp_path):
     web3.eth.receipts[row.tx_hash] = _receipt(status=1)
 
     assert chain.resolve(web3, row).status == chain.INCLUDED_SUCCESS
+
+
+def test_an_aged_row_with_no_deadline_is_still_resendable(tmp_path):
+    """The third gate, after the verdict gate and the send gate.
+
+    Both earlier fixes addressed `accept_by`. Neither touched the age bound below them, which
+    turns any unresolved row into `stuck` after thirty minutes, deal actions included. `stuck`
+    never reaches `unknown`, `unknown` is the only verdict carrying `may_rebroadcast`, and so a
+    dropped `acceptDeal` left unresolved for half an hour held its wallet exactly as before.
+    Every visitor after that is blocked behind it.
+
+    The age bound is right for a row that may still be live. It is wrong as a terminal answer
+    for an action with no deadline, because resending identical bytes is as safe as the first
+    send: every receipt and nonce check above has already fallen through, and the contract
+    reverts safely if the state moved on.
+    """
+
+    from datetime import UTC, datetime, timedelta
+
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, accept_by=0)
+    old = row.__class__(**{
+        **row.__dict__,
+        "updated_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+    })
+
+    verdict = chain.resolve(FakeWeb3(), old, chain_now=1_800_000_000)
+
+    assert verdict.status == chain.UNKNOWN, (
+        "an action with no deadline does not expire, however long nobody looked at it"
+    )
+    assert verdict.may_rebroadcast is True
+
+
+def test_an_aged_row_with_a_real_deadline_is_still_stuck(tmp_path):
+    """The bound the fix must not remove. A `createDeal` that aged past its deadline is done."""
+
+    from datetime import UTC, datetime, timedelta
+
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, accept_by=1_900_000_000)
+    old = row.__class__(**{
+        **row.__dict__,
+        "updated_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+    })
+
+    verdict = chain.resolve(FakeWeb3(), old, chain_now=1_800_000_000)
+    assert verdict.status == chain.STUCK
+    assert "unresolved for" in verdict.detail

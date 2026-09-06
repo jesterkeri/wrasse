@@ -272,7 +272,12 @@ def test_a_baseline_outside_the_domain_is_refused_with_its_bound(service):
 def test_health_says_plainly_what_it_does_not_do(service):
     client, _ = service
     body = client.get("/api/health").json()
-    assert body["signs"] is False and body["writes"] is False
+    assert body["signs"] is False and body["holds_keys"] is False
+    # Not `writes: false`. That was untrue on a cold deployment: opening a store that does not
+    # exist writes its identity record, and the first quote writes the persona commitment when
+    # it is absent. Both now happen at startup, and the claim says what is actually kept.
+    assert body["writes_receipts_or_outcomes"] is False
+    assert "writes" not in body, "the claim that was too broad must not come back"
     assert body["chain_id"] == 84532
 
 
@@ -415,3 +420,56 @@ def test_a_source_copied_without_its_write_ahead_log_does_not_serve_an_empty_mem
 
     with pytest.raises(RuntimeError, match="write-ahead log"):
         module.prepare_working_copies()
+
+
+def test_a_cold_deployment_writes_its_metadata_before_it_serves(tmp_path, monkeypatch):
+    """The claim the health endpoint makes, checked where it used to be false.
+
+    A store that does not exist gets its identity record written on first open, and the first
+    quote writes the persona commitment when it is absent. So a fresh deployment's first
+    request wrote files while the module said "writes nothing". Both now happen at startup,
+    which makes the read-only property true of every request rather than of every request
+    after the first.
+    """
+
+    import hashlib
+
+    for secret in ("WRASSE_KEYSTORE", "WRASSE_KEYSTORE_PASSWORD_FILE", "WRASSE_TX_DB"):
+        monkeypatch.delenv(secret, raising=False)
+
+    warm = tmp_path / "warm"
+    _warm_pair(warm)
+    cold = tmp_path / "cold"
+
+    monkeypatch.setenv("WRASSE_BUYER_ADDRESS", BUYER)
+    monkeypatch.setenv("WRASSE_PROVIDER_A_ADDRESS", PROVIDER)
+    monkeypatch.setenv("WRASSE_ESCROW_ADDRESS", ESCROW)
+    monkeypatch.setenv("BASE_SEPOLIA_CHAIN_ID", "84532")
+    monkeypatch.setenv(
+        "WRASSE_PROVIDER_PERSONA", str(REPO / "personas" / "provider-a.json")
+    )
+
+    from wrasse import service as module
+
+    monkeypatch.setattr(module, "_stores", {})
+    monkeypatch.setitem(module._PATHS, module.WARM, {
+        "buyer": warm / "buyer-memory.db", "provider": warm / "provider-memory.db",
+    })
+    monkeypatch.setitem(module._PATHS, module.COLD, {
+        "buyer": cold / "buyer-memory.db", "provider": cold / "provider-memory.db",
+    })
+
+    client = TestClient(module.app)
+    assert client.get("/api/quote", params={"memory": "off"}).status_code == 200
+
+    def fingerprint(directory):
+        return {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(directory.glob("*memory.db*"))
+        }
+
+    before = fingerprint(cold)
+    assert before, "the cold pair exists after the first request"
+    for _ in range(3):
+        assert client.get("/api/quote", params={"memory": "off"}).status_code == 200
+    assert fingerprint(cold) == before, "a cold quote wrote to the store it quoted from"
