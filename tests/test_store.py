@@ -605,3 +605,199 @@ def test_a_second_thread_cannot_walk_into_a_held_store(tmp_path):
     intruder.join(5)
 
     assert overlapped == [True], "a second thread entered while the first still held the store"
+
+
+def test_a_conflicting_replay_does_not_strand_the_marker(buyer_store):
+    """The failure that turns a recoverable store into a dead one.
+
+    `ingest` marks, writes, indexes, clears. A crash anywhere in the middle leaves the mark
+    standing and `recall` refuses until a replay finishes it, which is the design and it
+    works. `EventConflict` is different: it is raised by `persist_verified_event` before any
+    mutation, propagates out of `ingest`, and the mark is never cleared. Every later call
+    refuses, and replaying the conflicting receipt raises the same conflict and re-strands it.
+
+    Reachable without a bug or an attacker. `event_id` covers chain, contract, transaction and
+    log index; the canonical body also carries `block_number`, which a reorg changes. Ingest at
+    block N, reorg, re-include at N+1, and every command afterwards produces the N+1 body. The
+    only body that clears the mark is the one the chain no longer returns.
+
+    The conflict must still be raised. Refusing is right: two bodies for one id is exactly what
+    must never be resolved by arrival order. What must not happen is the store dying with it.
+    """
+
+    from wrasse.evidence import EventConflict
+
+    store = buyer_store
+    event = _event(tx_hash="0x" + "e1" * 32, block_number=100)
+    store.ingest(event)
+    assert store.pending_ingestions() == []
+
+    reorged = _event(tx_hash="0x" + "e1" * 32, block_number=101)
+    with pytest.raises(EventConflict):
+        store.ingest(reorged)
+
+    assert store.pending_ingestions() == [], (
+        "the conflict was refused before anything was written, so the mark must not survive it"
+    )
+    assert len(store.recall(PROVIDER).evidence) == 1, "and the store still prices"
+
+    # the same replay again, because a store that only survives one is not fixed
+    with pytest.raises(EventConflict):
+        store.ingest(reorged)
+    assert store.pending_ingestions() == []
+    assert len(store.recall(PROVIDER).evidence) == 1
+
+
+def test_a_group_of_memories_is_held_together_not_one_after_the_other(buyer_store, provider_store):
+    """`reconcile` delivers one receipt to both stores, and a reader must not see it half done.
+
+    Taking each lock in turn leaves a window where one side holds a receipt the other does not.
+    A quote acquiring both inside that window sees a genuinely one-sided history and aborts,
+    accusing the two memories of disagreeing when the second delivery was milliseconds away.
+    It fails closed, which is the right direction, and it is still a false accusation.
+
+    Unreachable while one person ran one command at a time. Reachable the moment a hosted quote
+    service reads while an operator reconciles, which is the architecture that shipped today.
+
+    Checked by holding the group and then trying to take one member from another thread. The
+    per-store guard is held across the yield, so a second thread blocks rather than walking in,
+    and a thread that is still blocked after a generous wait is the property.
+    """
+
+    import threading
+
+    from wrasse.store import both_locked
+
+    stores = {"buyer": buyer_store, "provider": provider_store}
+    took_it = threading.Event()
+
+    def grab():
+        with provider_store.lock():
+            took_it.set()
+
+    with both_locked(stores):
+        other = threading.Thread(target=grab, daemon=True)
+        other.start()
+        assert not took_it.wait(timeout=1.0), (
+            "a second thread took one of the memories while the group was held, so the pair "
+            "can be observed mid-delivery"
+        )
+
+    other.join(timeout=5.0)
+    assert took_it.is_set(), "and it must be released afterwards, or the next quote hangs"
+
+
+def test_reconcile_holds_both_memories_across_both_deliveries(buyer_store, provider_store, monkeypatch):
+    """The property the helper above exists for, asserted where it is actually used.
+
+    The previous test proves `both_locked` locks. It does not prove `reconcile` calls it, and a
+    mutation removing the call passed the entire suite. That is the shape this project keeps
+    hitting: the assertion one layer above the defect.
+
+    Checked on the real objects. `_depth` is non-zero only inside a held lock, so reading it
+    from inside the first delivery says whether the second store was already held when the
+    first one was written.
+    """
+
+    from wrasse import reconciler
+    from wrasse.store import ChainEvent as _  # noqa: F401  (import shape check only)
+
+    event = _event(tx_hash="0x" + "d1" * 32)
+    monkeypatch.setattr(reconciler, "verify_outcome", lambda *a, **k: event)
+
+    stores = {"buyer": buyer_store, "provider": provider_store}
+    depth_during_first_delivery = {}
+    real_ingest = buyer_store.ingest
+
+    def watched(evt):
+        depth_during_first_delivery["provider"] = provider_store._depth
+        return real_ingest(evt)
+
+    monkeypatch.setattr(buyer_store, "ingest", watched)
+    reconciler.reconcile(stores, object(), object())
+
+    assert depth_during_first_delivery["provider"] > 0, (
+        "the provider memory was not held while the buyer's was being written, so a reader "
+        "between the two deliveries sees a one-sided history"
+    )
+
+
+def test_recall_reads_the_stores_that_set_the_price(tmp_path, monkeypatch, capsys):
+    """The command named after the thing this project demonstrates read the wrong file.
+
+    It called a fuzzy helper against `WRASSE_MEMORY_PATH`, a third database neither side ever
+    writes to. `MemoryClient` creates a missing file, so it answered `cold_start: true,
+    verdict: empty_store` about a store that had never existed, while both real memories held
+    full history. A judge running it to inspect what an agent remembers was told: nothing.
+
+    `WRASSE_MEMORY_PATH` is pointed at a path that cannot exist, so a regression to the old
+    helper fails here rather than passing quietly against an empty file it invents.
+    """
+
+    import json as _json
+
+    from wrasse.cli import main
+
+    buyer = _open(tmp_path, "buyer", BUYER, "buyer.db")
+    provider = _open(tmp_path, "provider", PROVIDER, "provider.db")
+    event = _event(tx_hash="0x" + "f1" * 32)
+    buyer.ingest(event)
+    provider.ingest(event)
+
+    monkeypatch.setenv("WRASSE_BUYER_MEMORY_PATH", str(tmp_path / "buyer.db"))
+    monkeypatch.setenv("WRASSE_PROVIDER_MEMORY_PATH", str(tmp_path / "provider.db"))
+    monkeypatch.setenv("WRASSE_BUYER_ADDRESS", BUYER)
+    monkeypatch.setenv("WRASSE_PROVIDER_A_ADDRESS", PROVIDER)
+    monkeypatch.setenv("WRASSE_ESCROW_ADDRESS", ESCROW)
+    monkeypatch.setenv("BASE_SEPOLIA_CHAIN_ID", str(CHAIN_ID))
+    monkeypatch.setenv("WRASSE_MEMORY_PATH", str(tmp_path / "does" / "not" / "exist.db"))
+
+    assert main(["recall", PROVIDER]) == 0
+    printed = _json.loads(capsys.readouterr().out)
+
+    assert set(printed) == {"buyer", "provider"}, "both sides, because both remember"
+    for side in ("buyer", "provider"):
+        assert printed[side]["cold_start"] is False
+        assert len(printed[side]["evidence"]) == 1
+
+
+def test_store_repair_puts_back_a_lost_index_entry(tmp_path, monkeypatch, capsys):
+    """The repair existed and could not be run, which made "repairable" and "fatal" the same.
+
+    A lost index entry prices as a cold start, and a cold start is exactly what a genuinely
+    unknown counterparty looks like, so the failure is silent and reads as a correct answer.
+    `repair_index` detects and fixes it and had no caller outside the tests.
+    """
+
+    import json as _json
+
+    from wrasse.cli import main
+    from wrasse.store import INDEX_CATEGORY
+
+    buyer = _open(tmp_path, "buyer", BUYER, "buyer.db")
+    provider = _open(tmp_path, "provider", PROVIDER, "provider.db")
+    event = _event(tx_hash="0x" + "a7" * 32)
+    buyer.ingest(event)
+    provider.ingest(event)
+    assert len(buyer.recall(PROVIDER).evidence) == 1
+
+    # lose the projection, keeping the canonical entity, which is the repairable direction
+    for row in buyer.memory.list_entities(INDEX_CATEGORY, limit=10):
+        buyer.memory.delete_entity(INDEX_CATEGORY, row["name"])
+    assert buyer.recall(PROVIDER).is_cold_start, "this is the silent failure being repaired"
+
+    monkeypatch.setenv("WRASSE_BUYER_MEMORY_PATH", str(tmp_path / "buyer.db"))
+    monkeypatch.setenv("WRASSE_PROVIDER_MEMORY_PATH", str(tmp_path / "provider.db"))
+    monkeypatch.setenv("WRASSE_BUYER_ADDRESS", BUYER)
+    monkeypatch.setenv("WRASSE_PROVIDER_A_ADDRESS", PROVIDER)
+    monkeypatch.setenv("WRASSE_ESCROW_ADDRESS", ESCROW)
+    monkeypatch.setenv("BASE_SEPOLIA_CHAIN_ID", str(CHAIN_ID))
+
+    assert main(["store-repair"]) == 0
+    printed = _json.loads(capsys.readouterr().out)
+    assert printed["buyer"]["index_entries_repaired"] == 1
+    assert printed["buyer"]["unfinished_ingests"] == []
+
+    assert len(_open(tmp_path, "buyer", BUYER, "buyer.db").recall(PROVIDER).evidence) == 1, (
+        "and the history is priceable again"
+    )

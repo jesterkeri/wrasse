@@ -37,17 +37,27 @@ class EvidenceRecall:
         }
 
 
-def recall_counterparty_evidence(
+def fuzzy_search_never_for_pricing(
     memory: MemoryReader,
     counterparty: str,
     *,
     limit: int = 100,
 ) -> EvidenceRecall:
-    """Recall verified chain events, or stop if memory cannot be consulted.
+    """Fuzzy, capped recall for discovery and display. **Never for setting a price.**
 
-    A reachable store with no exact evidence for this counterparty is an honest
-    cold start. Any Sibyl failure is fatal: callers must not generate terms from
-    guessed or silently empty history.
+    The name is the warning, because the old one was `recall_counterparty_evidence` and the
+    `recall` command called it against the wrong database for weeks.
+
+    Two properties make it unfit for pricing, and both are by design here. It searches rather
+    than reading the exact counterparty index, so it can miss a matching row without ever
+    reaching its limit. And the limit is applied *before* the counterparty filter, so a hundred
+    unrelated rows report no match while the evidence sits behind them. `WrasseStore.recall`
+    is the pricing path: exact lookup, identity checked, pending markers refused, every row
+    validated.
+
+    A reachable store with no exact evidence for this counterparty is an honest cold start.
+    Any Sibyl failure is fatal: callers must not generate terms from guessed or silently empty
+    history.
     """
 
     normalized = counterparty.lower()

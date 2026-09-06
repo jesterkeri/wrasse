@@ -22,7 +22,7 @@ import fcntl
 import hashlib
 import json
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +31,14 @@ from typing import Any, Iterator
 from sibyl_memory_client import MemoryClient, NotFoundError, SibylMemoryError
 from web3 import Web3
 
-from .evidence import CHAIN_EVENT_CATEGORY, EVENT_TYPES, ChainEvent, event_id, persist_verified_event
+from .evidence import (
+    CHAIN_EVENT_CATEGORY,
+    EVENT_TYPES,
+    ChainEvent,
+    EventConflict,
+    event_id,
+    persist_verified_event,
+)
 from .memory_gate import MemoryRequired
 
 STORE_SCHEMA_VERSION = 1
@@ -127,6 +134,29 @@ def _file_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextmanager
+def both_locked(stores: dict[str, "WrasseStore"]) -> Iterator[None]:
+    """Hold every memory at once, in a fixed order, so a group of them reads one moment.
+
+    Ordered by resolved lock path rather than by role, because two processes taking the two
+    locks in opposite orders deadlock, and role order is stable only while every caller
+    happens to spell it the same way.
+
+    Lived in `cli` until a review pointed out that `reconcile` delivers to both stores in a
+    dict comprehension, taking each lock in turn. A quote acquiring both in the window between
+    the two ingests sees a genuinely one-sided history and aborts, accusing the two memories of
+    disagreeing when the second delivery was milliseconds away. Unreachable while one person
+    drove one command at a time, and reachable the moment a hosted quote service reads while an
+    operator reconciles, which is the demo architecture.
+    """
+
+    ordered = sorted(stores.values(), key=lambda store: str(store._lock_path))
+    with ExitStack() as stack:
+        for store in ordered:
+            stack.enter_context(store.lock())
+        yield
 
 
 class WrasseStore:
@@ -375,7 +405,21 @@ class WrasseStore:
                 PENDING_CATEGORY, identifier,
                 {"event_id": identifier, "started_at": _now()}, status="verified",
             )
-            result = persist_verified_event(self._memory, event)
+            try:
+                result = persist_verified_event(self._memory, event)
+            except EventConflict:
+                # The mark exists to say "something started and may not have finished". A
+                # conflict is neither: it is raised before any mutation, so nothing started.
+                # Leaving the mark standing killed the store, because the only body that
+                # clears it is the one being refused. A reorg reaches this without a bug or an
+                # attacker: `event_id` covers chain, contract, transaction and log index, the
+                # body also carries `block_number`, and after a re-inclusion every command
+                # produces the new body while only the old one would clear the mark.
+                #
+                # The conflict is still raised. Two bodies for one id must never be resolved
+                # by arrival order. What must not happen is the store dying alongside it.
+                self._memory.delete_entity(PENDING_CATEGORY, identifier)
+                raise
             body = result.entity["body"]
             counterparty = self.counterparty_of(body)
             if counterparty is not None:

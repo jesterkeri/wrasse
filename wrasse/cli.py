@@ -9,10 +9,9 @@ import sys
 import secrets
 import tempfile
 import time
-from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, NamedTuple
+from typing import Any, NamedTuple
 
 from dotenv import load_dotenv
 from sibyl_memory_client import MemoryClient
@@ -28,7 +27,6 @@ from .dimensions import (
     load_dimensions,
 )
 from .engine import PROFILES, produce_provider_terms, produce_terms
-from .memory_gate import recall_counterparty_evidence
 from .constants import NEGOTIATION_MANIFEST
 from .policy_document import (
     MAX_POLICY_BYTES,
@@ -40,6 +38,7 @@ from .policy_document import (
 from .policy_document import _no_duplicate_keys as no_duplicate_keys
 from .providers import ProviderPersona
 from .store import WrasseStore, persona_digest
+from .store import both_locked as store_both_locked
 from .policy_hash import (
     BPS_DENOMINATOR,
     ENGINE_VERSION,
@@ -525,20 +524,14 @@ def _document_halves(
     }
 
 
-@contextmanager
-def _both_locked(stores: dict[str, WrasseStore]) -> Iterator[None]:
-    """Hold both memories at once, in a fixed order, so a quote reads one moment.
+def _both_locked(stores: dict[str, WrasseStore]):
+    """One definition of the ordering, in `store`, where `reconcile` can reach it too.
 
-    The order is by resolved lock path rather than by role, because two processes taking the
-    two locks in opposite orders would deadlock, and role order is only stable while every
-    caller happens to spell it the same way.
+    It lived here, and `reconcile` could not import it without a cycle, so `reconcile` took the
+    two locks one at a time instead. Two copies of an ordering rule is one more than is safe.
     """
 
-    ordered = sorted(stores.values(), key=lambda store: str(store._lock_path))
-    with ExitStack() as stack:
-        for store in ordered:
-            stack.enter_context(store.lock())
-        yield
+    return store_both_locked(stores)
 
 
 @dataclass(frozen=True)
@@ -675,6 +668,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     recall = sub.add_parser("recall", help="recall verified evidence for a provider")
     recall.add_argument("provider")
+    sub.add_parser(
+        "store-repair",
+        help="rebuild each memory's counterparty index and report any unfinished ingest",
+    )
     learn = sub.add_parser("learn-dimension", help="learn or reuse a dimension for a verified event")
     learn.add_argument("event_id")
     learn.add_argument(
@@ -1893,14 +1890,75 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
     if args.command == "recall":
-        recalled = recall_counterparty_evidence(_memory(), args.provider)
+        # Through the identified stores, which is what the pricing path reads.
+        #
+        # It used to call `recall_counterparty_evidence(_memory(), ...)`, and `_memory()`
+        # opens `WRASSE_MEMORY_PATH`, a third database neither side writes to. `MemoryClient`
+        # creates a missing file, so the command named after the thing this project
+        # demonstrates reported an honest-looking empty store about a file nothing had ever
+        # written. It was also fuzzy where the price is exact, and capped at 100 rows *before*
+        # filtering by counterparty, so a hundred unrelated rows reported no match while the
+        # evidence sat behind them.
+        #
+        # Both locks, because printing two sequential reads of a pair is the same defect
+        # `_bilateral_quote` documents: two snapshots are not one snapshot.
+        stores = _open_stores(
+            buyer=_required_env("WRASSE_BUYER_ADDRESS"),
+            provider=_required_env("WRASSE_PROVIDER_A_ADDRESS"),
+        )
+        with _both_locked(stores):
+            recalled = {
+                "buyer": stores["buyer"].recall(
+                    Web3.to_checksum_address(args.provider)
+                ),
+                "provider": stores["provider"].recall(
+                    Web3.to_checksum_address(_required_env("WRASSE_BUYER_ADDRESS"))
+                ),
+            }
         print(json.dumps({
-            "counterparty": recalled.counterparty,
-            "cold_start": recalled.is_cold_start,
-            "verdict": recalled.verdict,
-            "evidence": list(recalled.evidence),
+            side: {
+                "counterparty": r.counterparty,
+                "cold_start": r.is_cold_start,
+                "verdict": r.verdict,
+                "evidence": list(r.evidence),
+            }
+            for side, r in recalled.items()
         }, indent=2, sort_keys=True))
         return 0
+    if args.command == "store-repair":
+        # The repair the design always described and never exposed.
+        #
+        # `repair_index` and `finish_pending` existed, were correct, and had no caller outside
+        # the tests. So "a missing index entry is repairable" was true of the code and false of
+        # the build: a lost entry priced as a cold start, which reads exactly like a
+        # counterparty nobody has met, and nothing could put it back.
+        #
+        # It does not call `finish_pending`, which needs the original `ChainEvent` objects and
+        # the CLI cannot reconstruct them. It reports the ids instead and says how to replay.
+        stores = _open_stores(
+            buyer=_required_env("WRASSE_BUYER_ADDRESS"),
+            provider=_required_env("WRASSE_PROVIDER_A_ADDRESS"),
+        )
+        report: dict[str, Any] = {}
+        with _both_locked(stores):
+            for side, store in stores.items():
+                report[side] = {
+                    "index_entries_repaired": store.repair_index(),
+                    "unfinished_ingests": store.pending_ingestions(),
+                }
+        stranded = sorted({
+            identifier
+            for side in report.values()
+            for identifier in side["unfinished_ingests"]
+        })
+        if stranded:
+            report["next"] = (
+                "replay these receipts with `wrasse ingest <tx_hash>`; until then neither "
+                "memory will price, because a store that cannot say what it holds must not "
+                "quote from it"
+            )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 1 if stranded else 0
     if args.command == "learn-dimension":
         # One model call, then the same definition into each side's own store. They hold it
         # separately because they are separate memories, not because they disagree.

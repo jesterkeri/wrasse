@@ -17,6 +17,7 @@ from web3 import Web3
 from . import chain, escrow
 from .chain import _as_hex
 from .evidence import ChainEvent
+from .store import both_locked
 
 TIMEOUT_SIGNATURE = Web3.keccak(text="TimeoutClaimed(uint256)")
 RELEASED_SIGNATURE = Web3.keccak(text="DealReleased(uint256,bool)")
@@ -213,4 +214,9 @@ def reconcile(
     """
 
     event = verify_outcome(web3, ledger, **expected)
-    return {name: store.ingest(event) for name, store in stores.items()}
+    # Both locks across both deliveries, not one lock per delivery. A reader taking both in the
+    # gap between them sees one side holding a receipt the other does not, which is exactly
+    # what a corrupted pair looks like, and the quote correctly refuses. The receipt was fine;
+    # the window was the defect.
+    with both_locked(stores):
+        return {name: store.ingest(event) for name, store in stores.items()}

@@ -4,7 +4,7 @@ import pytest
 from sibyl_memory_client import MemoryClient, StorageError
 
 from wrasse.evidence import persist_verified_event
-from wrasse.memory_gate import MemoryRequired, recall_counterparty_evidence
+from wrasse.memory_gate import MemoryRequired, fuzzy_search_never_for_pricing
 
 
 class BrokenMemory:
@@ -14,7 +14,7 @@ class BrokenMemory:
 
 def test_empty_store_is_an_explicit_cold_start(tmp_path):
     memory = MemoryClient.local(tmp_path / "memory.db")
-    recalled = recall_counterparty_evidence(
+    recalled = fuzzy_search_never_for_pricing(
         memory, "0x3333333333333333333333333333333333333333"
     )
     assert recalled.evidence == ()
@@ -25,7 +25,7 @@ def test_empty_store_is_an_explicit_cold_start(tmp_path):
 def test_non_matching_nonempty_store_is_an_explicit_cold_start(tmp_path):
     memory = MemoryClient.local(tmp_path / "memory.db")
     memory.set_entity("chain_event", "unrelated", {"provider": "0x" + "44" * 20})
-    recalled = recall_counterparty_evidence(
+    recalled = fuzzy_search_never_for_pricing(
         memory, "0x3333333333333333333333333333333333333333"
     )
     assert recalled.evidence == ()
@@ -35,7 +35,7 @@ def test_non_matching_nonempty_store_is_an_explicit_cold_start(tmp_path):
 
 def test_memory_failure_stops_term_generation():
     with pytest.raises(MemoryRequired):
-        recall_counterparty_evidence(
+        fuzzy_search_never_for_pricing(
             BrokenMemory(), "0x3333333333333333333333333333333333333333"
         )
 
@@ -47,7 +47,7 @@ def test_fresh_client_recalls_prior_verified_event(tmp_path, chain_event):
     del first_process
 
     fresh_process = MemoryClient.local(database)
-    recalled = recall_counterparty_evidence(fresh_process, chain_event.provider)
+    recalled = fuzzy_search_never_for_pricing(fresh_process, chain_event.provider)
     assert len(recalled.evidence) == 1
     assert recalled.evidence[0]["event_id"]
     assert recalled.verdict == "ok"
