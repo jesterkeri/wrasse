@@ -1,4 +1,20 @@
+# --- Secrets -------------------------------------------------------------------------
+# `.env` on its own matched only that exact name. A `.env.local` or a `.env.production`
+# would have been committed by the next `git add -A`, which is how this goes wrong: not
+# by adding a secret on purpose, but by adding a file nobody thought was one.
 .env
+.env.*
+!.env.example
+
+# Keystores and their passwords, wherever they are put. `.wrasse/` covers today's layout
+# and these cover a copy made somewhere else at three in the morning.
+*.key
+*.pem
+*.p12
+*keystore*
+*.password
+secrets/
+
 .venv/
 __pycache__/
 *.py[cod]
@@ -9,13 +25,17 @@ dist/
 build/
 *.egg-info/
 
-# Sibyl local state and generated demo output
+# --- Sibyl local state and generated demo output -------------------------------------
+# Both memories, the transaction ledger and the quote. The stores hold this machine's own
+# view of two agents; they are rebuildable from chain receipts and are not a build input.
 .wrasse/
+*.db
+*.db-journal
+*.db-wal
 policy.json
 
-# Foundry
+# --- Foundry --------------------------------------------------------------------------
 contracts/cache/
 contracts/out/
 contracts/broadcast/
 contracts/lib/
-
