@@ -22,11 +22,14 @@ JOURNAL_MARKER_CATEGORY = "chain_event_journalled"
 #: Closed and ABI-derived. An event type outside this set never came from a log this build
 #: recognises, so it can never become evidence.
 #:
-#: `SUBJECTS_OF` says whose conduct a receipt is evidence about and `VALENCE_OF` says whether
-#: that conduct is a reason to demand safer terms or to offer easier ones. Both are re-exported
-#: from `constants` rather than defined here, because both are consumed on the pricing path and
-#: a constant that decides a term belongs to the digest claiming to cover the term. The
-#: reasoning behind every entry is written out there.
+#: `SUBJECTS_OF` says whose conduct a receipt is evidence about. It is re-exported from
+#: `constants` rather than defined here, because it is consumed on the pricing path and a table
+#: that decides a term belongs to the digest claiming to cover the term. The reasoning behind
+#: every entry is written out there.
+#:
+#: `VALENCE_OF` lives beside it in `constants` and is **not** re-exported through this module.
+#: `dimensions` imports it from the source directly. This comment used to claim both were
+#: re-exported here, which would have sent anyone following it into an `ImportError`.
 EVENT_TYPES = frozenset(SUBJECTS_OF)
 
 

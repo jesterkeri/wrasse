@@ -511,6 +511,9 @@ def test_every_constant_that_can_move_a_term_is_in_the_manifest():
         "limit_names", "limit_kinds", "walkaway_rules",
         "evidence_subjects", "evidence_valence",
         "max_price_bps", "min_settled_price_wei",
+        # Round five. `_score` multiplies every provider contribution by this as well as by
+        # the weight, so it is a second global multiplier however much it looks like a 1.
+        "provider_relevance_multiplier",
     ):
         assert required in NEGOTIATION_MANIFEST, f"{required} can move a term and is not hashed"
 
@@ -757,6 +760,49 @@ def test_the_provider_risk_weight_is_hashed_and_applied_exactly_once():
         "the weight is applied once, not squared"
     )
     assert engine._EQUALLY_RELEVANT(None) == Decimal(1)
+
+
+def test_the_provider_relevance_multiplier_is_hashed_and_read(monkeypatch):
+    """The last unhashed number that could move a term, and the hardest to see.
+
+    It looked like the identity of multiplication rather than a policy value, and was defended
+    as such. But `_score` multiplies every provider contribution by it, so editing it moves the
+    provider's risk and with it the price, the payout delay, the bond ceiling and the price
+    floor, under an unchanged `ENGINE_VERSION`. The membership test asks what a change would
+    do, and the answer does not depend on the value being 1 today.
+    """
+
+    import hashlib
+    import json as _json
+    from decimal import Decimal
+
+    from wrasse import constants, engine
+
+    # hashed: moving it moves the version
+    edited = _json.loads(constants.canonical_manifest())
+    edited["provider_relevance_multiplier"] = "2"
+    digest = hashlib.sha256(
+        _json.dumps(edited, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert digest[:12] != constants.MANIFEST_DIGEST[:12]
+
+    # and read: moving it moves the score, so the manifest entry is not a decoration
+    monkeypatch.setattr(engine, "PROVIDER_RELEVANCE_MULTIPLIER", "2")
+    assert engine._EQUALLY_RELEVANT(None) == Decimal(2)
+
+    class _Dimension:
+        source_event_type = "delivered_and_claimed_after_delay"
+        severity = "0.4"
+        confidence = "1"
+        signal_direction = "negative"
+
+    events = [{"event_id": "0x" + "33" * 32,
+               "event_type": "delivered_and_claimed_after_delay"}]
+    doubled, _ = engine._score(
+        events, [_Dimension()], about="buyer",
+        weight=Decimal(1), relevance=engine._EQUALLY_RELEVANT,
+    )
+    assert doubled == Decimal("0.8"), "the multiplier scales the contribution"
 
 
 def test_the_relevance_function_is_not_a_second_copy_of_the_weight(monkeypatch):

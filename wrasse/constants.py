@@ -122,6 +122,18 @@ RISK_CEILING = "1"
 #: pointed out that the version claiming to cover the arithmetic did not cover this.
 PROVIDER_RISK_WEIGHT = "1"
 
+#: And the relevance every dimension carries for it. Separate from the weight above, because
+#: `_score` multiplies a contribution by both and passing one value into both slots squared it.
+#:
+#: This was a bare `Decimal(1)` in the engine, defended as the identity of multiplication rather
+#: than a policy number. That argument explains why the intended value is 1. It does not take
+#: the literal out of the arithmetic: `_score` multiplies every provider contribution by it, so
+#: editing it moves the provider's risk and with it the price, the payout delay, the bond
+#: ceiling and the price floor. Changing it from 1 to 2 took risk 0.7200 to 1.0000 and the price
+#: proposal from 11800 to 12500 bps under an unchanged `ENGINE_VERSION`. That is the membership
+#: test answered in the affirmative, whatever the value happens to be today.
+PROVIDER_RELEVANCE_MULTIPLIER = "1"
+
 #: The mode every rounding in the engine uses, and the quantum each rounds to. `ROUND_HALF_UP`
 #: against Python's default banker's rounding is a whole unit at exactly `.5`.
 #:
@@ -297,6 +309,7 @@ NEGOTIATION_MANIFEST: dict[str, Any] = {
     "risk_floor": RISK_FLOOR,
     "risk_ceiling": RISK_CEILING,
     "provider_risk_weight": PROVIDER_RISK_WEIGHT,
+    "provider_relevance_multiplier": PROVIDER_RELEVANCE_MULTIPLIER,
     "rounding": ROUNDING,
     "integer_quantum": INTEGER_QUANTUM,
     "risk_display_quantum": RISK_DISPLAY_QUANTUM,

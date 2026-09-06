@@ -15,6 +15,7 @@ from .constants import (
     INTEGER_QUANTUM,
     MIN_SERVICE_WINDOW_SECONDS,
     PROFILE_FIELDS,
+    PROVIDER_RELEVANCE_MULTIPLIER,
     PROVIDER_RISK_WEIGHT,
     RELEVANT_MULTIPLIER,
     RISK_CEILING,
@@ -162,12 +163,17 @@ def produce_terms(
 def _EQUALLY_RELEVANT(_dimension) -> Decimal:
     """The provider's relevance function: every dimension counts the same to it.
 
-    Not a policy number and so not a manifest entry. It is the identity of multiplication,
-    which is what "no task profile, so nothing is more relevant than anything else" means. The
-    one number that *is* policy on this side is `PROVIDER_RISK_WEIGHT`, and it is passed once.
+    The provider has no task profile, so no dimension is more relevant to it than another, and
+    the value is 1. That is why it is 1; it is not why it may sit outside the manifest.
+
+    It was a bare literal here on exactly that reasoning, that the identity of multiplication is
+    not a policy number. `_score` multiplies every provider contribution by it, so editing it
+    moves the provider's risk and with it four published numbers, under an unchanged version.
+    The membership test is "can editing this change a term?", and the answer does not depend on
+    the value being 1 today. So it is hashed, and read from the hashed table.
     """
 
-    return Decimal(1)
+    return Decimal(PROVIDER_RELEVANCE_MULTIPLIER)
 
 
 @dataclass(frozen=True)

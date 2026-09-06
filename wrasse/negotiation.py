@@ -5,9 +5,14 @@ price and payout delay from the provider, with nothing between them. That is two
 stapled into one document, not a bargain.
 
 **The shape.** Every term has one *proposer* and one *opposer*. The opposer publishes a limit,
-the proposer publishes a walk-away, and the settlement is a comparison of four numbers. It is
-a pure function: given the same eight numbers it always produces the same result, and a reader
-holding only the document can reproduce it without consulting either memory.
+the proposer publishes a walk-away, and the settlement of that term is a comparison of three
+numbers: the proposal, the limit and the walk-away. Twelve across the four, and the document
+publishes all twelve. It is a pure function of them, and a reader holding only the document
+reproduces it without consulting either memory.
+
+The count used to read "eight", from before the walk-aways were published. That was not a
+typo. It was the mental model that left three of the four out of the document and made a
+refusal on bond, window or delay uncheckable, so it is worth correcting rather than tidying.
 
 **Which limits move.** A limit may move with its publisher's memory, but only if the movement
 is monotone *against the party whose conduct moved it*: a worse record must make that party's
