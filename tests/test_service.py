@@ -85,7 +85,9 @@ def test_it_answers_with_no_keystore_no_password_and_no_ledger(service):
 
     response = client.get("/api/quote", params={"memory": "on"})
     assert response.status_code == 200
-    assert response.json()["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 2_480
+    body = response.json()
+    assert body["profiles"][0]["terms"]["provider_bond_bps"] == 2_480
+    assert body["memories"]["buyer"]["receipts"] and len(body["memories"]["buyer"]["receipts"]) == 2
 
 
 def test_a_quote_makes_no_network_call_at_all(service):
@@ -99,9 +101,9 @@ def test_a_quote_makes_no_network_call_at_all(service):
     client, _ = service
     body = client.get("/api/quote", params={"memory": "on"}).json()
 
-    assert body["executability"]["executable"] is False
-    assert body["executability"]["basis"] == "supplied-reference"
-    assert body["executability"]["chain"] is None
+    assert body["document"]["executability"]["executable"] is False
+    assert body["document"]["executability"]["basis"] == "supplied-reference"
+    assert body["document"]["executability"]["chain"] is None
 
 
 def test_memory_off_and_on_are_the_same_engine_and_different_answers(service):
@@ -112,16 +114,16 @@ def test_memory_off_and_on_are_the_same_engine_and_different_answers(service):
     cold = client.get("/api/quote", params={"memory": "off"}).json()
 
     assert warm["engine_version"] == cold["engine_version"]
-    assert warm["memory"] == "on" and cold["memory"] == "off"
+    assert warm["memory"] is True and cold["memory"] is False
 
-    assert cold["buyer"]["cold_start"] is True
-    assert warm["buyer"]["cold_start"] is False
+    assert cold["memories"]["buyer"]["cold_start"] is True
+    assert warm["memories"]["buyer"]["cold_start"] is False
 
-    assert cold["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 500
-    assert warm["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 2_480
+    assert cold["document"]["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 500
+    assert warm["document"]["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 2_480
 
-    assert cold["buyer"]["profiles"]["budget"]["settlement"]["agreed"] is True
-    assert warm["buyer"]["profiles"]["budget"]["settlement"] == {
+    assert cold["document"]["buyer"]["profiles"]["budget"]["settlement"]["agreed"] is True
+    assert warm["document"]["buyer"]["profiles"]["budget"]["settlement"] == {
         "agreed": False, "failed_on": "price_bps", "gap": 850,
     }
 
@@ -180,10 +182,16 @@ def test_the_document_is_returned_as_produced(service):
     body = client.get("/api/quote", params={"memory": "on"}).json()
 
     assert set(body) == {
-        "schema_version", "request_id", "chain_id", "contract_address", "engine_version",
-        "engine", "executability", "buyer", "provider", "memory",
+        "engine_version", "chain_id", "contract_address", "memory", "baseline",
+        "limit_kinds", "limit_names", "persona", "memories", "profiles", "document",
     }
-    published = body["engine"]["negotiation_manifest"]
+    # The document rides along untouched, so the projection can be checked against it here
+    # rather than in a second request that might answer differently.
+    assert set(body["document"]) == {
+        "schema_version", "request_id", "chain_id", "contract_address", "engine_version",
+        "engine", "executability", "buyer", "provider",
+    }
+    published = body["document"]["engine"]["negotiation_manifest"]
     digest = hashlib.sha256(
         json.dumps(published, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -253,7 +261,7 @@ def test_a_read_only_source_is_copied_before_anything_opens_it(tmp_path, monkeyp
     })
 
     body = TestClient(module.app).get("/api/quote", params={"memory": "on"}).json()
-    assert body["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 2_480
+    assert body["document"]["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 2_480
 
     # the source is untouched, which is the property the mount is for
     assert all(path.stat().st_mode & 0o200 == 0 for path in source.glob("*.db"))
@@ -283,3 +291,93 @@ def test_a_configured_source_that_is_missing_fails_loudly(tmp_path, monkeypatch)
 
     with pytest.raises(RuntimeError, match="is missing"):
         module.prepare_working_copies()
+
+
+def test_every_number_the_page_shows_is_in_the_document(service):
+    """A projection is where a displayed term quietly stops being the produced one.
+
+    The rule for `wrasse/page.py` is that nothing is recomputed. Values are selected from the
+    document, never derived by arithmetic. This walks the whole projection and requires each
+    number to appear at the place in the document it claims to come from, so a projection that
+    started doing sums fails here rather than at judging.
+    """
+
+    client, _ = service
+    body = client.get("/api/quote", params={"memory": "on"}).json()
+    doc = body["document"]
+    profiles = doc["buyer"]["profiles"]
+
+    assert body["engine_version"] == doc["engine_version"]
+    assert body["chain_id"] == doc["chain_id"]
+    assert body["contract_address"] == doc["contract_address"]
+    assert body["baseline"] == profiles["urgent"]["baseline"]
+    assert body["persona"]["name"] == doc["provider"]["persona"]["name"]
+    assert body["persona"]["cashflow_sensitivity"] == \
+        doc["provider"]["persona"]["cashflow_sensitivity"]
+
+    for side in ("buyer", "provider"):
+        shown = body["memories"][side]
+        assert shown["address"] == doc[side]["address"]
+        assert shown["verdict"] == doc[side]["verdict"]
+        assert shown["cold_start"] == doc[side]["cold_start"]
+
+        # the receipt list is the recalled evidence, plus `subject` and nothing else
+        assert len(shown["receipts"]) == len(doc[side]["recalled_evidence"])
+        for projected, original in zip(shown["receipts"], doc[side]["recalled_evidence"]):
+            assert {k: v for k, v in projected.items() if k != "subject"} == original
+            assert projected["subject"] in ("buyer", "provider", "buyer and provider")
+
+        # risk is one value per side and per-profile in the document, so it must be one the
+        # document actually contains rather than an average of them
+        assert shown["risk"] in {profiles[n][side]["risk"] for n in profiles}
+
+        # and the cited set is the union, so nothing is marked used that no profile used
+        union = {i for n in profiles for i in profiles[n][side]["used_evidence_ids"]}
+        assert set(shown["used_evidence_ids"]) == union
+
+    for row in body["profiles"]:
+        profile = profiles[row["id"]]
+        settlement = profile["settlement"]
+        assert row["agreed"] == settlement["agreed"]
+        if row["agreed"]:
+            assert row["terms"] == profile["terms"]
+            assert row["policy_hash"] == profile["policy_hash"]
+            assert row["moves"] == settlement["moves"]
+            # a term that stood shows its own proposal, unchanged
+            proposals = {**profile["buyer"]["proposes"], **profile["provider"]["proposes"]}
+            moved = {m["term"] for m in settlement["moves"]}
+            assert {s["term"] for s in row["stood"]} == set(proposals) - moved
+            for stood in row["stood"]:
+                assert stood["value"] == proposals[stood["term"]]
+        else:
+            assert row["failed_on"] == settlement["failed_on"]
+            assert row["gap"] == settlement["gap"]
+            assert row["provider_floor_bps"] == profile["provider"]["walkaways"]["price_bps"]
+            assert row["buyer_ceiling_bps"] == profile["buyer"]["limits"]["max_price_bps"]
+
+
+def test_the_page_sees_the_receipts_when_memory_is_on(service):
+    """The bug this projection exists to fix.
+
+    The page read `memories.<side>.receipts` and the service returned `recalled_evidence`
+    nested under each side, so it rendered "0 receipts" beside a live quote that had two. It
+    looked like a system that remembers nothing, which is the one failure this project cannot
+    afford to show a judge.
+    """
+
+    client, _ = service
+    warm = client.post("/api/quote", json={"memory": True}).json()
+    cold = client.post("/api/quote", json={"memory": False}).json()
+
+    assert len(warm["memories"]["buyer"]["receipts"]) == 2
+    assert len(warm["memories"]["provider"]["receipts"]) == 2
+    assert warm["memories"]["buyer"]["risk"] == "1.0000"
+    assert warm["memories"]["provider"]["risk"] == "0.7200"
+
+    assert cold["memories"]["buyer"]["receipts"] == []
+    assert cold["memories"]["buyer"]["risk"] == "0.0000"
+
+    # and the marked receipt is the one that moved this side's numbers
+    cited = warm["memories"]["buyer"]["used_evidence_ids"]
+    assert len(cited) == 1
+    assert cited[0] in {r["event_id"] for r in warm["memories"]["buyer"]["receipts"]}

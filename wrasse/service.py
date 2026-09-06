@@ -58,6 +58,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import cli
+from .page import page_view
 from .negotiation import BASELINE_BOUNDS
 
 #: The two memory settings the page toggles between. `on` is what the two agents actually
@@ -228,8 +229,7 @@ def _quote(
             },
         ) from error
 
-    document["memory"] = memory
-    return JSONResponse(document)
+    return JSONResponse(page_view(document, memory=memory == WARM))
 
 
 class Baseline(BaseModel):
