@@ -1273,7 +1273,10 @@ def test_a_refused_opt_in_costs_the_wallet_nothing(both_roles, capsys, monkeypat
     capsys.readouterr()
 
     ledger = chain.TransactionLedger(os.environ["WRASSE_TX_DB"])
-    provider = Web3.to_checksum_address(os.environ["WRASSE_PROVIDER_A_ADDRESS"])
+    # `chain.canonical_address`, not `to_checksum_address`. The ledger stores wallets
+    # lowercase, so a checksummed comparison matches nothing and the assertion below would
+    # pass whatever the ledger held.
+    provider = chain.canonical_address(os.environ["WRASSE_PROVIDER_A_ADDRESS"])
     held = [row for row in ledger.rows() if row.wallet == provider]
     assert held == [], (
         "nothing was sent, so nothing may be recorded; a row here is a nonce nobody can free"
@@ -1286,3 +1289,65 @@ def test_a_refused_opt_in_costs_the_wallet_nothing(both_roles, capsys, monkeypat
     assert main(["tx-resolve"]) == 0
     capsys.readouterr()
     assert escrow_state(both_roles["web3"], both_roles["address"], deal_id) == "Accepted"
+
+
+def test_a_deal_action_whose_bytes_vanished_is_actually_resent(both_roles, capsys, monkeypatch):
+    """The gate the first fix missed, and the test shape that let it through.
+
+    Making the *verdict* reachable is not the same as making the resend happen. The verdict
+    gate in `chain.resolve` and the send gate in `_tx_resolve` both compare against
+    `accept_by`, and deal actions are signed with zero. Fixing only the first meant
+    `tx-resolve --rebroadcast` reported `unknown` with `may_rebroadcast: True`, then walked
+    into the second gate and wrote the row straight back to `stuck`. Reachable in the verdict,
+    unreachable in practice, and running it again did the same thing.
+
+    Every test written for the first fix called `chain.resolve` directly and asserted the
+    verdict. None drove the command. So the suite proved the verdict permitted a resend and
+    never checked that one happened. That is the same shape as the earlier miss: the exception
+    was never the bug, the nonce was; here the verdict was never the bug, the resend was.
+
+    This drives the command. The send is intercepted so the bytes never reach the chain, which
+    is what a mempool eviction or a dropped connection looks like from here, and then the
+    recovery has to be real: a receipt, a mined state change, and a wallet free again.
+    """
+
+    deal_id = _open_deal(both_roles, capsys)
+    web3 = both_roles["web3"]
+
+    # Signed, recorded, and reported as pending, but never actually sent. The ledger believes
+    # a transaction is in flight and no node has ever seen it.
+    real_broadcast = chain.broadcast
+
+    def swallow(_web3, row, **_kwargs):
+        return chain.BroadcastOutcome(chain.PENDING, "intercepted; these bytes never left")
+
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    monkeypatch.setattr(chain, "broadcast", swallow)
+    assert main(["accept-deal", "--deal-id", str(deal_id)]) == 0
+    capsys.readouterr()
+    # Restore only this. `monkeypatch.undo()` would also revert the fixture's environment,
+    # which is how the first version of this test failed on plumbing rather than on the gate.
+    monkeypatch.setattr(chain, "broadcast", real_broadcast)
+
+    ledger = chain.TransactionLedger(os.environ["WRASSE_TX_DB"])
+    provider = chain.canonical_address(os.environ["WRASSE_PROVIDER_A_ADDRESS"])
+    stranded = [row for row in ledger.rows() if row.wallet == provider]
+    assert len(stranded) == 1 and stranded[0].accept_by == 0
+
+    assert main(["tx-resolve", "--rebroadcast"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    entries = report if isinstance(report, list) else report.get("rows", [report])
+    actions = [entry.get("action", "") for entry in entries]
+    assert not any("deadline passed" in action for action in actions), (
+        f"the send gate refused a resend for an action that has no deadline: {actions}"
+    )
+
+    recovered = [row for row in ledger.rows() if row.wallet == provider][0]
+    assert recovered.status != chain.STUCK, "a resend that writes stuck back is not a recovery"
+
+    web3.eth.wait_for_transaction_receipt(recovered.tx_hash)
+    assert main(["tx-resolve"]) == 0
+    capsys.readouterr()
+    assert escrow_state(web3, both_roles["address"], deal_id) == "Accepted", (
+        "the recovery has to reach the chain, not merely leave stuck"
+    )

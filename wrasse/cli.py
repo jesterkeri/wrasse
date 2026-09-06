@@ -1684,8 +1684,13 @@ def _tx_resolve(args) -> int:
                 continue
             _require_deployment_identity(web3, _required_env("WRASSE_ESCROW_ADDRESS"), record)
 
+            # `chain.NO_DEADLINE`, exactly as in the verdict gate. This is the second of the
+            # two gates that compare against `accept_by`, and fixing only the first made the
+            # resend reachable in the verdict and unreachable in practice: `resolve` said
+            # `unknown` with `may_rebroadcast`, execution walked into this line, and the row
+            # went straight back to `stuck`. Running it again did the same thing.
             send_time = _chain_now(web3)
-            if send_time is None or row.accept_by <= send_time:
+            if send_time is None or chain.NO_DEADLINE < row.accept_by <= send_time:
                 row = ledger.set_status(row, chain.STUCK)
                 report.append({"intent_id": row.intent_id, "status": row.status,
                                "action": "the deadline passed while resolving; not resent"})
