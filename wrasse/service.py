@@ -53,7 +53,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import cli
 from .negotiation import BASELINE_BOUNDS
@@ -136,6 +137,12 @@ def _open(memory: str) -> dict[str, Any]:
     return _stores[memory]
 
 
+#: The page, served from the same origin as the API so it needs no CORS and a share link
+#: carries both. Absent in development and in the tests, where the service is exercised
+#: directly; present in a deployment, where the whole point is that one URL is the demo.
+WEB_ROOT = Path(os.getenv("WRASSE_WEB_ROOT", "web"))
+
+
 @app.get("/api/health")
 def health() -> dict:
     """Enough to tell a deploy from a corpse, and nothing that touches a wallet."""
@@ -209,3 +216,15 @@ class _SuppliedTime:
     """`_executability` reads one field off the argparse namespace. This is that field."""
 
     inclusion_margin = 0
+
+
+# Mounted last, so every `/api/...` route above wins and the page only catches what is left.
+# A missing directory is not an error: the service is useful without a page, and the tests
+# exercise it that way.
+if WEB_ROOT.is_dir():
+
+    @app.get("/")
+    def index() -> FileResponse:
+        return FileResponse(WEB_ROOT / "index.html")
+
+    app.mount("/", StaticFiles(directory=WEB_ROOT, html=True), name="web")
