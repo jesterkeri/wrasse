@@ -39,19 +39,24 @@ from typing import Any
 
 from .constants import (
     BASELINE_BOUNDS,
+    BASELINE_WIDENED_DOWN,
+    BASELINE_WIDENED_UP,
     CEILING,
+    CONCESSION,
     FLOOR,
+    LIMIT_KINDS,
+    LIMIT_NAMES,
     MAX_BOND_BPS,
+    MAX_PRICE_BPS,
+    MEMORY,
+    MIN_SETTLED_PRICE_WEI,
+    PUBLISHED,
+    RULE,
     TERM_SHAPES,
     TERMS,
+    WALKAWAY_RULES,
 )
-from .policy_hash import BPS_DENOMINATOR, MAX_DURATION, MAX_PROVIDER_BOND_BPS
-
-#: How a movement is explained. The three are disjoint and a reader has to be able to tell
-#: them apart, because only one of them is evidence.
-MEMORY = "memory"
-CONCESSION = "concession"
-RULE = "rule"
+from .policy_hash import _UINT256_MAX, BPS_DENOMINATOR, MAX_DURATION, MAX_PROVIDER_BOND_BPS
 
 #: `CEILING` and `FLOOR` say which way an opposer's limit points: a ceiling admits proposals at
 #: or below it, a floor admits proposals at or above it. `TERMS` is the fixed order the four are
@@ -199,6 +204,112 @@ def settle(positions: dict[str, Position]) -> Settlement:
 
 
 # --------------------------------------------------------------------------------------
+# Building the four positions, in one place
+#
+# The writer built them and the reader rebuilt them, from two copies of the same three `min`
+# and `max` rules. Two copies of a rule are free to drift, and neither copy was in the digest
+# claiming to describe the settlement. Worse, three of the four walk-aways were never published
+# at all, so a refusal on bond, window or delay could not be checked from the document: with a
+# bond proposal of 3 500, a ceiling of 400 and a baseline of 500, the unpublished rule is the
+# only fact separating "refuse by 100" from "settle at 400".
+#
+# So the rules are named, hashed and applied here, the walk-aways are published, and the
+# reader checks the published number against the rule rather than trusting either.
+# --------------------------------------------------------------------------------------
+
+
+def derived_walkaway(term: str, baseline: dict[str, int], proposal: int) -> int | None:
+    """The walk-away `WALKAWAY_RULES` gives for a term, or `None` when the rule is `PUBLISHED`.
+
+    `None` is not a failure. Price is published rather than derived because the provider
+    concedes only part of the way back, and how far is a function of its memory rather than of
+    the baseline. Every other term concedes to the baseline, widened to include the side's own
+    proposal.
+    """
+
+    rule = WALKAWAY_RULES[term]
+    if rule == PUBLISHED:
+        return None
+    if term not in baseline:
+        raise ValueError(
+            f"{term} concedes toward the baseline under {rule!r}, and the baseline has no "
+            f"{term}. A derived rule needs a baseline field of the same name."
+        )
+    base = baseline[term]
+    if rule == BASELINE_WIDENED_DOWN:
+        return min(base, proposal)
+    if rule == BASELINE_WIDENED_UP:
+        return max(base, proposal)
+    raise ValueError(f"no walk-away rule named {rule!r}")
+
+
+def walkaways_for(
+    baseline: dict[str, int], proposals: dict[str, int], published: dict[str, int]
+) -> dict[str, int]:
+    """Every term's walk-away: derived where there is a rule, taken as given where there is not.
+
+    Called by the writer to fill the document. The reader calls `build_positions`, which
+    applies the same rules and refuses a published number that disagrees with one.
+    """
+
+    resolved = {}
+    for term in TERMS:
+        derived = derived_walkaway(term, baseline, proposals[term])
+        if derived is None:
+            if term not in published:
+                raise ValueError(f"{term} has no derivation rule and none was published")
+            resolved[term] = published[term]
+        else:
+            resolved[term] = derived
+    return resolved
+
+
+def build_positions(
+    *,
+    baseline: dict[str, int],
+    proposals: dict[str, int],
+    limits: dict[str, int],
+    walkaways: dict[str, int],
+) -> dict[str, Position]:
+    """The four positions a settlement is decided by, from published numbers alone.
+
+    The one place they are built. The writer feeds it what memory produced and the reader feeds
+    it what the document says, so the thing checked and the thing produced cannot be two
+    different rules that happen to agree on today's data.
+
+    A walk-away with a derivation rule is recomputed here and the published value must match.
+    Publishing it as well as deriving it is not redundant: a reader who does not know Wrasse's
+    rules still gets the number, and a reader who does gets a proof that the number is the one
+    the rules give.
+    """
+
+    missing = sorted(set(TERMS) - set(proposals)) + sorted(set(TERMS) - set(limits))
+    if missing:
+        raise ValueError(f"no position published for {', '.join(missing)}")
+
+    positions = {}
+    for term in TERMS:
+        if term not in walkaways:
+            raise ValueError(f"no walk-away published for {term}")
+        expected = derived_walkaway(term, baseline, proposals[term])
+        if expected is not None and walkaways[term] != expected:
+            raise ValueError(
+                f"{term} publishes a walk-away of {walkaways[term]} where "
+                f"{WALKAWAY_RULES[term]} over a baseline of {baseline[term]} and a proposal of "
+                f"{proposals[term]} gives {expected}. A walk-away decides whether this term "
+                "agrees or refuses, so a document may not choose its own."
+            )
+        positions[term] = Position(
+            proposal=proposals[term],
+            limit=limits[term],
+            walkaway=walkaways[term],
+            limit_name=LIMIT_NAMES[term],
+            limit_kind=LIMIT_KINDS[term],
+        )
+    return positions
+
+
+# --------------------------------------------------------------------------------------
 # Bounds
 #
 # The opposer's limit constrains one direction of each term. The contract constrains the
@@ -240,7 +351,14 @@ def price_wei(base_price_wei: int, bps: int) -> int:
     toss.
     """
 
-    return max(1, base_price_wei * bps // BPS_DENOMINATOR)
+    product = base_price_wei * bps
+    if product > _UINT256_MAX:
+        raise ValueError(
+            f"a baseline of {base_price_wei} wei at {bps} bps is {product} wei, which does not "
+            f"fit the uint256 the contract stores it in. `BASELINE_BOUNDS` refuses baselines "
+            "this large at the door; reaching here means something bypassed it."
+        )
+    return max(MIN_SETTLED_PRICE_WEI, product // BPS_DENOMINATOR)
 
 
 def bond_is_collectible(price: int, bond_bps: int) -> bool:
@@ -255,6 +373,14 @@ def bond_is_collectible(price: int, bond_bps: int) -> bool:
 
 __all__ = [
     "BASELINE_BOUNDS",
+    "LIMIT_KINDS",
+    "LIMIT_NAMES",
+    "MAX_PRICE_BPS",
+    "MIN_SETTLED_PRICE_WEI",
+    "WALKAWAY_RULES",
+    "build_positions",
+    "derived_walkaway",
+    "walkaways_for",
     "CEILING",
     "CONCESSION",
     "FLOOR",

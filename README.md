@@ -45,7 +45,11 @@ critical path, not an activity log attached after the decision.
 The provider agent is a simulation. What makes its terms reproducible is not a retained
 random seed, which no longer exists: it is that the persona is committed to git before the
 store holds a receipt, its SHA-256 is recorded in that store, and every number it produces is
-a deterministic function of that persona and the receipts it can show you.
+a deterministic function of four things a reader can be handed. The persona. The receipts. The
+operator's baseline price, bond, window and delay, which are command-line flags and appear in
+every document under `baseline`. And the stored dimensions, which carry the severity and
+confidence a receipt is scored with. Receipts alone are not enough, and saying they were left
+a judge following the recipe unable to reproduce the numbers.
 
 ## Setup and tests
 
@@ -148,11 +152,22 @@ one changes the version, the `engineVersionHash`, and every `policyHash` built f
 manifest is published in the document so a reader recomputes the digest instead of trusting
 it.
 
-That covers the rule as well as the numbers. Which way each opposer's limit points, and the
-order the four terms settle in, are in the digest too. They hold no numbers, so they read like
-structure rather than like constants, and a review found them sitting outside it: flipping
-`price_bps` from a ceiling to a floor inverts every price this build produces and would have
-left the version untouched.
+That covers every table as well as every number: which way each limit points, the order the
+terms settle in, what each limit is called and whether it moves with memory, how far each side
+concedes, which receipts count against which side, and the bounds on all of it. Those hold no
+numbers, so they read like structure rather than like constants, and two review rounds found
+them outside the digest. Flipping `price_bps` from a ceiling to a floor inverts every price
+this build produces and used to leave the version untouched.
+
+**It does not cover the procedure, and the claim stops there deliberately.** The comparison
+operators, the gap arithmetic and the integer division live in code that no digest here
+fingerprints. Hashing the source instead would make a comment edit invalidate every document
+ever written, and it still would not help a reader who cannot run this build.
+
+What helps that reader is the document. Every term publishes its proposal, the limit against
+it, and the walk-away the comparison is stated over, so the settlement can be recomputed by
+hand from the file. A build whose procedure had drifted would disagree with that arithmetic in
+the open rather than in private, which is the property worth having.
 
 ## Sending transactions
 

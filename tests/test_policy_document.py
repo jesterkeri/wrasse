@@ -323,7 +323,6 @@ def test_editing_a_negotiation_constant_changes_the_engine_version(monkeypatch):
     """
 
     import hashlib
-    import importlib
     import json as _json
 
     from wrasse import constants
@@ -340,7 +339,11 @@ def test_editing_a_negotiation_constant_changes_the_engine_version(monkeypatch):
     assert f"wrasse/0.2.0+{digest[:12]}" != before, (
         "a changed constant must produce a changed version, or the commitment covers nothing"
     )
-    importlib.reload(constants)  # leave the module as it was found
+    # No reload. This test never mutated the module: it edits a parsed copy of the canonical
+    # manifest and hashes that. Reloading replaced every constant object with a fresh one while
+    # `engine`, `negotiation` and `evidence` kept the originals, so the identity that makes the
+    # digest cover what the code reads was quietly broken for every test that ran afterwards.
+    # A test that repairs damage it did not do is how a suite acquires order dependence.
 
 
 def test_the_published_manifest_is_the_one_the_version_was_hashed_from(document):
@@ -382,6 +385,100 @@ def test_a_manifest_that_says_the_same_thing_in_different_bytes_is_refused(docum
         _load(_rewrite(document, retype))
 
 
+def test_every_walkaway_the_settlement_rests_on_is_published(document):
+    """The property gate's own words, and the build did not meet them.
+
+    Only the provider's price walk-away was published. The other three were derived in code, in
+    two places, from rules the document never states. A reader could reproduce this particular
+    sample, whose only refusal happens to be on price, and could not check a refusal on bond,
+    window or delay at all: with a bond proposal of 3 500, a ceiling of 400 and a baseline of
+    500, the unpublished rule is the only fact separating "refuse by 100" from "settle at 400".
+    """
+
+    from wrasse.negotiation import TERMS
+
+    body = json.loads(document.read_text())
+    for name, profile in body["buyer"]["profiles"].items():
+        published = set(profile["buyer"]["walkaways"]) | set(profile["provider"]["walkaways"])
+        assert published == set(TERMS), f"profile {name} does not publish all four walk-aways"
+
+
+def test_a_reader_holding_only_the_document_reproduces_every_settlement(document):
+    """The standalone claim, tested against a document rather than against handed-in objects.
+
+    The previous version of this property built `Position` objects directly and fed them the
+    walk-aways from memory, so it proved the settlement is a pure function and said nothing
+    about whether the document carries its inputs. It passed while three of the four were
+    missing from the file.
+    """
+
+    from wrasse.negotiation import CEILING, TERM_SHAPES
+
+    body = json.loads(document.read_text())
+    for name, profile in body["buyer"]["profiles"].items():
+        proposals = {**profile["buyer"]["proposes"], **profile["provider"]["proposes"]}
+        walkaways = {**profile["buyer"]["walkaways"], **profile["provider"]["walkaways"]}
+        limits = {
+            "provider_bond_bps": profile["provider"]["limits"]["max_bond_bps"],
+            "service_window": profile["provider"]["limits"]["min_service_window"],
+            "price_bps": profile["buyer"]["limits"]["max_price_bps"],
+            "payout_delay": profile["buyer"]["limits"]["min_payout_delay"],
+        }
+
+        # Deliberately not `settle`. This is the arithmetic a reader does with the published
+        # rule in front of them: min against a ceiling, max against a floor, refuse when the
+        # limit is past the walk-away.
+        settled, failed = {}, None
+        for term in body["engine"]["negotiation_manifest"]["settlement_order"]:
+            proposal, limit, walkaway = proposals[term], limits[term], walkaways[term]
+            if TERM_SHAPES[term] == CEILING:
+                if limit < walkaway and proposal > limit:
+                    failed = (term, walkaway - limit)
+                    break
+                settled[term] = min(proposal, limit)
+            else:
+                if limit > walkaway and proposal < limit:
+                    failed = (term, limit - walkaway)
+                    break
+                settled[term] = max(proposal, limit)
+
+        if failed is None:
+            assert profile["settlement"]["agreed"], f"{name}: reader agrees, document refuses"
+            assert profile["terms"]["provider_bond_bps"] == settled["provider_bond_bps"]
+            assert profile["terms"]["service_window"] == settled["service_window"]
+            assert profile["terms"]["payout_delay"] == settled["payout_delay"]
+        else:
+            term, gap = failed
+            assert not profile["settlement"]["agreed"], f"{name}: reader refuses, document agrees"
+            assert profile["settlement"]["failed_on"] == term
+            assert profile["settlement"]["gap"] == gap
+
+
+def test_a_refusal_on_a_derived_walkaway_is_checkable_from_the_document():
+    """The reviewer's example, made concrete.
+
+    A bond ceiling of 400 against a proposal of 3 500 refuses by 100 under the published rule
+    and settles at 400 under any rule that does not widen toward the baseline. Both are
+    consistent with everything the old document showed, which is what made an arbitrary refusal
+    unverifiable.
+    """
+
+    from wrasse.negotiation import build_positions, settle
+
+    baseline = {"provider_bond_bps": 500, "service_window": 600, "payout_delay": 1_800}
+    positions = build_positions(
+        baseline=baseline,
+        proposals={"provider_bond_bps": 3_500, "service_window": 600,
+                   "price_bps": 11_800, "payout_delay": 1_200},
+        limits={"provider_bond_bps": 400, "service_window": 300,
+                "price_bps": 12_000, "payout_delay": 900},
+        walkaways={"provider_bond_bps": 500, "service_window": 600,
+                   "price_bps": 11_350, "payout_delay": 1_800},
+    )
+    outcome = settle(positions)
+    assert (outcome.failed_on, outcome.gap) == ("provider_bond_bps", 100)
+
+
 def test_every_constant_that_can_move_a_term_is_in_the_manifest():
     """The test of membership is not "is it a negotiation constant".
 
@@ -407,6 +504,13 @@ def test_every_constant_that_can_move_a_term_is_in_the_manifest():
         "max_bond_bps", "concession_num", "concession_den",
         "min_service_window_seconds", "min_payout_delay_seconds", "profiles",
         "settlement_order", "term_shapes", "baseline_bounds",
+        # Round four. The limit names and kinds decide what a move says it was caused by; the
+        # walk-away rules decide whether a term agrees at all; the evidence subjects decide
+        # which receipts reach which side's score; the price bounds decide what the conversion
+        # is allowed to be handed.
+        "limit_names", "limit_kinds", "walkaway_rules",
+        "evidence_subjects", "evidence_valence",
+        "max_price_bps", "min_settled_price_wei",
     ):
         assert required in NEGOTIATION_MANIFEST, f"{required} can move a term and is not hashed"
 
@@ -628,16 +732,123 @@ def test_the_rounding_mode_the_manifest_hashes_is_the_one_the_engine_uses():
     assert "rounding=ROUNDING" in source
 
 
-def test_the_provider_risk_weight_is_hashed_and_used():
-    """It decides the provider's price, delay, bond ceiling and floor, and it was a literal."""
+def test_the_provider_risk_weight_is_hashed_and_applied_exactly_once():
+    """It decides the provider's price, delay, bond ceiling and floor, and it was a literal.
+
+    It was then passed twice, as the score's weight and again as its relevance function, and
+    `_score` multiplies both. At the shipped value of `1` that was invisible, which is the only
+    reason it survived: the first non-unit tuning would have squared it. The provider has no
+    task profile, so "every dimension is equally relevant" is the identity of multiplication
+    rather than a second copy of the weight.
+    """
 
     import inspect
+    from decimal import Decimal
 
     from wrasse import engine
     from wrasse.constants import NEGOTIATION_MANIFEST
 
     assert NEGOTIATION_MANIFEST["provider_risk_weight"] == "1"
     source = inspect.getsource(engine)
-    assert source.count("PROVIDER_RISK_WEIGHT") >= 4, (
+    assert source.count("PROVIDER_RISK_WEIGHT") >= 2, (
         "both the score and its causal-set recomputation must read the hashed weight"
     )
+    assert "relevance=lambda _: Decimal(PROVIDER_RISK_WEIGHT)" not in source, (
+        "the weight is applied once, not squared"
+    )
+    assert engine._EQUALLY_RELEVANT(None) == Decimal(1)
+
+
+def test_the_relevance_function_is_not_a_second_copy_of_the_weight(monkeypatch):
+    """Comparing against `Decimal(1)` proves nothing while the weight itself is 1.
+
+    The first version of the test above did exactly that, and a mutation putting the weight
+    back into the relevance slot passed it. The property is not "relevance equals one today".
+    It is that relevance does not read the weight at all, and the way to see that is to move
+    the weight and watch relevance stay put.
+    """
+
+    from decimal import Decimal
+
+    from wrasse import engine
+
+    monkeypatch.setattr(engine, "PROVIDER_RISK_WEIGHT", "0.5")
+    assert engine._EQUALLY_RELEVANT(None) == Decimal(1), (
+        "relevance moved with the weight, so the weight is applied twice again"
+    )
+
+
+def test_a_non_unit_provider_weight_scales_the_score_once(monkeypatch):
+    """The behavioural half. A half weight halves the score; it does not quarter it."""
+
+    from decimal import Decimal
+
+    from wrasse import engine
+
+    class _Dimension:
+        source_event_type = "timeout_claimed_without_delivery"
+        severity = "0.4"
+        confidence = "1"
+        signal_direction = "negative"
+
+    events = [{"event_id": "0x" + "11" * 32, "event_type": "timeout_claimed_without_delivery"}]
+
+    full, _ = engine._score(
+        events, [_Dimension()], about="provider",
+        weight=Decimal("0.5"), relevance=engine._EQUALLY_RELEVANT,
+    )
+    assert full == Decimal("0.2"), "0.4 severity at half weight is 0.2, not 0.1"
+
+
+def test_the_displayed_risk_uses_the_rounding_mode_the_manifest_publishes():
+    """A provenance-compared number disagreeing with the published policy is still a lie.
+
+    Both displayed risks quantized without a mode, so they took Decimal's ambient context,
+    which is banker's rounding. At the `0.12345` boundary the document showed `0.1234` beside a
+    manifest saying `ROUND_HALF_UP`, which gives `0.1235`.
+    """
+
+    import inspect
+    from decimal import Decimal
+
+    from wrasse import engine
+    from wrasse.constants import RISK_DISPLAY_QUANTUM, ROUNDING
+
+    source = inspect.getsource(engine)
+    assert source.count("quantize(Decimal(RISK_DISPLAY_QUANTUM), rounding=ROUNDING)") == 2
+    assert "quantize(Decimal(RISK_DISPLAY_QUANTUM))" not in source
+
+    boundary = Decimal("0.12345")
+    assert boundary.quantize(Decimal(RISK_DISPLAY_QUANTUM), rounding=ROUNDING) == Decimal("0.1235")
+    assert boundary.quantize(Decimal(RISK_DISPLAY_QUANTUM)) == Decimal("0.1234")
+
+
+def test_the_engine_routes_evidence_through_the_hashed_subject_table(monkeypatch):
+    """Which side a receipt counts against decides that side's proposals and its limits."""
+
+    from decimal import Decimal
+
+    from wrasse import constants, engine
+
+    assert engine.SUBJECTS_OF is constants.SUBJECTS_OF
+
+    class _Dimension:
+        source_event_type = "timeout_claimed_without_delivery"
+        severity = "0.4"
+        confidence = "1"
+        signal_direction = "negative"
+
+    events = [{"event_id": "0x" + "22" * 32, "event_type": "timeout_claimed_without_delivery"}]
+    scored, _ = engine._score(
+        events, [_Dimension()], about="buyer",
+        weight=Decimal(1), relevance=engine._EQUALLY_RELEVANT,
+    )
+    assert scored == 0, "a timeout is the provider's conduct, not the buyer's"
+
+    monkeypatch.setitem(constants.SUBJECTS_OF, "timeout_claimed_without_delivery",
+                        frozenset({"buyer"}))
+    rerouted, _ = engine._score(
+        events, [_Dimension()], about="buyer",
+        weight=Decimal(1), relevance=engine._EQUALLY_RELEVANT,
+    )
+    assert rerouted == Decimal("0.4"), "the hashed table is the one the score reads"

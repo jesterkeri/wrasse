@@ -21,9 +21,9 @@ from .constants import (
     RISK_DISPLAY_QUANTUM,
     RISK_FLOOR,
     ROUNDING,
+    SUBJECTS_OF,
 )
 from .dimensions import DimensionDefinition
-from .evidence import SUBJECTS_OF
 from .negotiation import clamp_bond_bps, clamp_duration
 from .policy_hash import BPS_DENOMINATOR, canonical_event_id
 from .providers import ProviderPersona
@@ -153,10 +153,21 @@ def produce_terms(
         min_payout_delay=clamp_duration(
             base_payout_delay * profile.payout_delay_floor_bps // BPS_DENOMINATOR
         ),
-        risk=risk.quantize(Decimal(RISK_DISPLAY_QUANTUM)),
+        risk=risk.quantize(Decimal(RISK_DISPLAY_QUANTUM), rounding=ROUNDING),
         recalled_event_ids=tuple(sorted(canonical_event_id(str(e["event_id"])) for e in events)),
         used_evidence_ids=_minimal_causal_set(events, used, committed),
     )
+
+
+def _EQUALLY_RELEVANT(_dimension) -> Decimal:
+    """The provider's relevance function: every dimension counts the same to it.
+
+    Not a policy number and so not a manifest entry. It is the identity of multiplication,
+    which is what "no task profile, so nothing is more relevant than anything else" means. The
+    one number that *is* policy on this side is `PROVIDER_RISK_WEIGHT`, and it is passed once.
+    """
+
+    return Decimal(1)
 
 
 @dataclass(frozen=True)
@@ -208,9 +219,15 @@ def produce_provider_terms(
         raise ValueError("base price, payout delay and service window must be positive")
 
     events = _unique_by_event_id(evidence)
+    # One weight, applied once. `relevance` is the neutral element here rather than a second
+    # copy of the weight: the provider has no task profile, so no dimension is more relevant to
+    # it than another, and "equally relevant" is 1 rather than a tunable number. Passing the
+    # weight in both slots squared it. At the shipped value of 1 that was invisible; at 0.5 the
+    # effective weight would have been 0.25, and a severity-0.4 receipt would have scored 0.1
+    # where the documented meaning of one provider risk weight says 0.2.
     risk, used = _score(
         events, dimensions, about="buyer", weight=Decimal(PROVIDER_RISK_WEIGHT),
-        relevance=lambda _: Decimal(PROVIDER_RISK_WEIGHT)
+        relevance=_EQUALLY_RELEVANT,
     )
 
     def committed(subset) -> tuple[int, int, int, int]:
@@ -225,7 +242,7 @@ def produce_provider_terms(
 
         partial, _ = _score(
             subset, dimensions, about="buyer", weight=Decimal(PROVIDER_RISK_WEIGHT),
-            relevance=lambda _: Decimal(PROVIDER_RISK_WEIGHT),
+            relevance=_EQUALLY_RELEVANT,
         )
         premium = _round_decimal(partial * persona.price_sensitivity_bps)
         return (
@@ -266,7 +283,7 @@ def produce_provider_terms(
         min_service_window=clamp_duration(
             min(MIN_SERVICE_WINDOW_SECONDS, base_service_window)
         ),
-        risk=risk.quantize(Decimal(RISK_DISPLAY_QUANTUM)),
+        risk=risk.quantize(Decimal(RISK_DISPLAY_QUANTUM), rounding=ROUNDING),
         recalled_event_ids=tuple(sorted(canonical_event_id(str(e["event_id"])) for e in events)),
         used_evidence_ids=_minimal_causal_set(events, used, committed),
     )

@@ -11,7 +11,7 @@ from typing import Any, Callable, Protocol
 import requests
 from sibyl_memory_client import NotFoundError
 
-from .evidence import SUBJECTS_OF, VALENCE_OF
+from .constants import SUBJECTS_OF, VALENCE_OF
 
 #: What each outcome actually means, in the words a person would use. The model is shown this
 #: rather than being left to infer intent from an identifier.

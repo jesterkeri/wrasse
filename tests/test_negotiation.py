@@ -298,12 +298,175 @@ def test_price_is_converted_once_and_never_reaches_zero():
     assert 9_250 < 11_800
 
 
+def test_a_baseline_too_large_to_multiply_refuses_rather_than_crashing():
+    """`BASELINE_BOUNDS` accepted a price the conversion could not survive.
+
+    At the old ceiling of `2**256 - 1`, a baseline the validator explicitly allowed produced a
+    settled price above uint256, and the first thing to notice was an ABI encoding error thrown
+    from inside the hashing. A domain that admits an input the next step cannot process is not
+    a domain, and a crash is not a refusal.
+    """
+
+    from wrasse.constants import BASELINE_BOUNDS, MAX_PRICE_BPS
+    from wrasse.negotiation import baseline_fault
+
+    largest = BASELINE_BOUNDS["price_wei"][1]
+    assert baseline_fault({**GOOD_BASELINE, "price_wei": largest}) is None
+    assert price_wei(largest, MAX_PRICE_BPS) > 0, "the whole admitted domain converts"
+
+    assert baseline_fault({**GOOD_BASELINE, "price_wei": largest + 1}) is not None
+    with pytest.raises(ValueError, match="does not fit the uint256"):
+        price_wei(largest + 1, MAX_PRICE_BPS)
+
+
+GOOD_BASELINE = {
+    "price_wei": 10**14,
+    "provider_bond_bps": 500,
+    "service_window": 600,
+    "payout_delay": 1_800,
+}
+
+
 def test_a_nonzero_bond_rate_that_would_round_to_nothing_is_caught():
     """Price settles down and bond settles up independently, so this is a joint condition."""
 
     assert bond_is_collectible(10**14, 3_500)
     assert bond_is_collectible(1, 0), "a zero rate owes no bond and is not a rounding failure"
     assert not bond_is_collectible(1, 9_999)
+
+
+# --------------------------------------------------------------------------------------
+# Walk-aways: one rule, applied by the writer and checked by the reader
+# --------------------------------------------------------------------------------------
+
+
+BASE = {"provider_bond_bps": 500, "service_window": 600, "payout_delay": 1_800}
+
+
+def _numbers():
+    """The proposals and limits of the comfortable four, keyed by term."""
+
+    positions = _positions()
+    return (
+        {term: p.proposal for term, p in positions.items()},
+        {term: p.limit for term, p in positions.items()},
+    )
+
+
+@pytest.mark.parametrize(
+    "term,proposal,expected",
+    [
+        # a bond proposal above the baseline concedes back down to the baseline
+        ("provider_bond_bps", 3_500, 500),
+        # and one below it concedes no further than its own opening
+        ("provider_bond_bps", 200, 200),
+        # a window proposal above the baseline holds its own opening
+        ("service_window", 2_400, 2_400),
+        # and one below it concedes back up to the baseline
+        ("service_window", 300, 600),
+        ("payout_delay", 893, 1_800),
+        ("payout_delay", 2_400, 2_400),
+    ],
+)
+def test_a_derived_walkaway_is_the_baseline_widened_by_the_proposal(term, proposal, expected):
+    """Concede back to what a stranger would have been asked, and never past your own offer.
+
+    The second clause is what makes the service window work. `budget` and `sensitive` propose a
+    longer window than the baseline, so a walk-away pinned to the baseline alone would be
+    violated by their own opening.
+    """
+
+    from wrasse.negotiation import derived_walkaway
+
+    assert derived_walkaway(term, BASE, proposal) == expected
+
+
+def test_the_price_walkaway_has_no_derivation_and_must_be_published():
+    """The exception that makes a refusal possible at all.
+
+    The provider concedes three quarters of the way back, not all of it, so its floor sits
+    above the baseline and can rise past a buyer's ceiling. That distance is a function of its
+    memory, not of the baseline, so no rule over the baseline can produce it.
+    """
+
+    from wrasse.negotiation import derived_walkaway
+
+    assert derived_walkaway("price_bps", BASE, 11_800) is None
+
+    with pytest.raises(ValueError, match="no derivation rule and none was published"):
+        from wrasse.negotiation import walkaways_for
+
+        walkaways_for(BASE, _numbers()[0], {})
+
+
+def test_a_document_may_not_publish_a_walkaway_its_own_rule_does_not_give():
+    """The reason publishing and deriving are both done rather than one or the other.
+
+    A reader who does not know Wrasse's rules gets the number. A reader who does gets a proof
+    that the number is the one the rules give. Without the check, a document could publish a
+    walk-away chosen to make a refusal look inevitable, and every other field would still
+    reconcile.
+    """
+
+    from wrasse.negotiation import build_positions
+
+    proposals, limits = _numbers()
+    honest = {"provider_bond_bps": 500, "service_window": 600, "price_bps": 11_350,
+              "payout_delay": 1_800}
+    build_positions(baseline=BASE, proposals=proposals, limits=limits, walkaways=honest)
+
+    with pytest.raises(ValueError, match="publishes a walk-away of 3400"):
+        build_positions(
+            baseline=BASE,
+            proposals=proposals,
+            limits=limits,
+            walkaways={**honest, "provider_bond_bps": 3_400},
+        )
+
+
+def test_the_published_price_walkaway_is_taken_as_given():
+    """It has no rule, so there is nothing to check it against and it is used as published."""
+
+    from wrasse.negotiation import build_positions
+
+    proposals, limits = _numbers()
+    built = build_positions(
+        baseline=BASE,
+        proposals=proposals,
+        limits=limits,
+        walkaways={"provider_bond_bps": 500, "service_window": 600, "price_bps": 9_999,
+                   "payout_delay": 1_800},
+    )
+    assert built["price_bps"].walkaway == 9_999
+
+
+def test_the_limit_names_and_kinds_come_from_the_hashed_tables(monkeypatch):
+    """A move's `kind` is the difference between evidence and a constant.
+
+    Both tables were literals repeated in the writer and again in the reader, hashed in
+    neither. Relabelling the bond ceiling would tell every reader that an evidence-driven
+    concession was a rule.
+    """
+
+    from wrasse import constants
+    from wrasse.negotiation import build_positions
+
+    proposals, limits = _numbers()
+    walkaways = {"provider_bond_bps": 500, "service_window": 600, "price_bps": 11_350,
+                 "payout_delay": 1_800}
+    built = build_positions(
+        baseline=BASE, proposals=proposals, limits=limits, walkaways=walkaways
+    )
+    assert built["provider_bond_bps"].limit_kind == MEMORY
+    assert built["provider_bond_bps"].limit_name == "provider_max_bond_bps"
+
+    monkeypatch.setitem(constants.LIMIT_KINDS, "provider_bond_bps", constants.RULE)
+    monkeypatch.setitem(constants.LIMIT_NAMES, "provider_bond_bps", "renamed")
+    relabelled = build_positions(
+        baseline=BASE, proposals=proposals, limits=limits, walkaways=walkaways
+    )
+    assert relabelled["provider_bond_bps"].limit_kind == RULE
+    assert relabelled["provider_bond_bps"].limit_name == "renamed"
 
 
 # --------------------------------------------------------------------------------------

@@ -26,11 +26,13 @@ from web3 import Web3
 from .constants import MANIFEST_DIGEST, canonical_manifest
 from .negotiation import (
     CONCESSION,
+    MAX_PRICE_BPS,
     MEMORY,
     RULE,
     Position,
     baseline_fault,
     bond_is_collectible,
+    build_positions,
     settle,
 )
 from .negotiation import TERMS as NEGOTIATED_TERMS
@@ -84,14 +86,15 @@ _REFUSED_PROFILE_KEYS = {"baseline", "buyer", "provider", "settlement"}
 _BASELINE_KEYS = {"price_wei", "provider_bond_bps", "service_window", "payout_delay"}
 _TERMS_KEYS = {"price_wei", "provider_bond_bps", "service_window", "payout_delay"}
 
-_BUYER_HALF_KEYS = {"proposes", "limits", "risk", "used_evidence_ids"}
+_BUYER_HALF_KEYS = {"proposes", "limits", "walkaways", "risk", "used_evidence_ids"}
 _BUYER_PROPOSES_KEYS = {"provider_bond_bps", "service_window"}
 _BUYER_LIMITS_KEYS = {"max_price_bps", "min_payout_delay"}
+_BUYER_WALKAWAY_KEYS = {"provider_bond_bps", "service_window"}
 
-_PROVIDER_HALF_KEYS = {"proposes", "limits", "walkaway", "risk", "used_evidence_ids"}
+_PROVIDER_HALF_KEYS = {"proposes", "limits", "walkaways", "risk", "used_evidence_ids"}
 _PROVIDER_PROPOSES_KEYS = {"price_bps", "payout_delay"}
 _PROVIDER_LIMITS_KEYS = {"max_bond_bps", "min_service_window"}
-_PROVIDER_WALKAWAY_KEYS = {"price_floor_bps"}
+_PROVIDER_WALKAWAY_KEYS = {"price_bps", "payout_delay"}
 
 _AGREED_SETTLEMENT_KEYS = {"agreed", "moves"}
 _REFUSED_SETTLEMENT_KEYS = {"agreed", "failed_on", "gap"}
@@ -312,10 +315,18 @@ def load_policy(
 
     document = _exact_keys(document, _TOP_LEVEL, "the policy document")
 
-    if document["schema_version"] != SCHEMA_VERSION:
+    # Strict about the spelling, not only the value. `3.0 == 3` and `84532.0 == 84532` in
+    # Python and in neither JSON nor Solidity, so a plain equality check passed a document a
+    # cross-language reader is entitled to reject. Every other integer field in this validator
+    # already refuses a float spelling; these two identifiers were the last that did not.
+    if (
+        isinstance(document["schema_version"], bool)
+        or not isinstance(document["schema_version"], int)
+        or document["schema_version"] != SCHEMA_VERSION
+    ):
         raise PolicyDocumentError(
-            f"schema_version {document['schema_version']!r} is not {SCHEMA_VERSION}; "
-            "this build cannot know which fields it is reading"
+            f"schema_version {document['schema_version']!r} is not the integer "
+            f"{SCHEMA_VERSION}; this build cannot know which fields it is reading"
         )
 
     request_id = document["request_id"]
@@ -328,9 +339,13 @@ def load_policy(
             "rebind-policy`, which mints a new request_id because a rebound quote is a new "
             "action."
         )
-    if document["chain_id"] != chain_id:
+    if (
+        isinstance(document["chain_id"], bool)
+        or not isinstance(document["chain_id"], int)
+        or document["chain_id"] != chain_id
+    ):
         raise PolicyDocumentError(
-            f"the document targets chain {document['chain_id']}, this run targets {chain_id}"
+            f"the document targets chain {document['chain_id']!r}, this run targets {chain_id}"
         )
     if not _same_address(document["contract_address"], contract_address):
         raise PolicyDocumentError(
@@ -567,58 +582,52 @@ def _check_positions(body: dict[str, Any], name: str) -> dict[str, Position]:
     provider = _exact_keys(body["provider"], _PROVIDER_HALF_KEYS, f"profile {name!r} provider half")
     offers = _exact_keys(provider["proposes"], _PROVIDER_PROPOSES_KEYS, f"profile {name!r} provider proposals")
     caps = _exact_keys(provider["limits"], _PROVIDER_LIMITS_KEYS, f"profile {name!r} provider limits")
-    walkaway = _exact_keys(provider["walkaway"], _PROVIDER_WALKAWAY_KEYS, f"profile {name!r} provider walkaway")
+    concedes = _exact_keys(buyer["walkaways"], _BUYER_WALKAWAY_KEYS, f"profile {name!r} buyer walkaways")
+    walkaway = _exact_keys(provider["walkaways"], _PROVIDER_WALKAWAY_KEYS, f"profile {name!r} provider walkaways")
     _bounded_decimal(provider["risk"], f"profile {name!r} provider risk")
 
     numbers = {
         "buyer bond proposal": (proposes["provider_bond_bps"], MAX_PROVIDER_BOND_BPS, 0),
         "buyer window proposal": (proposes["service_window"], MAX_DURATION, 1),
-        "buyer max price": (limits["max_price_bps"], 2**32, 1),
+        "buyer max price": (limits["max_price_bps"], MAX_PRICE_BPS, 1),
         "buyer min payout delay": (limits["min_payout_delay"], MAX_DURATION, 1),
-        "provider price proposal": (offers["price_bps"], 2**32, 1),
+        "provider price proposal": (offers["price_bps"], MAX_PRICE_BPS, 1),
         "provider payout delay proposal": (offers["payout_delay"], MAX_DURATION, 1),
         "provider max bond": (caps["max_bond_bps"], MAX_PROVIDER_BOND_BPS, 0),
         "provider min window": (caps["min_service_window"], MAX_DURATION, 1),
-        "provider price floor": (walkaway["price_floor_bps"], 2**32, 1),
+        "provider price walk-away": (walkaway["price_bps"], MAX_PRICE_BPS, 1),
+        "provider payout delay walk-away": (walkaway["payout_delay"], MAX_DURATION, 1),
+        "buyer bond walk-away": (concedes["provider_bond_bps"], MAX_PROVIDER_BOND_BPS, 0),
+        "buyer window walk-away": (concedes["service_window"], MAX_DURATION, 1),
     }
     for label, (value, high, low) in numbers.items():
         _bounded_int(value, f"profile {name!r} {label}", low=low, high=high)
 
-    # The walk-aways the settlement is stated over. Three are derived, in the open, from the
-    # baseline and the side's own proposal: a side concedes back to what it would have asked a
-    # stranger and never past a number it offered itself. The fourth, price, is published,
-    # because the provider concedes only part of the way back and that is what makes a refusal
-    # possible at all.
-    return {
-        "provider_bond_bps": Position(
-            proposal=proposes["provider_bond_bps"],
-            limit=caps["max_bond_bps"],
-            walkaway=min(baseline["provider_bond_bps"], proposes["provider_bond_bps"]),
-            limit_name="provider_max_bond_bps",
-            limit_kind=MEMORY,
-        ),
-        "service_window": Position(
-            proposal=proposes["service_window"],
-            limit=caps["min_service_window"],
-            walkaway=max(baseline["service_window"], proposes["service_window"]),
-            limit_name="provider_min_service_window",
-            limit_kind=RULE,
-        ),
-        "price_bps": Position(
-            proposal=offers["price_bps"],
-            limit=limits["max_price_bps"],
-            walkaway=walkaway["price_floor_bps"],
-            limit_name="buyer_max_price_bps",
-            limit_kind=RULE,
-        ),
-        "payout_delay": Position(
-            proposal=offers["payout_delay"],
-            limit=limits["min_payout_delay"],
-            walkaway=max(baseline["payout_delay"], offers["payout_delay"]),
-            limit_name="buyer_min_payout_delay",
-            limit_kind=RULE,
-        ),
+    # One builder, shared with the writer. It applies the hashed walk-away rules, refuses a
+    # published walk-away that disagrees with its own rule, and attaches the hashed limit names
+    # and kinds. Rebuilding the four positions here by hand is what let the reader and the
+    # writer hold two copies of the same three expressions, neither of them in the digest.
+    proposals = {
+        "provider_bond_bps": proposes["provider_bond_bps"],
+        "service_window": proposes["service_window"],
+        "price_bps": offers["price_bps"],
+        "payout_delay": offers["payout_delay"],
     }
+    caps_by_term = {
+        "provider_bond_bps": caps["max_bond_bps"],
+        "service_window": caps["min_service_window"],
+        "price_bps": limits["max_price_bps"],
+        "payout_delay": limits["min_payout_delay"],
+    }
+    try:
+        return build_positions(
+            baseline=baseline,
+            proposals=proposals,
+            limits=caps_by_term,
+            walkaways={**concedes, **walkaway},
+        )
+    except ValueError as error:
+        raise PolicyDocumentError(f"profile {name!r} {error}") from error
 
 
 def _check_settlement_follows(body: dict[str, Any], positions: dict[str, Position], name: str) -> None:

@@ -10,6 +10,8 @@ from eth_abi import encode
 from web3 import Web3
 from sibyl_memory_client import NotFoundError
 
+from .constants import SUBJECTS_OF
+
 
 CHAIN_EVENT_CATEGORY = "chain_event"
 
@@ -20,33 +22,11 @@ JOURNAL_MARKER_CATEGORY = "chain_event_journalled"
 #: Closed and ABI-derived. An event type outside this set never came from a log this build
 #: recognises, so it can never become evidence.
 #:
-#: The value is **whose conduct the receipt is evidence about**, which the contract decides and
-#: no model is asked to guess. A timeout is a provider failing to deliver. A release withheld
-#: until the payout delay expired is a buyer making the provider wait. Without this, a
-#: provider's own failure would raise the price it charges, and a buyer's slowness would raise
-#: the bond that buyer demands, which is nonsense in both directions.
-SUBJECTS_OF = {
-    "timeout_claimed_without_delivery": frozenset({"provider"}),
-    # Evidence about both. A prompt release is good conduct by the buyer, and it is also proof
-    # the provider delivered. Attributing it to one side alone would leave the closing beat
-    # unbuildable: the only positive outcome could never soften a buyer's view of a provider.
-    "delivered_and_released_by_buyer": frozenset({"buyer", "provider"}),
-    "delivered_and_claimed_after_delay": frozenset({"buyer"}),
-}
-
-#: Whether an outcome is a reason to demand safer terms or to offer easier ones. Derived from
-#: the contract, never chosen by a model.
-#:
-#: A live call proved why. Asked what a timeout meant, the model answered `positive` with a
-#: severity of zero, so a provider that took payment and never delivered would have made itself
-#: cheaper. The model still names the dimension and judges how much it matters; which way it
-#: points is not its call.
-VALENCE_OF = {
-    "timeout_claimed_without_delivery": "negative",
-    "delivered_and_released_by_buyer": "positive",
-    "delivered_and_claimed_after_delay": "negative",
-}
-
+#: `SUBJECTS_OF` says whose conduct a receipt is evidence about and `VALENCE_OF` says whether
+#: that conduct is a reason to demand safer terms or to offer easier ones. Both are re-exported
+#: from `constants` rather than defined here, because both are consumed on the pricing path and
+#: a constant that decides a term belongs to the digest claiming to cover the term. The
+#: reasoning behind every entry is written out there.
 EVENT_TYPES = frozenset(SUBJECTS_OF)
 
 

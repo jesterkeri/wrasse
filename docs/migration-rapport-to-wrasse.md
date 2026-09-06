@@ -23,7 +23,9 @@ claim sitting in the source.
 What makes a provider's terms reproducible now is not a retained seed. It is that
 the persona is committed to git before its store holds a receipt, its SHA-256 is
 recorded in that store, and every number it produces is a deterministic function
-of that persona and the receipts a reader can see.
+of the persona, the receipts, the operator's baselines and the stored dimensions
+those receipts are scored against. The last two are inputs as much as the first
+two are, and the earlier wording named only the first two.
 
 ## Why neither is a compatibility problem
 

@@ -333,49 +333,46 @@ def _canonical(value: Any) -> str:
 def _positions_for(quote: "BilateralQuote", profile: str) -> dict[str, negotiation.Position]:
     """The eight numbers one profile's settlement is decided by.
 
-    A walk-away is the operator's baseline, widened to include the side's own proposal: a side
-    concedes back toward what it would have asked of a stranger, and never walks away from a
-    number it just offered. That second clause is what makes the service window work, because
-    `budget` and `sensitive` propose a *longer* window than the baseline and a walk-away pinned
-    to the baseline alone would be violated by their own opening.
-
-    Price is the one exception, and it is the exception that makes a refusal possible: the
-    provider concedes only three quarters of the way back, so its floor sits above the baseline
-    and can rise past a buyer's ceiling. With every walk-away at the baseline and every ceiling
-    above it, no term could ever refuse.
+    A thin adapter now. The walk-away rules, the limit names and the limit kinds all live in
+    `negotiation.build_positions`, which the document's validator also calls, so the writer and
+    the reader cannot be two rules that happen to agree on today's numbers. They were exactly
+    that until a review pointed it out: the same three `min` and `max` expressions, written
+    twice, hashed nowhere.
     """
 
     buyer, provider, base = quote.buyer_terms[profile], quote.provider_terms, quote.baseline
-    return {
-        "provider_bond_bps": negotiation.Position(
-            proposal=buyer.provider_bond_bps,
-            limit=provider.max_bond_bps,
-            walkaway=min(base["provider_bond_bps"], buyer.provider_bond_bps),
-            limit_name="provider_max_bond_bps",
-            limit_kind=negotiation.MEMORY,
+    proposals, limits = _published_numbers(buyer, provider)
+    return negotiation.build_positions(
+        baseline=base,
+        proposals=proposals,
+        limits=limits,
+        walkaways=negotiation.walkaways_for(
+            base, proposals, {"price_bps": provider.price_floor_bps}
         ),
-        "service_window": negotiation.Position(
-            proposal=buyer.service_window,
-            limit=provider.min_service_window,
-            walkaway=max(base["service_window"], buyer.service_window),
-            limit_name="provider_min_service_window",
-            limit_kind=negotiation.RULE,
-        ),
-        "price_bps": negotiation.Position(
-            proposal=provider.price_bps,
-            limit=buyer.max_price_bps,
-            walkaway=provider.price_floor_bps,
-            limit_name="buyer_max_price_bps",
-            limit_kind=negotiation.RULE,
-        ),
-        "payout_delay": negotiation.Position(
-            proposal=provider.payout_delay,
-            limit=buyer.min_payout_delay,
-            walkaway=max(base["payout_delay"], provider.payout_delay),
-            limit_name="buyer_min_payout_delay",
-            limit_kind=negotiation.RULE,
-        ),
+    )
+
+
+def _published_numbers(buyer, provider) -> tuple[dict[str, int], dict[str, int]]:
+    """Each term's proposal and the limit standing against it, keyed by term.
+
+    Keyed by term rather than by side, because the settlement is a per-term comparison and the
+    side that proposes a term is already fixed by the term's identity. Both the writer's
+    per-side document blocks and the reader's rebuild flatten into this shape.
+    """
+
+    proposals = {
+        "provider_bond_bps": buyer.provider_bond_bps,
+        "service_window": buyer.service_window,
+        "price_bps": provider.price_bps,
+        "payout_delay": provider.payout_delay,
     }
+    limits = {
+        "provider_bond_bps": provider.max_bond_bps,
+        "service_window": provider.min_service_window,
+        "price_bps": buyer.max_price_bps,
+        "payout_delay": buyer.min_payout_delay,
+    }
+    return proposals, limits
 
 
 def _document_halves(
@@ -400,7 +397,15 @@ def _document_halves(
 
     profiles = {}
     for name, terms in quote.buyer_terms.items():
-        settlement = negotiation.settle(_positions_for(quote, name))
+        positions = _positions_for(quote, name)
+        settlement = negotiation.settle(positions)
+        # Published, all four. Three of them are derivable from the baseline and the proposal,
+        # and a reader who knows Wrasse's rules could recompute them. A reader who does not
+        # could not check a refusal at all: with a bond proposal of 3 500, a ceiling of 400 and
+        # a baseline of 500, the unpublished rule is the only thing separating "refuse by 100"
+        # from "settle at 400". The validator still recomputes each one and refuses a document
+        # that publishes a walk-away its own rule does not give.
+        walkaways = {term: position.walkaway for term, position in positions.items()}
         body: dict[str, Any] = {
             "baseline": dict(base),
             "buyer": {
@@ -411,6 +416,10 @@ def _document_halves(
                 "limits": {
                     "max_price_bps": terms.max_price_bps,
                     "min_payout_delay": terms.min_payout_delay,
+                },
+                "walkaways": {
+                    "provider_bond_bps": walkaways["provider_bond_bps"],
+                    "service_window": walkaways["service_window"],
                 },
                 "risk": str(terms.risk),
                 "used_evidence_ids": list(terms.used_evidence_ids),
@@ -424,7 +433,14 @@ def _document_halves(
                     "max_bond_bps": provider_terms.max_bond_bps,
                     "min_service_window": provider_terms.min_service_window,
                 },
-                "walkaway": {"price_floor_bps": provider_terms.price_floor_bps},
+                # Keyed by term, like the proposals and the limits above, so a reader lines
+                # the four numbers of a comparison up without a glossary. The provider's price
+                # walk-away is its floor; the name it carries inside the engine is not the name
+                # the settlement knows it by.
+                "walkaways": {
+                    "price_bps": walkaways["price_bps"],
+                    "payout_delay": walkaways["payout_delay"],
+                },
                 "risk": str(provider_terms.risk),
                 "used_evidence_ids": list(provider_terms.used_evidence_ids),
             },

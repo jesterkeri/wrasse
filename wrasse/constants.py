@@ -7,12 +7,25 @@ it tempting to say that the constants deciding a term are covered by the same co
 the term. With a hand-typed version string that is false: editing a constant and leaving the
 string alone changes every quote and no hash. It is release discipline, not proof.
 
-So the string is derived. Every constant that participates in producing or settling a term
-lives in `NEGOTIATION_MANIFEST`, the manifest is canonicalised and hashed, and the digest is
-part of `ENGINE_VERSION`. Change any of these numbers and the version changes, the commitment
-changes, and every document written before the change is refused by `load_policy`. The
-manifest is published in the document too, so a reader recomputes the digest instead of
+So the string is derived. Every constant and every table that *parameterises* the production or
+settlement of a term lives in `NEGOTIATION_MANIFEST`, the manifest is canonicalised and hashed,
+and the digest is part of `ENGINE_VERSION`. Change any of them and the version changes, the
+commitment changes, and every document written before the change is refused by `load_policy`.
+The manifest is published in the document too, so a reader recomputes the digest instead of
 trusting it.
+
+**What it does not cover, stated rather than left to be discovered.** The settlement
+*procedure* is code: the comparison operators in `_settle_one`, the inclusive boundary, the
+gap arithmetic, the floor division in `price_wei`. No digest here fingerprints any of it.
+Hashing the module source would fix that in the narrowest sense and make a comment edit
+invalidate every document ever written, which is a worse trade than the problem.
+
+The procedure is checked a different way. Every document publishes all four numbers for each
+term, the proposal, the opposing limit and the walk-away the comparison is stated over, so a
+reader recomputes the settlement by hand without running this build at all. A procedure that
+drifted would disagree with that arithmetic visibly. The claim is therefore: **the parameters
+are committed, and the procedure is reproducible from the receipt.** Not "the whole rule is
+hashed", which was written here once and was not true.
 
 Nothing here imports anything from this package. That is deliberate: `policy_hash` needs the
 digest, `engine` needs the numbers, and a cycle between them would be resolved by duplicating
@@ -131,6 +144,98 @@ BPS_DENOMINATOR = 10_000
 MAX_PROVIDER_BOND_BPS = 10_000
 MAX_DURATION = 30 * 24 * 60 * 60
 
+#: How a movement is explained. The three are disjoint and a reader has to be able to tell them
+#: apart, because only one of them is evidence. They are hashed because `LIMIT_KINDS` below
+#: decides which one a move is labelled with, and relabelling an evidence-driven concession as a
+#: constant is the exact dishonesty the three-way split exists to prevent.
+MEMORY = "memory"
+CONCESSION = "concession"
+RULE = "rule"
+
+#: What each term's opposing limit is called in a refusal and in a move's `because`, and whether
+#: that limit moves with its publisher's memory or is a constant.
+#:
+#: Both were literals repeated in the writer and again in the reader, which is the same defect
+#: the shape table had: two copies, neither hashed, free to drift from each other and from the
+#: version claiming to describe them. Flipping one entry of `LIMIT_KINDS` relabels a concession
+#: as a rule in every document this build writes.
+LIMIT_NAMES: dict[str, str] = {
+    "provider_bond_bps": "provider_max_bond_bps",
+    "service_window": "provider_min_service_window",
+    "price_bps": "buyer_max_price_bps",
+    "payout_delay": "buyer_min_payout_delay",
+}
+
+LIMIT_KINDS: dict[str, str] = {
+    "provider_bond_bps": MEMORY,
+    "service_window": RULE,
+    "price_bps": RULE,
+    "payout_delay": RULE,
+}
+
+#: How far each proposer will concede, as a named rule rather than as arithmetic buried in two
+#: places. A side concedes back toward what it would have asked of a stranger, and never past a
+#: number it just offered itself: hence the baseline *widened* to include the proposal. That
+#: second clause is what makes the service window work, because `budget` and `sensitive` propose
+#: a longer window than the baseline and a walk-away pinned to the baseline alone would be
+#: violated by their own opening.
+#:
+#: Price is the exception, and it is the exception that makes a refusal possible at all. The
+#: provider concedes only three quarters of the way back, so its floor sits above the baseline
+#: and can rise past a buyer's ceiling. With every walk-away at the baseline and every ceiling
+#: above it, no term could ever refuse.
+BASELINE_WIDENED_DOWN = "min(baseline, proposal)"
+BASELINE_WIDENED_UP = "max(baseline, proposal)"
+PUBLISHED = "published"
+
+WALKAWAY_RULES: dict[str, str] = {
+    "provider_bond_bps": BASELINE_WIDENED_DOWN,
+    "service_window": BASELINE_WIDENED_UP,
+    "price_bps": PUBLISHED,
+    "payout_delay": BASELINE_WIDENED_UP,
+}
+
+#: Whose conduct a receipt is evidence about, which the contract decides and no model is asked
+#: to guess. A timeout is a provider failing to deliver. A release withheld until the payout
+#: delay expired is a buyer making the provider wait.
+#:
+#: This is consumed directly on the pricing path: it decides which receipts reach which side's
+#: score, and therefore that side's proposals and its limits. Flipping the subject of an outcome
+#: changes every term this build produces, so it belongs to the digest that claims to cover
+#: them. `delivered_and_released_by_buyer` is evidence about both: a prompt release is good
+#: conduct by the buyer and it is also proof the provider delivered. Attributing it to one side
+#: would leave the closing beat unbuildable, because the only positive outcome could never
+#: soften a buyer's view of a provider.
+SUBJECTS_OF: dict[str, frozenset[str]] = {
+    "timeout_claimed_without_delivery": frozenset({"provider"}),
+    "delivered_and_released_by_buyer": frozenset({"buyer", "provider"}),
+    "delivered_and_claimed_after_delay": frozenset({"buyer"}),
+}
+
+#: Whether an outcome is a reason to demand safer terms or to offer easier ones. Derived from
+#: the contract, never chosen by a model, and it gates which stored dimensions are admissible:
+#: a dimension whose direction disagrees with its outcome is refused before it can reach a
+#: score. That makes it a constraint on the engine's inputs, like the baseline domain below.
+#:
+#: A live call proved why it is not the model's call. Asked what a timeout meant, the model
+#: answered `positive` with a severity of zero, so a provider that took payment and never
+#: delivered would have made itself cheaper.
+VALENCE_OF: dict[str, str] = {
+    "timeout_claimed_without_delivery": "negative",
+    "delivered_and_released_by_buyer": "positive",
+    "delivered_and_claimed_after_delay": "negative",
+}
+
+#: The widest any basis-point figure in a document may be. The validator bounded every one of
+#: them against a bare `2**32` and the number appeared nowhere else, so it read as a sanity
+#: check rather than as what it is: the factor the baseline price is multiplied by, and
+#: therefore the thing that decides how large a baseline can be before the product leaves
+#: uint256.
+MAX_PRICE_BPS = 2**32
+
+#: A settled price of zero is a deal the chain rejects, so the conversion floors at this.
+MIN_SETTLED_PRICE_WEI = 1
+
 #: The four terms, in the order they are settled, and which way each opposer's limit points.
 #:
 #: These decide a settled term as completely as any number here does, and they were not hashed.
@@ -165,7 +270,12 @@ TERM_SHAPES: dict[str, str] = {
 #: floor to zero would let a settlement land on `price_wei`'s own clamp rather than on the
 #: number either side published.
 BASELINE_BOUNDS: dict[str, tuple[int, int]] = {
-    "price_wei": (1, 2**256 - 1),
+    # Not `2**256 - 1`. A baseline is multiplied by a basis-point figure before anything is
+    # signed, so the honest upper bound is the largest baseline whose product still fits the
+    # word the contract stores it in. At the old bound a baseline `baseline_fault` explicitly
+    # accepted killed `wrasse policy` with an ABI encoding error from inside the hashing, which
+    # is a crash where the design promises a refusal.
+    "price_wei": (MIN_SETTLED_PRICE_WEI, (2**256 - 1) // MAX_PRICE_BPS),
     "provider_bond_bps": (0, MAX_PROVIDER_BOND_BPS),
     "service_window": (1, MAX_DURATION),
     "payout_delay": (1, MAX_DURATION),
@@ -197,6 +307,17 @@ NEGOTIATION_MANIFEST: dict[str, Any] = {
     "settlement_order": list(TERMS),
     "term_shapes": TERM_SHAPES,
     "baseline_bounds": {field: list(bounds) for field, bounds in BASELINE_BOUNDS.items()},
+    "limit_names": LIMIT_NAMES,
+    "limit_kinds": LIMIT_KINDS,
+    "walkaway_rules": WALKAWAY_RULES,
+    # Sorted lists rather than the sets themselves, because a set has no JSON spelling. The
+    # lists are derived from the objects the engine reads, so editing one moves the digest.
+    "evidence_subjects": {
+        event_type: sorted(subjects) for event_type, subjects in SUBJECTS_OF.items()
+    },
+    "evidence_valence": VALENCE_OF,
+    "max_price_bps": MAX_PRICE_BPS,
+    "min_settled_price_wei": MIN_SETTLED_PRICE_WEI,
 }
 
 
