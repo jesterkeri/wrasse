@@ -25,9 +25,18 @@ dist/
 build/
 *.egg-info/
 
-# --- Sibyl local state and generated demo output -------------------------------------
-# Both memories, the transaction ledger and the quote. The stores hold this machine's own
-# view of two agents; they are rebuildable from chain receipts and are not a build input.
+# --- Local runtime state and generated demo output -----------------------------------
+# Both memories, the transaction ledger and the operational quote. Ignored because they are
+# this machine's runtime state, NOT because they are disposable.
+#
+# An earlier version of this comment called them rebuildable from chain receipts. They are
+# not. Supplied receipts can be reverified and replayed, and that is the whole of the claim:
+# the learned dimensions carry the severity and confidence every term is scored against and
+# do not come back from a log, automatic full-history discovery is explicitly out of scope,
+# and the transaction ledger is not reconstructed at all. Deleting `.wrasse/` loses the demo.
+#
+# The frozen sample a reader is meant to check lives at docs/examples/policy.schema3.json and
+# is tracked. `policy.json` here is operational output that changes on every run.
 .wrasse/
 *.db
 *.db-journal

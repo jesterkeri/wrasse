@@ -331,11 +331,14 @@ def _canonical(value: Any) -> str:
 
 
 def _positions_for(quote: "BilateralQuote", profile: str) -> dict[str, negotiation.Position]:
-    """The twelve numbers one profile's settlement is decided by.
+    """The twelve numbers one profile's settlement is read from.
 
     Three per term: the proposal, the limit standing against it, and the walk-away the
-    comparison is stated over. This said "eight" while only one walk-away of four was
-    published, which is the same mistake in prose that the document had in JSON.
+    comparison is stated over. Not "decided by": the twelve are read under the manifest's term
+    shapes and settlement order, and the same twelve settle differently without them.
+
+    This said "eight" while only one walk-away of four was published, which was the same
+    mistake in prose that the document had in JSON.
 
     A thin adapter now. The walk-away rules, the limit names and the limit kinds all live in
     `negotiation.build_positions`, which the document's validator also calls, so the writer and

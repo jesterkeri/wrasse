@@ -898,3 +898,117 @@ def test_the_engine_routes_evidence_through_the_hashed_subject_table(monkeypatch
         weight=Decimal(1), relevance=engine._EQUALLY_RELEVANT,
     )
     assert rerouted == Decimal("0.4"), "the hashed table is the one the score reads"
+
+
+# --------------------------------------------------------------------------------------
+# The golden sample, which has to be in the commit that claims to freeze it
+# --------------------------------------------------------------------------------------
+
+
+SAMPLE = Path(__file__).resolve().parent.parent / "docs" / "examples" / "policy.schema3.json"
+
+#: The live escrow and the two wallets the sample was produced from. Written out here rather
+#: than read from the sample, because reading them from the file under test would make the
+#: check agree with whatever the file happens to say.
+SAMPLE_ESCROW = Web3.to_checksum_address("0x5525653f05990DA1479578893b5a624183AFa22E")
+SAMPLE_BUYER = Web3.to_checksum_address("0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22")
+SAMPLE_PROVIDER = Web3.to_checksum_address("0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0")
+
+SAMPLE_TERMS = {
+    "urgent": {"price_wei": 118_000_000_000_000, "provider_bond_bps": 2_480,
+               "service_window": 300, "payout_delay": 900},
+    "sensitive": {"price_wei": 115_000_000_000_000, "provider_bond_bps": 2_480,
+                  "service_window": 2_400, "payout_delay": 1_440},
+}
+
+
+def _load_sample(profile: str):
+    return load_policy(
+        SAMPLE, profile=profile, chain_id=84532,
+        contract_address=SAMPLE_ESCROW, buyer=SAMPLE_BUYER, provider=SAMPLE_PROVIDER,
+    )
+
+
+def test_the_golden_sample_is_tracked_in_the_repository():
+    """A file the release commit does not contain cannot be frozen by that commit.
+
+    `policy.json` is gitignored, correctly: it is operational output that changes whenever
+    anyone runs a quote. Calling it the frozen sample anyway meant a fresh checkout had nothing
+    to inspect, the designer's brief could not be checked against the release point, and the
+    artifact could change or vanish while HEAD stood still. That is the failure that already
+    lost an adversarial review kept in a temporary directory.
+
+    So the operational file stays ignored and the frozen one is tracked under its own name.
+    """
+
+    import subprocess
+
+    assert SAMPLE.is_file(), f"{SAMPLE} is missing"
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", str(SAMPLE.relative_to(SAMPLE.parents[2]))],
+        cwd=SAMPLE.parents[2], capture_output=True, text=True,
+    )
+    assert tracked.returncode == 0, "the golden sample is not tracked by git"
+
+
+def test_the_golden_sample_was_written_by_this_build():
+    """The property that stops it becoming a stale artifact nobody notices.
+
+    Every constant that decides a term is inside `ENGINE_VERSION`, so a sample carrying an
+    older version was written by a build that would settle differently. Tying the two together
+    means changing a constant fails this test until the sample is regenerated, rather than
+    leaving a document on disk that quietly disagrees with the code beside it.
+    """
+
+    import hashlib
+
+    from wrasse.constants import ENGINE_VERSION
+
+    body = json.loads(SAMPLE.read_text())
+    assert body["schema_version"] == 3
+    assert body["engine_version"] == ENGINE_VERSION, (
+        "regenerate docs/examples/policy.schema3.json: a constant moved and the sample did not"
+    )
+
+    published = body["engine"]["negotiation_manifest"]
+    digest = hashlib.sha256(
+        json.dumps(published, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert ENGINE_VERSION.endswith(digest[:12])
+
+
+@pytest.mark.parametrize("profile", ["urgent", "sensitive"])
+def test_the_golden_sample_loads_and_settles_where_it_says(profile):
+    """Both agreed profiles go through the production validator, not a relaxed one.
+
+    `load_policy` recomputes the settlement from the document's own published numbers, so this
+    is not a shape check: it is the same arithmetic a reader does by hand.
+    """
+
+    _load_sample(profile)
+    settled = json.loads(SAMPLE.read_text())["buyer"]["profiles"][profile]["terms"]
+    assert settled == SAMPLE_TERMS[profile]
+
+
+def test_the_golden_sample_still_carries_the_refusal():
+    """The refusing profile is the demo beat, and it is the one a shape check would lose."""
+
+    with pytest.raises(PolicyDocumentError, match="did not reach agreement"):
+        _load_sample("budget")
+
+    budget = json.loads(SAMPLE.read_text())["buyer"]["profiles"]["budget"]
+    assert budget["settlement"] == {"agreed": False, "failed_on": "price_bps", "gap": 850}
+    assert "terms" not in budget and "policy_hash" not in budget
+
+
+def test_the_golden_sample_is_a_fixture_and_says_so():
+    """It is judged against a supplied time, so it is reproducible and NOT executable.
+
+    A live quote would carry a real block observation and would stop being executable minutes
+    later, which is not something a tracked file can honestly claim. The settled terms are
+    identical either way, because the settlement does not depend on the clock.
+    """
+
+    executability = json.loads(SAMPLE.read_text())["executability"]
+    assert executability["executable"] is False
+    assert executability["basis"] == "supplied-reference"

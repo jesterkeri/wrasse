@@ -169,6 +169,26 @@ it, and the walk-away the comparison is stated over, so the settlement can be re
 hand from the file. A build whose procedure had drifted would disagree with that arithmetic in
 the open rather than in private, which is the property worth having.
 
+### A document to read
+
+[`docs/examples/policy.schema3.json`](docs/examples/policy.schema3.json) is a real quote at
+schema 3, produced from the two receipts already on Base Sepolia. It carries all three
+profiles: two that agree and one that refuses, naming the term and the distance.
+
+It is tracked rather than generated, so a fresh checkout can check it. `policy.json` at the
+repository root is ignored, because it is operational output that changes on every run, and an
+artifact a release commit does not contain is not something that release can freeze.
+
+It is judged against a supplied reference time rather than a live block, which is why it is
+labelled `executable: false`. That is honest rather than weaker: a live quote stops being
+executable minutes after it is written, and no tracked file can keep that claim. The settled
+terms are identical either way, because the settlement does not depend on a clock.
+
+Four tests hold it to the build: it must be tracked, its `engine_version` must be this build's,
+its published manifest must recompute to the digest inside that version, and both agreed
+profiles must load through the production validator at the terms it prints. Change a constant
+and those fail until the sample is regenerated, so it cannot quietly go stale.
+
 ## Sending transactions
 
 Four commands sit between a quote and a settled deal.

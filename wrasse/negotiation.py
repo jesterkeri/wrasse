@@ -7,8 +7,12 @@ stapled into one document, not a bargain.
 **The shape.** Every term has one *proposer* and one *opposer*. The opposer publishes a limit,
 the proposer publishes a walk-away, and the settlement of that term is a comparison of three
 numbers: the proposal, the limit and the walk-away. Twelve across the four, and the document
-publishes all twelve. It is a pure function of them, and a reader holding only the document
-reproduces it without consulting either memory.
+publishes all twelve. It is a pure function of those twelve *read under the manifest's term
+shapes and settlement order*, both of which the document publishes too. The numbers alone are
+not sufficient and this codebase hashed both tables for exactly that reason: the same twelve
+settle differently if `price_bps` is a floor rather than a ceiling, and two simultaneous
+refusals name a different term if the order changes. A reader holding the document has all of
+it and needs neither memory.
 
 The count used to read "eight", from before the walk-aways were published. That was not a
 typo. It was the mental model that left three of the four out of the document and made a

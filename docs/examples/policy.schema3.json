@@ -1,0 +1,431 @@
+{
+  "buyer": {
+    "address": "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22",
+    "cold_start": false,
+    "counterparty": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+    "profiles": {
+      "budget": {
+        "baseline": {
+          "payout_delay": 1800,
+          "price_wei": 100000000000000,
+          "provider_bond_bps": 500,
+          "service_window": 600
+        },
+        "buyer": {
+          "limits": {
+            "max_price_bps": 10500,
+            "min_payout_delay": 1170
+          },
+          "proposes": {
+            "provider_bond_bps": 1500,
+            "service_window": 4200
+          },
+          "risk": "1.0000",
+          "used_evidence_ids": [
+            "0x90c366fa6f7f997f227b40e63298bc30296351130ebe6ac3714fe00f17945a87"
+          ],
+          "walkaways": {
+            "provider_bond_bps": 500,
+            "service_window": 4200
+          }
+        },
+        "provider": {
+          "limits": {
+            "max_bond_bps": 2480,
+            "min_service_window": 300
+          },
+          "proposes": {
+            "payout_delay": 893,
+            "price_bps": 11800
+          },
+          "risk": "0.7200",
+          "used_evidence_ids": [
+            "0x2c0efe23c8986e0a4f5bb6e6779cfbd5bc3301f026ba8af4c6025356e135e16b"
+          ],
+          "walkaways": {
+            "payout_delay": 1800,
+            "price_bps": 11350
+          }
+        },
+        "settlement": {
+          "agreed": false,
+          "failed_on": "price_bps",
+          "gap": 850
+        }
+      },
+      "sensitive": {
+        "baseline": {
+          "payout_delay": 1800,
+          "price_wei": 100000000000000,
+          "provider_bond_bps": 500,
+          "service_window": 600
+        },
+        "buyer": {
+          "limits": {
+            "max_price_bps": 11500,
+            "min_payout_delay": 1440
+          },
+          "proposes": {
+            "provider_bond_bps": 3000,
+            "service_window": 2400
+          },
+          "risk": "1.0000",
+          "used_evidence_ids": [
+            "0x90c366fa6f7f997f227b40e63298bc30296351130ebe6ac3714fe00f17945a87"
+          ],
+          "walkaways": {
+            "provider_bond_bps": 500,
+            "service_window": 2400
+          }
+        },
+        "policy_hash": "0xa4c097ea31c59d9cc94509bc17828fd1a9a90b3092ed2d1ed3ad8c0f90b40921",
+        "policy_preimage": {
+          "accept_by": 1788666920,
+          "bond_bps": 2480,
+          "buyer": "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22",
+          "buyer_evidence_hash": "0x1e2833495c50c8b4550879a798ecfbfd522eff5182fdf1864d0024269655ca5b",
+          "engine_version": "wrasse/0.2.0+726b04ffb8bf",
+          "payout_delay": 1440,
+          "price": 115000000000000,
+          "provider": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+          "provider_evidence_hash": "0x51bb7c45b95d217e8c3ecfb937d555a7752cb2bc53407ebf7e5b902332e0d82f",
+          "service_window": 2400
+        },
+        "provider": {
+          "limits": {
+            "max_bond_bps": 2480,
+            "min_service_window": 300
+          },
+          "proposes": {
+            "payout_delay": 893,
+            "price_bps": 11800
+          },
+          "risk": "0.7200",
+          "used_evidence_ids": [
+            "0x2c0efe23c8986e0a4f5bb6e6779cfbd5bc3301f026ba8af4c6025356e135e16b"
+          ],
+          "walkaways": {
+            "payout_delay": 1800,
+            "price_bps": 11350
+          }
+        },
+        "settlement": {
+          "agreed": true,
+          "moves": [
+            {
+              "because": "provider_max_bond_bps=2480",
+              "from": 3000,
+              "kind": "concession",
+              "term": "provider_bond_bps",
+              "to": 2480
+            },
+            {
+              "because": "buyer_max_price_bps=11500",
+              "from": 11800,
+              "kind": "rule",
+              "term": "price_bps",
+              "to": 11500
+            },
+            {
+              "because": "buyer_min_payout_delay=1440",
+              "from": 893,
+              "kind": "rule",
+              "term": "payout_delay",
+              "to": 1440
+            }
+          ]
+        },
+        "terms": {
+          "payout_delay": 1440,
+          "price_wei": 115000000000000,
+          "provider_bond_bps": 2480,
+          "service_window": 2400
+        }
+      },
+      "urgent": {
+        "baseline": {
+          "payout_delay": 1800,
+          "price_wei": 100000000000000,
+          "provider_bond_bps": 500,
+          "service_window": 600
+        },
+        "buyer": {
+          "limits": {
+            "max_price_bps": 12000,
+            "min_payout_delay": 900
+          },
+          "proposes": {
+            "provider_bond_bps": 3500,
+            "service_window": 300
+          },
+          "risk": "1.0000",
+          "used_evidence_ids": [
+            "0x90c366fa6f7f997f227b40e63298bc30296351130ebe6ac3714fe00f17945a87"
+          ],
+          "walkaways": {
+            "provider_bond_bps": 500,
+            "service_window": 600
+          }
+        },
+        "policy_hash": "0x7f0d92d86c2398a3d29af07ef4a9c46d17f113aafd23fc35fd5b5cf193c93603",
+        "policy_preimage": {
+          "accept_by": 1788666920,
+          "bond_bps": 2480,
+          "buyer": "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22",
+          "buyer_evidence_hash": "0x1e2833495c50c8b4550879a798ecfbfd522eff5182fdf1864d0024269655ca5b",
+          "engine_version": "wrasse/0.2.0+726b04ffb8bf",
+          "payout_delay": 900,
+          "price": 118000000000000,
+          "provider": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+          "provider_evidence_hash": "0x51bb7c45b95d217e8c3ecfb937d555a7752cb2bc53407ebf7e5b902332e0d82f",
+          "service_window": 300
+        },
+        "provider": {
+          "limits": {
+            "max_bond_bps": 2480,
+            "min_service_window": 300
+          },
+          "proposes": {
+            "payout_delay": 893,
+            "price_bps": 11800
+          },
+          "risk": "0.7200",
+          "used_evidence_ids": [
+            "0x2c0efe23c8986e0a4f5bb6e6779cfbd5bc3301f026ba8af4c6025356e135e16b"
+          ],
+          "walkaways": {
+            "payout_delay": 1800,
+            "price_bps": 11350
+          }
+        },
+        "settlement": {
+          "agreed": true,
+          "moves": [
+            {
+              "because": "provider_max_bond_bps=2480",
+              "from": 3500,
+              "kind": "concession",
+              "term": "provider_bond_bps",
+              "to": 2480
+            },
+            {
+              "because": "buyer_min_payout_delay=900",
+              "from": 893,
+              "kind": "rule",
+              "term": "payout_delay",
+              "to": 900
+            }
+          ]
+        },
+        "terms": {
+          "payout_delay": 900,
+          "price_wei": 118000000000000,
+          "provider_bond_bps": 2480,
+          "service_window": 300
+        }
+      }
+    },
+    "recalled_evidence": [
+      {
+        "block_number": 46390123,
+        "buyer": "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22",
+        "chain_id": 84532,
+        "contract_address": "0x5525653f05990DA1479578893b5a624183AFa22E",
+        "deal_id": 2,
+        "event_id": "0x2c0efe23c8986e0a4f5bb6e6779cfbd5bc3301f026ba8af4c6025356e135e16b",
+        "event_type": "delivered_and_claimed_after_delay",
+        "log_index": 2,
+        "observed_at": "2026-09-04T19:02:14+00:00",
+        "provider": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+        "tx_hash": "0x7b0150df1355401e78a49f5819ddd7d6185976e670ec0fad7101644057f401d0"
+      },
+      {
+        "block_number": 46390048,
+        "buyer": "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22",
+        "chain_id": 84532,
+        "contract_address": "0x5525653f05990DA1479578893b5a624183AFa22E",
+        "deal_id": 1,
+        "event_id": "0x90c366fa6f7f997f227b40e63298bc30296351130ebe6ac3714fe00f17945a87",
+        "event_type": "timeout_claimed_without_delivery",
+        "log_index": 53,
+        "observed_at": "2026-09-04T18:59:44+00:00",
+        "provider": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+        "tx_hash": "0xbe78947d2dd457b8c4257f07e23a0cef2b01faa56bf11a891a52aabb7f92ac98"
+      }
+    ],
+    "verdict": "match"
+  },
+  "chain_id": 84532,
+  "contract_address": "0x5525653f05990DA1479578893b5a624183AFa22E",
+  "engine": {
+    "negotiation_manifest": {
+      "baseline_bounds": {
+        "payout_delay": [
+          1,
+          2592000
+        ],
+        "price_wei": [
+          1,
+          26959946667150639794667015087019630673637144422540572481103610249215
+        ],
+        "provider_bond_bps": [
+          0,
+          10000
+        ],
+        "service_window": [
+          1,
+          2592000
+        ]
+      },
+      "bps_denominator": 10000,
+      "concession_den": 4,
+      "concession_num": 3,
+      "evidence_subjects": {
+        "delivered_and_claimed_after_delay": [
+          "buyer"
+        ],
+        "delivered_and_released_by_buyer": [
+          "buyer",
+          "provider"
+        ],
+        "timeout_claimed_without_delivery": [
+          "provider"
+        ]
+      },
+      "evidence_valence": {
+        "delivered_and_claimed_after_delay": "negative",
+        "delivered_and_released_by_buyer": "positive",
+        "timeout_claimed_without_delivery": "negative"
+      },
+      "integer_quantum": "1",
+      "irrelevant_multiplier": "0.5",
+      "limit_kinds": {
+        "payout_delay": "rule",
+        "price_bps": "rule",
+        "provider_bond_bps": "memory",
+        "service_window": "rule"
+      },
+      "limit_names": {
+        "payout_delay": "buyer_min_payout_delay",
+        "price_bps": "buyer_max_price_bps",
+        "provider_bond_bps": "provider_max_bond_bps",
+        "service_window": "provider_min_service_window"
+      },
+      "max_bond_bps": 5000,
+      "max_duration_seconds": 2592000,
+      "max_price_bps": 4294967296,
+      "max_provider_bond_bps": 10000,
+      "min_payout_delay_seconds": 60,
+      "min_service_window_seconds": 300,
+      "min_settled_price_wei": 1,
+      "profiles": {
+        "budget": {
+          "bond_sensitivity_bps": 1000,
+          "contexts": [
+            "cost_sensitive"
+          ],
+          "payout_delay_floor_bps": 6500,
+          "price_ceiling_premium_bps": 500,
+          "risk_weight": "0.85",
+          "window_buffer_seconds": 3600
+        },
+        "sensitive": {
+          "bond_sensitivity_bps": 2500,
+          "contexts": [
+            "quality_sensitive"
+          ],
+          "payout_delay_floor_bps": 8000,
+          "price_ceiling_premium_bps": 1500,
+          "risk_weight": "1.20",
+          "window_buffer_seconds": 1800
+        },
+        "urgent": {
+          "bond_sensitivity_bps": 3000,
+          "contexts": [
+            "deadline_sensitive"
+          ],
+          "payout_delay_floor_bps": 5000,
+          "price_ceiling_premium_bps": 2000,
+          "risk_weight": "1.40",
+          "window_buffer_seconds": -1800
+        }
+      },
+      "provider_relevance_multiplier": "1",
+      "provider_risk_weight": "1",
+      "relevant_multiplier": "1.5",
+      "risk_ceiling": "1",
+      "risk_display_quantum": "0.0001",
+      "risk_floor": "0",
+      "rounding": "ROUND_HALF_UP",
+      "settlement_order": [
+        "provider_bond_bps",
+        "service_window",
+        "price_bps",
+        "payout_delay"
+      ],
+      "term_shapes": {
+        "payout_delay": "floor",
+        "price_bps": "ceiling",
+        "provider_bond_bps": "ceiling",
+        "service_window": "floor"
+      },
+      "walkaway_rules": {
+        "payout_delay": "max(baseline, proposal)",
+        "price_bps": "published",
+        "provider_bond_bps": "min(baseline, proposal)",
+        "service_window": "max(baseline, proposal)"
+      }
+    }
+  },
+  "engine_version": "wrasse/0.2.0+726b04ffb8bf",
+  "executability": {
+    "basis": "supplied-reference",
+    "chain": null,
+    "executable": false,
+    "inclusion_margin_seconds": null,
+    "note": "Judged against a supplied time, not against Base. Reproducible, but not a live quote: re-derive the deadline from chain time before signing.",
+    "observed_lag_seconds": null,
+    "reference_timestamp": 1788666320
+  },
+  "provider": {
+    "address": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+    "cold_start": false,
+    "counterparty": "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22",
+    "persona": {
+      "cashflow_sensitivity": "0.70",
+      "commitment": "9a7ce92d0797b2a057ea90fc2b7dac9b0415d31d1877c05f69cf4d99fb7c2c5d",
+      "name": "atlas"
+    },
+    "recalled_evidence": [
+      {
+        "block_number": 46390123,
+        "buyer": "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22",
+        "chain_id": 84532,
+        "contract_address": "0x5525653f05990DA1479578893b5a624183AFa22E",
+        "deal_id": 2,
+        "event_id": "0x2c0efe23c8986e0a4f5bb6e6779cfbd5bc3301f026ba8af4c6025356e135e16b",
+        "event_type": "delivered_and_claimed_after_delay",
+        "log_index": 2,
+        "observed_at": "2026-09-04T19:02:14+00:00",
+        "provider": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+        "tx_hash": "0x7b0150df1355401e78a49f5819ddd7d6185976e670ec0fad7101644057f401d0"
+      },
+      {
+        "block_number": 46390048,
+        "buyer": "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22",
+        "chain_id": 84532,
+        "contract_address": "0x5525653f05990DA1479578893b5a624183AFa22E",
+        "deal_id": 1,
+        "event_id": "0x90c366fa6f7f997f227b40e63298bc30296351130ebe6ac3714fe00f17945a87",
+        "event_type": "timeout_claimed_without_delivery",
+        "log_index": 53,
+        "observed_at": "2026-09-04T18:59:44+00:00",
+        "provider": "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0",
+        "tx_hash": "0xbe78947d2dd457b8c4257f07e23a0cef2b01faa56bf11a891a52aabb7f92ac98"
+      }
+    ],
+    "verdict": "match"
+  },
+  "request_id": "e0d740720cdcf599ac50aee47e857eba",
+  "schema_version": 3
+}
