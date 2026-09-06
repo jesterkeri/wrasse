@@ -52,9 +52,10 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from . import cli
 from .negotiation import BASELINE_BOUNDS
@@ -181,6 +182,25 @@ def quote(
     link reproduces its own result.
     """
 
+    return _quote(
+        memory=memory, price_wei=price_wei, provider_bond_bps=provider_bond_bps,
+        service_window=service_window, payout_delay=payout_delay,
+        reference_timestamp=reference_timestamp, accept_by=accept_by,
+    )
+
+
+def _quote(
+    *,
+    memory: str,
+    price_wei: int,
+    provider_bond_bps: int,
+    service_window: int,
+    payout_delay: int,
+    reference_timestamp: int = 1_788_666_320,
+    accept_by: int = 1_788_666_920,
+) -> JSONResponse:
+    """One implementation, two request shapes. Neither reshapes the document."""
+
     basis = cli.TimeBasis(reference_timestamp, accept_by, None, 0)
     try:
         document = cli.quote_document(
@@ -210,6 +230,43 @@ def quote(
 
     document["memory"] = memory
     return JSONResponse(document)
+
+
+class Baseline(BaseModel):
+    """The four numbers an operator chooses before either memory is consulted.
+
+    Named exactly as the page sends them and as the document prints them back, because a
+    rename here is a place the displayed baseline and the quoted one can differ.
+    """
+
+    price_wei: int = Field(default=100_000_000_000_000)
+    provider_bond_bps: int = Field(default=500)
+    service_window: int = Field(default=600)
+    payout_delay: int = Field(default=1_800)
+
+
+class QuoteRequest(BaseModel):
+    """What the page posts. `memory` is a boolean there, `on`/`off` in the query form.
+
+    Both spellings reach the same code. The page posts, because it sends four numbers and a
+    flag; a share link uses the query form, because a link has to carry its own state.
+    """
+
+    baseline: Baseline = Field(default_factory=Baseline)
+    memory: bool = True
+
+
+@app.post("/api/quote")
+def quote_post(request: QuoteRequest = Body(default_factory=QuoteRequest)) -> JSONResponse:
+    """The shape the page sends. Same function underneath as the query form."""
+
+    return _quote(
+        memory=WARM if request.memory else COLD,
+        price_wei=request.baseline.price_wei,
+        provider_bond_bps=request.baseline.provider_bond_bps,
+        service_window=request.baseline.service_window,
+        payout_delay=request.baseline.payout_delay,
+    )
 
 
 class _SuppliedTime:
