@@ -1268,6 +1268,14 @@ def _create_deal(args) -> int:
             preimage=preimage.as_dict(),
         )
 
+    # The opt-in is checked here as well as inside `broadcast`, and the duplication is the
+    # point. `broadcast` checks it as its first statement, by which time this caller has
+    # already signed, allocated a nonce and written a row. Only `DeterministicRejection` was
+    # caught, so one command run without the flag left a nonce held for bytes no node ever
+    # saw, and the next `tx-resolve` turned that into a wallet nobody could free. Refusing
+    # before anything is recorded means the mistake costs nothing at all.
+    chain.require_broadcast_opt_in()
+
     row, created = ledger.record_signed(
         chain_id=chain_id,
         wallet=buyer,
@@ -1288,6 +1296,12 @@ def _create_deal(args) -> int:
     row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
     try:
         outcome = chain.broadcast(web3, row)
+    except chain.BroadcastNotAuthorised as error:
+        # Unreachable through the guard above, and kept anyway. These bytes were never offered
+        # to a mempool, so nothing can mine at this nonce and holding it would strand every
+        # later transaction behind a permanent gap.
+        ledger.mark_unbroadcast(row, str(error))
+        raise
     except chain.DeterministicRejection as error:
         # The node refused it during pre-validation, on the very first attempt, so these bytes
         # never entered a mempool and nothing can ever mine at this nonce. Releasing it is the
@@ -1421,6 +1435,14 @@ def _send(args, *, role, action, calldata, value_wei, preimage, intent_id, note=
             chain.sign_transaction(account, transaction), accept_by=0, preimage=preimage
         )
 
+    # The opt-in is checked here as well as inside `broadcast`, and the duplication is the
+    # point. `broadcast` checks it as its first statement, by which time this caller has
+    # already signed, allocated a nonce and written a row. Only `DeterministicRejection` was
+    # caught, so one command run without the flag left a nonce held for bytes no node ever
+    # saw, and the next `tx-resolve` turned that into a wallet nobody could free. Refusing
+    # before anything is recorded means the mistake costs nothing at all.
+    chain.require_broadcast_opt_in()
+
     row, created = ledger.record_signed(
         chain_id=chain_id, wallet=wallet, contract_address=address, intent_id=intent_id,
         read_chain_nonce=lambda: int(web3.eth.get_transaction_count(wallet, "pending")),
@@ -1434,6 +1456,12 @@ def _send(args, *, role, action, calldata, value_wei, preimage, intent_id, note=
     row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
     try:
         outcome = chain.broadcast(web3, row)
+    except chain.BroadcastNotAuthorised as error:
+        # Unreachable through the guard above, and kept anyway. These bytes were never offered
+        # to a mempool, so nothing can mine at this nonce and holding it would strand every
+        # later transaction behind a permanent gap.
+        ledger.mark_unbroadcast(row, str(error))
+        raise
     except chain.DeterministicRejection as error:
         ledger.mark_unbroadcast(row, str(error))
         print(json.dumps({"intent_id": row.intent_id, "status": chain.UNBROADCAST,
@@ -1663,6 +1691,11 @@ def _tx_resolve(args) -> int:
                                "action": "the deadline passed while resolving; not resent"})
                 continue
 
+            # Before the attempt is recorded, for the same reason as the two first-send sites.
+            # `--rebroadcast` is a flag and the opt-in is an environment variable, so they can
+            # disagree, and a refusal after the counter has moved records an attempt nobody
+            # made. This row is past its first send, so its nonce cannot be released either.
+            chain.require_broadcast_opt_in()
             row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
             try:
                 outcome = chain.broadcast(web3, row)

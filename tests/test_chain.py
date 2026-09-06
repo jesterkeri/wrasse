@@ -1304,3 +1304,138 @@ def test_a_date_form_retry_after_is_understood(monkeypatch):
 
     assert chain._read(_Flaky(1, Dated()), describe="probe") == "answer"
     assert 0 < slept[0] <= chain.READ_MAX_DELAY_SECONDS
+
+
+# --------------------------------------------------------------------------------------
+# A deal action has no acceptance deadline, and pretending it has one killed the wallet
+# --------------------------------------------------------------------------------------
+
+
+def test_a_row_with_no_deadline_is_unknown_rather_than_stuck(tmp_path):
+    """`accept_by = 0` means this action has no deadline, not that its deadline has passed.
+
+    Only `createDeal` carries a deadline, because only `createDeal` has one the contract
+    enforces. Every other action is signed with zero, and the expiry check read that as a
+    deadline in 1970. So `acceptDeal`, `markDelivered`, `releaseDeal`, `claimPayment`,
+    `claimTimeout` and `withdraw` could never reach `unknown`, which is the only verdict
+    carrying `may_rebroadcast`. A deal action whose bytes left the mempool held its wallet
+    with no way out, and there are two of those wallets in the whole demo.
+    """
+
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, accept_by=0)
+    assert row.accept_by == 0
+
+    verdict = chain.resolve(FakeWeb3(), row, chain_now=1_800_000_000)
+
+    assert verdict.status == chain.UNKNOWN, (
+        "a deadline of zero is no deadline; resending is exactly as safe as the first send"
+    )
+    assert verdict.may_rebroadcast is True
+
+
+def test_a_real_deadline_that_has_passed_is_still_stuck(tmp_path):
+    """The check the fix must not remove. `createDeal` does have a deadline and it does expire."""
+
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, accept_by=1_700_000_000)
+
+    verdict = chain.resolve(FakeWeb3(), row, chain_now=1_800_000_000)
+
+    assert verdict.status == chain.STUCK
+    assert verdict.may_rebroadcast is False
+    assert "deadline" in verdict.detail
+
+
+def test_a_deadline_still_in_the_future_is_unknown(tmp_path):
+    """The boundary between the two above, checked rather than assumed."""
+
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, accept_by=1_900_000_000)
+
+    assert chain.resolve(FakeWeb3(), row, chain_now=1_800_000_000).status == chain.UNKNOWN
+
+
+# --------------------------------------------------------------------------------------
+# Bytes that never reached a node must not hold a nonce
+# --------------------------------------------------------------------------------------
+
+
+def test_a_send_refused_by_the_opt_in_releases_its_nonce(tmp_path, monkeypatch):
+    """The trigger that made the deadlock likely rather than theoretical.
+
+    `broadcast` checks the opt-in as its first statement, and the caller has already recorded a
+    signed row and taken a nonce by then. Only `DeterministicRejection` was caught. So a single
+    command run without `WRASSE_ALLOW_BROADCAST=1` left a nonce held for bytes no node ever
+    saw, and the wallet was one `tx-resolve` away from being unusable.
+
+    `unbroadcast` is the state for exactly this and is documented as the only terminal status
+    that gives a nonce back. A refused opt-in is a stronger case than the one it was written
+    for: nothing was even offered to a mempool.
+    """
+
+    monkeypatch.delenv(chain.BROADCAST_ENV, raising=False)
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, accept_by=0)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+
+    with pytest.raises(chain.BroadcastNotAuthorised):
+        chain.broadcast(FakeWeb3(), row)
+
+    released = ledger.mark_unbroadcast(row, "refused by the opt-in")
+    assert released.status == chain.UNBROADCAST
+    assert chain.UNBROADCAST in chain.NONCE_RELEASING_STATUSES
+
+    # and the wallet is free, which is the property that actually matters. A different deal id
+    # so the bytes differ: the ledger's tx-hash index would refuse an identical payload, which
+    # is a separate protection and not the one under test here.
+    second, created, _ = _record(
+        ledger, intent_id="a-second-intent", accept_by=0, deal_id=7
+    )
+    assert created and second.nonce == row.nonce
+
+
+def test_a_stuck_wallet_can_be_freed_without_editing_the_database(tmp_path):
+    """The escape the design promised and never shipped, and why it now exists.
+
+    `stuck` is deliberately not terminal: it means "we do not know whether this nonce is
+    spent", and the comment says clearing it is an operator decision. No command made that
+    decision. Combined with every deal action being stuck on arrival, a wallet could reach a
+    state where nothing in the project could free it, and there are exactly two wallets.
+
+    Nothing new was needed once the deadline gate was fixed. `stuck` is non-terminal, so
+    `tx-resolve` picks it up, and `resolve` judges it against the chain rather than against its
+    recorded status. What was missing was a verdict it could reach.
+    """
+
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, accept_by=0)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+    row = ledger.set_status(row, chain.STUCK)
+
+    assert row.status not in chain.TERMINAL_STATUSES, "a terminal row would never be looked at again"
+
+    verdict = chain.resolve(FakeWeb3(), row, chain_now=1_800_000_000)
+    assert verdict.status == chain.UNKNOWN
+    assert verdict.may_rebroadcast is True
+    assert chain.SEND_ATTEMPTED in chain.ALLOWED_TRANSITIONS[chain.STUCK], (
+        "and the graph has to admit the resend the verdict just authorised"
+    )
+
+
+def test_a_row_that_actually_mined_leaves_stuck_on_its_own(tmp_path):
+    """The other way out, which needs no operator at all.
+
+    A stuck row is a statement about our knowledge, not about the chain. If the transaction
+    was in a block the whole time, the next resolve says so.
+    """
+
+    ledger = _ledger(tmp_path)
+    row, _, _ = _record(ledger, accept_by=0)
+    row = ledger.set_status(row, chain.SEND_ATTEMPTED, bump_attempts=True)
+    row = ledger.set_status(row, chain.STUCK)
+
+    web3 = FakeWeb3()
+    web3.eth.receipts[row.tx_hash] = _receipt(status=1)
+
+    assert chain.resolve(web3, row).status == chain.INCLUDED_SUCCESS

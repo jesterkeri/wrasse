@@ -51,8 +51,17 @@ REORGED = "reorged"
 NONCE_CONFLICT_PENDING = "nonce_conflict_pending"
 NONCE_CONSUMED_OR_REPLACED = "nonce_consumed_or_replaced"
 STUCK = "stuck"
-REJECTED = "rejected"
 UNBROADCAST = "unbroadcast"
+
+# `rejected` used to sit here, in `ALL_STATUSES`, in `TERMINAL_STATUSES` and in two transition
+# sets. Nothing in the package ever wrote it. A review found it while looking for the exit from
+# `stuck`, which is worse than dead code: a state in a transition table is a claim about what
+# the machine can do, and this one was a claim nobody could act on. It would not even have
+# freed a wallet, because `_blocking_row` skips only settled and releasing statuses and
+# `rejected` was in neither.
+#
+# A node that refuses bytes before admitting them is already `unbroadcast`, which does release
+# the nonce and is written in three places. There was nothing left for `rejected` to mean.
 
 ALL_STATUSES = (
     SIGNED,
@@ -66,7 +75,6 @@ ALL_STATUSES = (
     NONCE_CONFLICT_PENDING,
     NONCE_CONSUMED_OR_REPLACED,
     STUCK,
-    REJECTED,
     UNBROADCAST,
 )
 
@@ -76,7 +84,7 @@ ALL_STATUSES = (
 #: know whether this nonce is spent", and allowing the wallet to move on would open a nonce
 #: gap that silently strands every later transaction. Clearing either is an operator decision.
 TERMINAL_STATUSES = frozenset(
-    {CONFIRMED_SUCCESS, CONFIRMED_REVERTED, NONCE_CONSUMED_OR_REPLACED, REJECTED, UNBROADCAST}
+    {CONFIRMED_SUCCESS, CONFIRMED_REVERTED, NONCE_CONSUMED_OR_REPLACED, UNBROADCAST}
 )
 
 #: The wallet's question is "is this nonce spent", and a transaction in a block has spent it.
@@ -111,7 +119,7 @@ NONCE_RELEASING_STATUSES = frozenset({UNBROADCAST})
 #: from included to unmined, which is the whole reason inclusion and confirmation are
 #: different states.
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    SIGNED: frozenset({SEND_ATTEMPTED, STUCK, REJECTED, UNBROADCAST}),
+    SIGNED: frozenset({SEND_ATTEMPTED, STUCK, UNBROADCAST}),
     SEND_ATTEMPTED: frozenset(
         {
             SEND_ATTEMPTED,
@@ -121,7 +129,6 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
             NONCE_CONFLICT_PENDING,
             NONCE_CONSUMED_OR_REPLACED,
             STUCK,
-            REJECTED,
         }
     ),
     PENDING: frozenset(
@@ -172,8 +179,12 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     CONFIRMED_SUCCESS: frozenset(),
     CONFIRMED_REVERTED: frozenset(),
     NONCE_CONSUMED_OR_REPLACED: frozenset(),
-    REJECTED: frozenset(),
 }
+
+
+#: What an `accept_by` of zero means: this action has no acceptance deadline. Named rather than
+#: written as a bare `0` because the whole defect was one comparison reading it as a timestamp.
+NO_DEADLINE = 0
 
 
 READ_ATTEMPTS = 3
@@ -1156,7 +1167,16 @@ def resolve(
             f"pending nonce {pending} is past {row.nonce}, but nothing is confirmed",
         )
 
-    if chain_now is not None and row.accept_by <= chain_now:
+    # `accept_by` of zero means this action has no deadline, not that its deadline fell in
+    # 1970. Only `createDeal` has one the contract enforces; every other action is signed with
+    # zero and is judged by the contract's own preconditions, which revert safely.
+    #
+    # Reading zero as an expiry meant no deal action could ever reach the `UNKNOWN` verdict
+    # below, and `UNKNOWN` is the only verdict carrying `may_rebroadcast`. So `acceptDeal`,
+    # `markDelivered`, `releaseDeal`, `claimPayment`, `claimTimeout` and `withdraw` held their
+    # wallet forever the moment their bytes left a mempool, with no command in the project that
+    # freed it. There are two such wallets in the whole demo.
+    if chain_now is not None and NO_DEADLINE < row.accept_by <= chain_now:
         return Verdict(STUCK, "the acceptance deadline has passed; resending cannot succeed")
 
     age = (datetime.now(UTC) - datetime.fromisoformat(row.updated_at)).total_seconds()

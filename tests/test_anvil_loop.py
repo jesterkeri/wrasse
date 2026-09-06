@@ -1250,3 +1250,39 @@ def test_a_document_that_says_the_same_thing_twice_is_refused(rehearsal, capsys)
             contract_address=rehearsal["address"], buyer=rehearsal["buyer"].address,
             provider=PROVIDER,
         )
+
+
+def test_a_refused_opt_in_costs_the_wallet_nothing(both_roles, capsys, monkeypatch):
+    """The failure that made a dead wallet likely rather than theoretical, end to end.
+
+    `broadcast` checks the opt-in as its first statement, and by then the caller has signed,
+    taken a nonce and written a row. Only `DeterministicRejection` was caught, so one command
+    run without the flag left a nonce held for bytes no node ever saw. The next `tx-resolve`
+    found no receipt, hit the deadline gate, and that wallet was finished.
+
+    A judge closing a tab or a service restarting mid-action is the same shape. The property
+    that matters is not the exception, which was always raised. It is that the next attempt
+    still works: a phantom row holding the nonce would make this raise `WalletBusy` instead.
+    """
+
+    deal_id = _open_deal(both_roles, capsys)
+
+    monkeypatch.delenv(chain.BROADCAST_ENV, raising=False)
+    with pytest.raises(chain.BroadcastNotAuthorised):
+        main(["accept-deal", "--deal-id", str(deal_id)])
+    capsys.readouterr()
+
+    ledger = chain.TransactionLedger(os.environ["WRASSE_TX_DB"])
+    provider = Web3.to_checksum_address(os.environ["WRASSE_PROVIDER_A_ADDRESS"])
+    held = [row for row in ledger.rows() if row.wallet == provider]
+    assert held == [], (
+        "nothing was sent, so nothing may be recorded; a row here is a nonce nobody can free"
+    )
+
+    monkeypatch.setenv(chain.BROADCAST_ENV, "1")
+    assert main(["accept-deal", "--deal-id", str(deal_id)]) == 0
+    sent = json.loads(capsys.readouterr().out)
+    both_roles["web3"].eth.wait_for_transaction_receipt(sent["tx_hash"])
+    assert main(["tx-resolve"]) == 0
+    capsys.readouterr()
+    assert escrow_state(both_roles["web3"], both_roles["address"], deal_id) == "Accepted"
