@@ -1063,3 +1063,115 @@ def test_the_golden_sample_is_a_fixture_and_says_so():
     executability = json.loads(SAMPLE.read_text())["executability"]
     assert executability["executable"] is False
     assert executability["basis"] == "supplied-reference"
+
+
+# --------------------------------------------------------------------------------------
+# The cold-start quote, which is the other half of the argument
+# --------------------------------------------------------------------------------------
+
+
+COLD = SAMPLE.parent / "policy.cold.json"
+
+#: Regenerate both together, from two empty stores:
+#:
+#:     WRASSE_BUYER_MEMORY_PATH=<tmp>/buyer-memory.db \
+#:     WRASSE_PROVIDER_MEMORY_PATH=<tmp>/provider-memory.db \
+#:     uv run wrasse policy 0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0 \
+#:       --buyer 0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22 \
+#:       --accept-by 1788666920 --reference-timestamp 1788666320 \
+#:       --base-bond-bps 500 --service-window 600 --payout-delay 1800 \
+#:       --output docs/examples/policy.cold.json
+COLD_DIGEST = "9fff7d6f3edbdbe3995cf7869bb2079823a7a0692bd1aaf6ec092cf954588b99"
+
+
+def test_the_cold_start_sample_is_tracked_and_pinned_whole():
+    import hashlib
+    import subprocess
+
+    from wrasse.constants import ENGINE_VERSION
+
+    assert COLD.is_file()
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", str(COLD.relative_to(COLD.parents[2]))],
+        cwd=COLD.parents[2], capture_output=True, text=True,
+    )
+    assert tracked.returncode == 0, "a document the release commit does not contain is not frozen"
+
+    body = json.loads(COLD.read_text())
+    assert body["schema_version"] == 3
+    assert body["engine_version"] == ENGINE_VERSION, "regenerate it; a constant moved"
+
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(canonical.encode()).hexdigest() == COLD_DIGEST
+
+
+def test_a_cold_start_says_so_rather_than_inventing_a_history():
+    """An empty store is not a clean record. It is the absence of one, and it says which."""
+
+    body = json.loads(COLD.read_text())
+    for side in ("buyer", "provider"):
+        assert body[side]["cold_start"] is True
+        assert body[side]["verdict"] == "empty_store"
+        assert body[side]["recalled_evidence"] == []
+
+
+@pytest.mark.parametrize("profile", ["urgent", "sensitive", "budget"])
+def test_with_no_memory_every_profile_settles_at_the_operator_baseline(profile):
+    """Nothing has happened yet, so there is nothing for either side to react to.
+
+    Risk is zero on both sides, no limit binds, and no term moves. That is what makes this the
+    control: every number here is the operator's own baseline, and every difference in the
+    other document is memory.
+    """
+
+    body = json.loads(COLD.read_text())
+    block = body["buyer"]["profiles"][profile]
+
+    assert block["buyer"]["risk"] == "0.0000"
+    assert block["provider"]["risk"] == "0.0000"
+    assert block["settlement"] == {"agreed": True, "moves": []}
+    assert block["terms"] == {
+        "price_wei": 100_000_000_000_000,
+        "provider_bond_bps": 500,
+        "service_window": 600,
+        "payout_delay": 1_800,
+    }
+    assert block["buyer"]["used_evidence_ids"] == []
+    assert block["provider"]["used_evidence_ids"] == []
+
+
+def test_the_two_documents_differ_only_because_one_side_remembers():
+    """The entry's whole claim, as a comparison rather than an assertion.
+
+    Same engine version, same operator baselines, same two addresses, same three profiles.
+    One was produced against empty stores and one against two receipts on Base. Everything
+    that differs between them is memory, and there is a lot of it: a bond ceiling that falls
+    from 5000 to 2480, a price floor that rises from the baseline to 11350, and a deal that
+    stops existing.
+    """
+
+    cold = json.loads(COLD.read_text())
+    warm = json.loads(SAMPLE.read_text())
+
+    assert cold["engine_version"] == warm["engine_version"]
+    assert cold["schema_version"] == warm["schema_version"]
+    for profile in ("urgent", "sensitive", "budget"):
+        assert cold["buyer"]["profiles"][profile]["baseline"] == \
+            warm["buyer"]["profiles"][profile]["baseline"], "the baselines have to match"
+
+    cold_budget = cold["buyer"]["profiles"]["budget"]
+    warm_budget = warm["buyer"]["profiles"]["budget"]
+
+    assert cold_budget["settlement"]["agreed"] is True
+    assert warm_budget["settlement"] == {"agreed": False, "failed_on": "price_bps", "gap": 850}
+
+    # and the reason, which a reader can follow without running anything
+    assert cold_budget["provider"]["walkaways"]["price_bps"] == 10_000
+    assert warm_budget["provider"]["walkaways"]["price_bps"] == 11_350
+    assert cold_budget["buyer"]["limits"]["max_price_bps"] == 10_500
+    assert warm_budget["buyer"]["limits"]["max_price_bps"] == 10_500, (
+        "the ceiling is a profile constant, so the refusal is the floor rising to meet it"
+    )
+
+    assert cold["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 500
+    assert warm["buyer"]["profiles"]["urgent"]["terms"]["provider_bond_bps"] == 2_480

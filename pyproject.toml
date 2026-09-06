@@ -16,6 +16,14 @@ dev = [
     "pytest>=8.4,<9",
     "pytest-cov>=6.2,<7",
     "ruff>=0.14,<0.15",
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+]
+# The hosted quote service. Optional because the terminal path is the product and this is one
+# read-only view of it: a clone that never serves a page should not carry a web framework.
+service = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.scripts]

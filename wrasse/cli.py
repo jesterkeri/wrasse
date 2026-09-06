@@ -184,10 +184,19 @@ def _persona_path() -> Path:
     return Path(os.getenv("WRASSE_PROVIDER_PERSONA", "personas/provider-a.json"))
 
 
-def _open_stores(*, buyer: str, provider: str) -> dict[str, WrasseStore]:
-    """One identified memory per side, and never the same file twice."""
+def _open_stores(
+    *, buyer: str, provider: str, paths: dict[str, Path] | None = None
+) -> dict[str, WrasseStore]:
+    """One identified memory per side, and never the same file twice.
 
-    paths = {role: _store_path(role) for role in ("buyer", "provider")}
+    `paths` exists for callers that are not a process. Every setting in this module is read
+    from the environment at call time, deliberately, so that `load_dotenv` can reach it. That
+    is right for a command and wrong for a service, where `os.environ` is shared by every
+    in-flight request and two of them would interleave. The quote service holds one pair of
+    stores per memory setting, opened once, and passes them here.
+    """
+
+    paths = paths or {role: _store_path(role) for role in ("buyer", "provider")}
     if paths["buyer"].resolve() == paths["provider"].resolve():
         raise RuntimeError(
             f"both memory paths resolve to {paths['buyer'].resolve()}; one store cannot hold "
@@ -1782,6 +1791,101 @@ def _rebind_policy(args) -> int:
     return 0
 
 
+def quote_document(
+    *,
+    buyer: str,
+    provider: str,
+    base_price_wei: int,
+    base_bond_bps: int,
+    service_window: int,
+    payout_delay: int,
+    basis: TimeBasis,
+    executability: dict,
+    inclusion_margin: int,
+    stores: dict[str, WrasseStore] | None = None,
+) -> dict:
+    """One quote, as the document a reader receives.
+
+    Extracted from the `policy` command so the hosted quote service and the command produce the
+    same bytes from the same code rather than from two assemblies that agree today. The
+    command's body was inline in `main`'s if-chain, which meant a service either drove argparse
+    and parsed printed JSON back, or rebuilt this and drifted from it.
+
+    **Nothing here writes anything a caller did not already own.** `_bilateral_quote` reads both
+    stores and returns; the only write on this path is the persona commitment, which is
+    idempotent after the first open and is a property of the store rather than of the quote.
+    That is what makes the hosted form safe with the databases mounted read-only.
+    """
+
+    chain_id = _chain_id()
+    escrow_address = _escrow_address()
+    if escrow_address is None:
+        raise RuntimeError(
+            "WRASSE_ESCROW_ADDRESS is not set. A quote is bound to one deployment, and a "
+            "document that names none cannot be executed against any."
+        )
+    buyer = Web3.to_checksum_address(buyer)
+    provider = Web3.to_checksum_address(provider)
+
+    # Refused here, by the writer, rather than discovered later by the reader. The domain
+    # is defined once in `negotiation.BASELINE_BOUNDS` and both consult it.
+    fault = negotiation.baseline_fault({
+        "price_wei": base_price_wei,
+        "provider_bond_bps": base_bond_bps,
+        "service_window": service_window,
+        "payout_delay": payout_delay,
+    })
+    if fault is not None:
+        raise RuntimeError(
+            f"the baseline {fault}. A quote written from it could not be read back by "
+            "this build, so it is refused before it is written rather than after."
+        )
+
+    stores = stores or _open_stores(buyer=buyer, provider=provider)
+    quote = _bilateral_quote(
+        stores, buyer=buyer, provider=provider,
+        base_price_wei=base_price_wei, base_bond_bps=base_bond_bps,
+        base_service_window=service_window, base_payout_delay=payout_delay,
+    )
+    reference_timestamp, accept_by, observation = basis.reference, basis.accept_by, basis.observation
+
+    halves = _document_halves(
+        quote, buyer=buyer, provider=provider, accept_by=accept_by,
+        commitment=stores["provider"].persona_commitment()["sha256"],
+    )
+    for name, profile in halves["buyer"]["profiles"].items():
+        if not profile["settlement"]["agreed"]:
+            continue  # nothing to execute, so nothing to check against a chain
+        preimage = PolicyPreimage(**profile["policy_preimage"])
+        # A quote the chain would refuse is not a quote. Checking here, rather than at
+        # broadcast, keeps the displayed policy and the executable policy the same thing.
+        validate_creatable(preimage, reference_timestamp=reference_timestamp)
+        if observation is not None:
+            require_inclusion_margin(
+                preimage,
+                chain_timestamp=observation.timestamp,
+                observed_lag_seconds=basis.observed_lag,
+                margin_seconds=inclusion_margin,
+            )
+
+    return {
+        # Immutable identity, fixed before any transaction exists. `request_id` is what
+        # makes a retry a retry: the committed terms move between attempts because the
+        # deadline is re-derived from chain time, so action identity cannot come from them.
+        "schema_version": POLICY_SCHEMA_VERSION,
+        "request_id": secrets.token_hex(16),
+        "chain_id": chain_id,
+        "contract_address": escrow_address,
+        "engine_version": ENGINE_VERSION,
+        # Published so a reader recomputes the digest inside `engine_version` rather than
+        # trusting it. Every constant that can move a term is in here.
+        "engine": {"negotiation_manifest": NEGOTIATION_MANIFEST},
+        "executability": executability,
+        "buyer": halves["buyer"],
+        "provider": halves["provider"],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     # Read before dotenv can populate the environment from a file. A crash simulation that a
     # stale `.env` could arm would eventually fire during a real run.
@@ -1911,74 +2015,16 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2, sort_keys=True))
         return 0
     if args.command == "policy":
-        chain_id = _chain_id()
-        escrow_address = _escrow_address()
-        if escrow_address is None:
-            raise RuntimeError(
-                "WRASSE_ESCROW_ADDRESS is not set. A quote is bound to one deployment, and a "
-                "document that names none cannot be executed against any."
-            )
-        buyer = Web3.to_checksum_address(args.buyer)
-        provider = Web3.to_checksum_address(args.provider)
-
-        # Refused here, by the writer, rather than discovered later by the reader. The domain
-        # is defined once in `negotiation.BASELINE_BOUNDS` and both consult it.
-        fault = negotiation.baseline_fault({
-            "price_wei": args.base_price_wei,
-            "provider_bond_bps": args.base_bond_bps,
-            "service_window": args.service_window,
-            "payout_delay": args.payout_delay,
-        })
-        if fault is not None:
-            raise RuntimeError(
-                f"the baseline {fault}. A quote written from it could not be read back by "
-                "this build, so it is refused before it is written rather than after."
-            )
-
-        stores = _open_stores(buyer=buyer, provider=provider)
-        quote = _bilateral_quote(
-            stores, buyer=buyer, provider=provider,
-            base_price_wei=args.base_price_wei, base_bond_bps=args.base_bond_bps,
-            base_service_window=args.service_window, base_payout_delay=args.payout_delay,
-        )
         basis = _resolve_time_basis(args)
-        reference_timestamp, accept_by, observation = basis.reference, basis.accept_by, basis.observation
-
-        halves = _document_halves(
-            quote, buyer=buyer, provider=provider, accept_by=accept_by,
-            commitment=stores["provider"].persona_commitment()["sha256"],
+        output = quote_document(
+            buyer=args.buyer, provider=args.provider,
+            base_price_wei=args.base_price_wei, base_bond_bps=args.base_bond_bps,
+            service_window=args.service_window, payout_delay=args.payout_delay,
+            basis=basis, executability=_executability(args, basis),
+            inclusion_margin=args.inclusion_margin,
         )
-        for name, profile in halves["buyer"]["profiles"].items():
-            if not profile["settlement"]["agreed"]:
-                continue  # nothing to execute, so nothing to check against a chain
-            preimage = PolicyPreimage(**profile["policy_preimage"])
-            # A quote the chain would refuse is not a quote. Checking here, rather than at
-            # broadcast, keeps the displayed policy and the executable policy the same thing.
-            validate_creatable(preimage, reference_timestamp=reference_timestamp)
-            if observation is not None:
-                require_inclusion_margin(
-                    preimage,
-                    chain_timestamp=observation.timestamp,
-                    observed_lag_seconds=basis.observed_lag,
-                    margin_seconds=args.inclusion_margin,
-                )
+        halves = {"buyer": output["buyer"]}
 
-        output = {
-            # Immutable identity, fixed before any transaction exists. `request_id` is what
-            # makes a retry a retry: the committed terms move between attempts because the
-            # deadline is re-derived from chain time, so action identity cannot come from them.
-            "schema_version": POLICY_SCHEMA_VERSION,
-            "request_id": secrets.token_hex(16),
-            "chain_id": chain_id,
-            "contract_address": escrow_address,
-            "engine_version": ENGINE_VERSION,
-            # Published so a reader recomputes the digest inside `engine_version` rather than
-            # trusting it. Every constant that can move a term is in here.
-            "engine": {"negotiation_manifest": NEGOTIATION_MANIFEST},
-            "executability": _executability(args, basis),
-            "buyer": halves["buyer"],
-            "provider": halves["provider"],
-        }
         rendered = json.dumps(output, indent=2, sort_keys=True)
         if args.output:
             _write_atomic(args.output, rendered + "\n")
