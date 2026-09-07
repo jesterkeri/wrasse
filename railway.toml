@@ -1,0 +1,21 @@
+# Railway builds from the Dockerfile rather than from Nixpacks, because the image has to
+# compile the contract as well as install the package: `_require_deployment_identity` compares
+# the code at the configured address against the bytecode this build produced, and a container
+# without that artifact cannot send a transaction.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# One instance, and this is load-bearing rather than thrift. The transaction ledger is a single
+# SQLite file whose whole job is to stop two sends taking the same nonce on the two shared
+# wallets. A second instance would get its own view of it and reintroduce exactly the nonce gap
+# the ledger exists to prevent.
+numReplicas = 1
+healthcheckPath = "/api/health"
+healthcheckTimeout = 30
+# A restart mid-run leaves a transaction unresolved rather than lost: `tx-resolve` runs on the
+# next run and walks every unresolved row, and an action with no deadline is resendable.
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
