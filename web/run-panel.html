@@ -15,7 +15,11 @@
     #wrasse-run .wr-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 0}
     #wrasse-run select,#wrasse-run button{font:inherit;padding:8px 14px;border:1px solid var(--fg,#141412);
       background:transparent;color:var(--fg,#141412);border-radius:0;cursor:pointer}
-    #wrasse-run button.wr-go{background:var(--fg,#141412);color:var(--bg,#EBE5D9);font-weight:600}
+    /* The design's own call-to-action colour when it has one, falling back to the
+       foreground so a future export that drops the token still gets a real button. */
+    #wrasse-run button.wr-go{background:var(--primary,var(--fg,#141412));
+      color:var(--on-primary,var(--bg,#EBE5D9));border-color:var(--primary,var(--fg,#141412));
+      font-weight:600}
     #wrasse-run button[disabled]{opacity:.45;cursor:default}
     #wrasse-run ol{list-style:none;margin:20px 0 0;padding:0;border-top:1px solid var(--line,#C7C0AF)}
     #wrasse-run li{display:flex;gap:12px;align-items:baseline;padding:9px 0;

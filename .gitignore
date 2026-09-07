@@ -53,3 +53,4 @@ contracts/lib/
 # in a second, and committing it would create a second source of truth that goes stale without
 # anyone noticing. The bundle is the artefact; this is a working copy.
 web/src/
+.service.pid

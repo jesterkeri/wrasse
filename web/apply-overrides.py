@@ -30,6 +30,11 @@ SOURCE = HERE / "src" / "app.html"
 START = "<!-- wrasse:run-panel:start -->"
 END = "<!-- wrasse:run-panel:end -->"
 
+#: Each entry is (name, pattern, replacement, already). `pattern` is a regular expression
+#: because an exact literal broke on the first re-export it met: the design changed the shell's
+#: top padding from `14px` to `0`, which has nothing to do with what this override is for, and
+#: the anchor vanished. `already` is what the applied result looks like, so a second run is a
+#: no-op rather than a failure.
 OVERRIDES = [
     (
         "the shell fills the screen",
@@ -37,8 +42,12 @@ OVERRIDES = [
         # Only the shell is widened. The prose measures inside it, 34ch through 82ch, are
         # deliberate and stay: a paragraph running the full width of a 2000px display is
         # unreadable, and widening those would trade one bad layout for another.
-        'max-width:1180px;margin:0 auto;padding:14px 14px 96px',
-        'max-width:none;margin:0 auto;padding:14px clamp(14px,3vw,44px) 96px',
+        # Three values: top, horizontal, bottom. Only the horizontal one is replaced, so the
+        # design keeps whatever top and bottom padding it chose. A greedier capture swallowed
+        # both of the first two and produced a four-value padding, which is a different rule.
+        r"max-width:1180px;margin:0 auto;padding:(\S+) \S+ 96px",
+        r"max-width:none;margin:0 auto;padding:\1 clamp(14px,3vw,44px) 96px",
+        "max-width:none;margin:0 auto;padding:",
     ),
 ]
 
@@ -85,18 +94,18 @@ def main() -> int:
         return 1
 
     text = PAGE.read_text(encoding="utf-8")
-    for name, old, new in OVERRIDES:
-        if new in text:
+    for name, pattern, replacement, already in OVERRIDES:
+        if already in text:
             print(f"  already applied: {name}")
             continue
-        if text.count(old) != 1:
+        text, count = re.subn(pattern, replacement, text, count=1)
+        if count != 1:
             print(
-                f"  ANCHOR LOST: {name!r} expected exactly one match, found {text.count(old)}. "
+                f"  ANCHOR LOST: {name!r} matched {count} times, not once. "
                 "The export changed; rewrite this override rather than skipping it.",
                 file=sys.stderr,
             )
             return 1
-        text = text.replace(old, new, 1)
         print(f"  applied: {name}")
 
     PAGE.write_text(text, encoding="utf-8")
