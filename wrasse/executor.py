@@ -110,7 +110,18 @@ COMMAND_TIMEOUT = float(os.getenv("WRASSE_COMMAND_TIMEOUT", "120"))
 #: this is the difference between a demo that survives async judging and one that empties a
 #: wallet on its ninth visitor. It bounds the settled price, not the baseline, because the
 #: settled price is what actually leaves the buyer.
-MAX_PRICE_WEI = int(os.getenv("WRASSE_DEMO_MAX_PRICE_WEI", str(5 * 10**12)))
+#:
+#: Sized against the demo's own default rather than picked round. The page opens at a baseline
+#: of 1e14 wei, and the urgent profile settles that at 1.18e14, so a lower ceiling would refuse
+#: the demo's own front page and every judge would meet an error instead of a deal. The first
+#: value here did exactly that. It is a guard against a visitor typing a large baseline, not a
+#: substitute for funding the wallets, and nothing about it makes a nearly-empty wallet safe.
+MAX_PRICE_WEI = int(os.getenv("WRASSE_DEMO_MAX_PRICE_WEI", str(2 * 10**14)))
+
+#: What one whole run costs in gas, generously. Seven transactions at Base Sepolia's fees come
+#: to a small fraction of this; it is deliberately loose because its only job is to catch a
+#: wallet that cannot finish what it is about to start.
+GAS_ALLOWANCE_WEI = int(os.getenv("WRASSE_DEMO_GAS_ALLOWANCE_WEI", str(2 * 10**13)))
 
 #: Seconds of acceptance time a hosted run quotes. Long enough that a queued run does not
 #: expire while it waits, short enough that an abandoned deal can be cancelled the same day.
@@ -214,6 +225,19 @@ def _default_command(
     return completed.returncode, completed.stdout, completed.stderr
 
 
+def _default_balance_reader() -> dict[str, int]:
+    from . import cli
+
+    web3 = cli._web3()
+    return {
+        role: int(web3.eth.get_balance(cli._required_env(name)))
+        for role, name in (
+            ("buyer", "WRASSE_BUYER_ADDRESS"),
+            ("provider", "WRASSE_PROVIDER_A_ADDRESS"),
+        )
+    }
+
+
 def _default_deal_id_reader(tx_hash: str) -> int:
     from . import cli
     from .escrow import deal_id_from_receipt
@@ -235,11 +259,13 @@ class Runner:
         *,
         command: Callable[..., tuple[int, str, str]] | None = None,
         deal_id_reader: Callable[[str], int] | None = None,
+        balance_reader: Callable[[], dict[str, int]] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._command = command or _default_command
         self._deal_id = deal_id_reader or _default_deal_id_reader
+        self._balances = balance_reader or _default_balance_reader
         self._sleep = sleep
         self._clock = clock
 
@@ -419,11 +445,38 @@ class Runner:
                 f"{MAX_PRICE_WEI} wei ceiling. Both wallets are faucet-funded and shared, so a "
                 "single run is bounded. Quote a smaller baseline price and run it again."
             )
+        self._require_funded(terms)
         run.settled = {"agreed": True, **terms}
         self._end(step, detail=(
             f"bond {terms['provider_bond_bps']} bps, window {terms['service_window']}s, "
             f"price {terms['price_wei']} wei, payout delay {terms['payout_delay']}s"
         ))
+
+    def _require_funded(self, terms: dict[str, Any]) -> None:
+        """Refuse a run neither wallet can finish, before the first transaction rather than
+        during the third.
+
+        `chain.require_affordable` already guards each individual send, which is the right
+        place for it and the wrong time for this. By then the deal exists: the buyer's price is
+        in escrow, the provider cannot accept, and the visitor is looking at a half-finished
+        lifecycle and an error about gas. Checking here costs one RPC read and turns that into
+        a sentence saying the demo wallet needs topping up.
+
+        The provider's side is the bond, which is a fraction of the price, plus its own gas.
+        """
+
+        balances = self._balances()
+        bond = terms["price_wei"] * terms["provider_bond_bps"] // 10_000
+        for role, needs in (
+            ("buyer", terms["price_wei"] + GAS_ALLOWANCE_WEI),
+            ("provider", bond + GAS_ALLOWANCE_WEI),
+        ):
+            if balances.get(role, 0) < needs:
+                raise ExecutionError(
+                    f"the {role} wallet holds {balances.get(role, 0)} wei and this run needs "
+                    f"about {needs}. Both wallets are faucet-funded and shared; the demo needs "
+                    "topping up before it can settle another deal. Quoting is unaffected."
+                )
 
     def _create(self, run: Run) -> dict[str, Any]:
         step = self._begin(run, "create")

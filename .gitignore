@@ -48,3 +48,8 @@ contracts/cache/
 contracts/out/
 contracts/broadcast/
 contracts/lib/
+
+# The unpacked application document. `web/bundle.py unpack` regenerates it from `index.html`
+# in a second, and committing it would create a second source of truth that goes stale without
+# anyone noticing. The bundle is the artefact; this is a working copy.
+web/src/

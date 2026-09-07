@@ -148,9 +148,15 @@ def bounded_clock():
     return lambda: next(ticks)
 
 
-def runner(chain: FakeChain, **kwargs) -> Runner:
+#: Both wallets, funded well past anything these tests settle. A test that had to think about
+#: gas would be testing arithmetic it does not own.
+RICH = {"buyer": 10**18, "provider": 10**18}
+
+
+def runner(chain: FakeChain, balances: dict[str, int] | None = None, **kwargs) -> Runner:
     return Runner(
         command=chain, deal_id_reader=lambda tx_hash: 7,
+        balance_reader=lambda: balances if balances is not None else RICH,
         sleep=lambda _: None, **kwargs,
     )
 
@@ -301,3 +307,59 @@ def test_a_failed_run_leaves_no_step_saying_it_is_still_running(environment):
     assert executor.RUNNING not in {step.status for step in run.steps}
     assert run.step("accept").status == executor.FAILED
     assert run.step("accept").finished_at is not None
+
+
+def test_a_wallet_that_cannot_finish_the_run_stops_it_before_the_first_transaction(environment):
+    """The check that matters is the one before the deal exists.
+
+    `chain.require_affordable` guards each send, correctly, and by the time it fires on the
+    provider's acceptance the buyer's price is already in escrow and the visitor is looking at
+    a half-finished lifecycle. One RPC read here turns that into a sentence.
+    """
+
+    chain = FakeChain()
+    run = make_run(environment)
+    runner(chain, balances={"buyer": 1, "provider": 10**18}).execute(run)
+
+    assert run.status == executor.FAILED
+    assert "topping up" in run.error
+    assert chain.commands() == ["policy"]
+
+
+def test_the_provider_side_is_checked_too_and_only_needs_the_bond(environment):
+    """The provider posts a bond, not the price, so the two wallets are checked separately.
+
+    Checking the provider against the price would refuse runs it could comfortably afford, and
+    checking the buyer against the bond would admit runs it cannot.
+    """
+
+    chain = FakeChain()
+    # Enough for the bond of 2480 bps on 1.18e14 and the gas allowance, and nowhere near the
+    # price. The provider never pays the price, so this must run.
+    bond = 118_000_000_000_000 * 2480 // 10_000
+    run = make_run(environment)
+    runner(
+        chain, balances={"buyer": 10**18, "provider": bond + executor.GAS_ALLOWANCE_WEI}
+    ).execute(run)
+    assert run.status == executor.SUCCEEDED, run.error
+
+
+def test_the_shipped_ceiling_admits_the_page_s_own_default_baseline(environment, monkeypatch):
+    """A guard that refuses the demo's front page is not a guard, it is an outage.
+
+    The first ceiling here was 5e12 while the page opens at a baseline of 1e14, which the
+    urgent profile settles at 1.18e14. Every judge pressing the button on an untouched page
+    would have met a refusal about a limit they had not gone near. This pins the relationship
+    rather than the number, so changing either one deliberately is fine and changing one by
+    accident is not.
+    """
+
+    monkeypatch.undo()
+    monkeypatch.setenv("WRASSE_BUYER_ADDRESS", "0x30C95B7eb3E08F83992E803Be2A5AB0E0af93d22")
+    monkeypatch.setenv("WRASSE_PROVIDER_A_ADDRESS", "0x0b920573ADf657f45Fecd9f7e48e66B5535A90C0")
+    monkeypatch.setattr(executor, "POLL_SECONDS", 0)
+
+    settled = json.loads(SAMPLE.read_text())["buyer"]["profiles"]["urgent"]["terms"]["price_wei"]
+    assert settled <= executor.MAX_PRICE_WEI, (
+        f"the demo settles at {settled} wei and the ceiling is {executor.MAX_PRICE_WEI}"
+    )

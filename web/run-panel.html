@@ -1,0 +1,293 @@
+<!-- The settlement a visitor performs themselves.
+     Deliberately outside <x-dc>. The design runtime owns that element and re-renders it; a
+     panel inside it would be wiped, and editing the generated template by hand is how a
+     300 kilobyte bundle gets corrupted. This is a sibling: it reads the same CSS variables
+     from :root, talks to the same origin, and the design can be re-exported without touching
+     it. `web/apply-overrides.py` puts it back after every export. -->
+<section id="wrasse-run" hidden>
+  <style>
+    #wrasse-run{max-width:none;margin:0 auto;padding:0 clamp(14px,3vw,44px) 96px;
+      font:14px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif;color:var(--fg,#141412)}
+    #wrasse-run .wr-card{border:1px solid var(--line,#C7C0AF);background:var(--surface,transparent);
+      padding:clamp(16px,2.5vw,28px)}
+    #wrasse-run h2{font-size:clamp(19px,2.2vw,25px);line-height:1.2;margin:0 0 8px;font-weight:600}
+    #wrasse-run p{max-width:74ch;margin:0 0 14px;color:var(--fg,#141412);opacity:.78}
+    #wrasse-run .wr-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 0}
+    #wrasse-run select,#wrasse-run button{font:inherit;padding:8px 14px;border:1px solid var(--fg,#141412);
+      background:transparent;color:var(--fg,#141412);border-radius:0;cursor:pointer}
+    #wrasse-run button.wr-go{background:var(--fg,#141412);color:var(--bg,#EBE5D9);font-weight:600}
+    #wrasse-run button[disabled]{opacity:.45;cursor:default}
+    #wrasse-run ol{list-style:none;margin:20px 0 0;padding:0;border-top:1px solid var(--line,#C7C0AF)}
+    #wrasse-run li{display:flex;gap:12px;align-items:baseline;padding:9px 0;
+      border-bottom:1px solid var(--line,#C7C0AF)}
+    #wrasse-run li .wr-mark{width:1.5em;flex:none;font-variant-numeric:tabular-nums;opacity:.6}
+    #wrasse-run li .wr-body{flex:1;min-width:0}
+    #wrasse-run li .wr-detail{opacity:.68;font-size:13px}
+    #wrasse-run li[data-state="running"]{font-weight:600}
+    #wrasse-run li[data-state="pending"],#wrasse-run li[data-state="skipped"]{opacity:.42}
+    #wrasse-run a{color:inherit}
+    #wrasse-run table{border-collapse:collapse;margin-top:18px;font-variant-numeric:tabular-nums}
+    #wrasse-run th,#wrasse-run td{text-align:left;padding:6px 22px 6px 0;
+      border-bottom:1px solid var(--line,#C7C0AF)}
+    #wrasse-run th{font-weight:600;opacity:.7}
+    #wrasse-run .wr-note{margin-top:14px;padding:10px 12px;border-left:2px solid var(--fg,#141412);
+      opacity:.85;max-width:74ch}
+    #wrasse-run .wr-moved{font-weight:600}
+  </style>
+
+  <div class="wr-card">
+    <h2>Settle it yourself, on Base Sepolia</h2>
+    <p id="wr-intro">
+      Everything above is memory and arithmetic. This performs it: four transactions on a public
+      testnet at the terms settled above, and then both memories record what happened. It takes
+      about two minutes, because the last step waits for Base to consider the outcome permanent
+      rather than merely mined.
+    </p>
+    <div class="wr-controls" id="wr-controls" hidden>
+      <label for="wr-profile">Profile</label>
+      <select id="wr-profile">
+        <option value="urgent">urgent</option>
+        <option value="sensitive">sensitive</option>
+        <option value="budget">budget</option>
+      </select>
+      <button class="wr-go" id="wr-go" type="button">Run it on Base</button>
+      <span id="wr-queue" class="wr-detail"></span>
+    </div>
+    <ol id="wr-steps" hidden></ol>
+    <div id="wr-outcome"></div>
+  </div>
+</section>
+
+<script>
+(function () {
+  'use strict';
+
+  var TERMS = [
+    ['provider_bond_bps', 'provider bond', function (v) { return v + ' bps'; }],
+    ['service_window', 'service window', function (v) { return v + ' s'; }],
+    ['price_wei', 'price', function (v) { return v + ' wei'; }],
+    ['payout_delay', 'payout delay', function (v) { return v + ' s'; }]
+  ];
+  var MARK = { pending: '·', running: '…', done: '✓', failed: '✗', skipped: '–' };
+
+  var root = document.getElementById('wrasse-run');
+  var controls = document.getElementById('wr-controls');
+  var intro = document.getElementById('wr-intro');
+  var stepList = document.getElementById('wr-steps');
+  var outcome = document.getElementById('wr-outcome');
+  var button = document.getElementById('wr-go');
+  var profile = document.getElementById('wr-profile');
+  var queueLabel = document.getElementById('wr-queue');
+  var timer = null;
+
+  function text(el, value) { el.textContent = value; }
+
+  function baseline() {
+    // Read from the URL rather than from the app's state. The panel is deliberately outside
+    // the design runtime and cannot see its variables; the app writes every committed
+    // baseline into the query string, so the URL is the seam that already exists.
+    var q = new URLSearchParams(location.search);
+    var n = function (key, fallback) {
+      var raw = q.get(key);
+      return raw !== null && /^[0-9]+$/.test(raw) ? Number(raw) : fallback;
+    };
+    return {
+      price_wei: n('price', 100000000000000),
+      provider_bond_bps: n('bond', 500),
+      service_window: n('window', 600),
+      payout_delay: n('delay', 1800)
+    };
+  }
+
+  async function post(path, body) {
+    var res = await fetch(path, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body || {})
+    });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+    return data;
+  }
+
+  async function session() {
+    // Kept for the tab rather than forever. A session holds a private copy of both memories,
+    // and the oldest are evicted, so a stale identifier from last week is expected to fail.
+    var held = null;
+    try { held = sessionStorage.getItem('wrasse-session'); } catch (e) { held = null; }
+    if (held) return held;
+    var made = await post('/api/session');
+    try { sessionStorage.setItem('wrasse-session', made.session_id); } catch (e) { /* private mode */ }
+    return made.session_id;
+  }
+
+  function drawSteps(run) {
+    stepList.hidden = false;
+    stepList.innerHTML = '';
+    run.steps.forEach(function (step) {
+      var li = document.createElement('li');
+      li.setAttribute('data-state', step.status);
+
+      var mark = document.createElement('span');
+      mark.className = 'wr-mark';
+      text(mark, MARK[step.status] || '·');
+      li.appendChild(mark);
+
+      var body = document.createElement('span');
+      body.className = 'wr-body';
+      var label = document.createElement('div');
+      text(label, step.label);
+      body.appendChild(label);
+
+      if (step.detail) {
+        var detail = document.createElement('div');
+        detail.className = 'wr-detail';
+        text(detail, step.detail);
+        body.appendChild(detail);
+      }
+      if (step.tx_hash) {
+        var link = document.createElement('a');
+        link.className = 'wr-detail';
+        link.href = step.explorer_url || '#';
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        text(link, step.tx_hash.slice(0, 10) + '…' + step.tx_hash.slice(-8));
+        body.appendChild(link);
+      }
+      li.appendChild(body);
+      stepList.appendChild(li);
+    });
+  }
+
+  function note(message) {
+    var div = document.createElement('div');
+    div.className = 'wr-note';
+    text(div, message);
+    outcome.appendChild(div);
+  }
+
+  async function afterQuote(run) {
+    // The closing beat, and the reason a session exists. The same request that produced the
+    // terms above, asked again against the two memories this run just taught.
+    var data = await post('/api/quote', {
+      baseline: run.baseline || baseline(), memory: true, session_id: run.session_id
+    });
+    var found = (data.profiles || []).filter(function (p) { return p.id === run.profile; })[0];
+    if (!found || !found.terms || !run.settled) return;
+
+    var table = document.createElement('table');
+    var head = document.createElement('tr');
+    ['term', 'before this run', 'after it'].forEach(function (name) {
+      var th = document.createElement('th');
+      text(th, name);
+      head.appendChild(th);
+    });
+    table.appendChild(head);
+
+    var moved = 0;
+    TERMS.forEach(function (entry) {
+      var key = entry[0], label = entry[1], format = entry[2];
+      var before = run.settled[key], after = found.terms[key];
+      var tr = document.createElement('tr');
+      [label, format(before), format(after)].forEach(function (value, index) {
+        var td = document.createElement('td');
+        text(td, value);
+        if (index === 2 && before !== after) td.className = 'wr-moved';
+        tr.appendChild(td);
+      });
+      if (before !== after) moved += 1;
+      table.appendChild(tr);
+    });
+    outcome.appendChild(table);
+    note(moved
+      ? 'Nothing was rewritten. The timeout both sides remember is still there, and unchanged. '
+        + 'What changed is that there is now a kept promise beside it, so ' + moved
+        + ' of the four terms settle differently for the same request.'
+      : 'The terms did not move. One outcome is a small addition to a history, and this '
+        + 'profile was already at a bound that a single receipt cannot shift.');
+  }
+
+  async function poll(runId) {
+    var res = await fetch('/api/run/' + encodeURIComponent(runId));
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var run = await res.json();
+    drawSteps(run);
+
+    if (run.queue_position !== null && run.queue_position !== undefined) {
+      text(queueLabel, run.queue_position === 0
+        ? 'next, once the run in front finishes'
+        : run.queue_position + ' ahead of you');
+    } else {
+      text(queueLabel, run.status === 'running' ? 'running' : '');
+    }
+    return run;
+  }
+
+  function finish(message) {
+    clearInterval(timer);
+    timer = null;
+    button.disabled = false;
+    text(button, 'Run it again');
+    if (message) note(message);
+  }
+
+  async function start() {
+    button.disabled = true;
+    text(button, 'Running…');
+    outcome.innerHTML = '';
+    try {
+      var sessionId = await session();
+      var body = { session_id: sessionId, profile: profile.value, baseline: baseline() };
+      var queued = await post('/api/execute', body);
+      var runId = queued.run_id;
+
+      timer = setInterval(async function () {
+        try {
+          var run = await poll(runId);
+          run.session_id = sessionId;
+          run.profile = body.profile;
+          run.baseline = body.baseline;
+          if (run.status === 'succeeded') {
+            finish(null);
+            text(queueLabel, '');
+            await afterQuote(run);
+          } else if (run.status === 'refused') {
+            finish('No deal exists at this baseline for the ' + body.profile + ' profile, and '
+              + 'that is an answer rather than a failure. The two memories left no overlap, so '
+              + 'nothing was signed.');
+            text(queueLabel, '');
+          } else if (run.status === 'failed') {
+            finish(run.error || 'the run stopped');
+            text(queueLabel, '');
+          }
+        } catch (error) {
+          finish(String(error.message || error));
+        }
+      }, 2000);
+    } catch (error) {
+      // A spent session is the ordinary case, not a fault: three runs each, because both
+      // wallets are shared and faucet-funded.
+      finish(String(error.message || error));
+    }
+  }
+
+  async function boot() {
+    var health;
+    try {
+      health = await (await fetch('/api/health')).json();
+    } catch (error) {
+      return;
+    }
+    root.hidden = false;
+    if (!health.execution_enabled) {
+      text(intro, 'This deployment quotes and holds no keys, so the settlement above cannot be '
+        + 'performed from here. Health reports signs: false, which is the same answer this '
+        + 'sentence gives.');
+      return;
+    }
+    controls.hidden = false;
+    button.addEventListener('click', start);
+  }
+
+  boot();
+})();
+</script>

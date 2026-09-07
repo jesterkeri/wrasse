@@ -89,7 +89,8 @@ Worth changing before opening the link, all with defaults that are already sane:
 
 | variable | default | what it bounds |
 |---|---|---|
-| `WRASSE_DEMO_MAX_PRICE_WEI` | `5000000000000` | the largest settled price a single run may move |
+| `WRASSE_DEMO_MAX_PRICE_WEI` | `200000000000000` | the largest settled price a single run may move |
+| `WRASSE_DEMO_GAS_ALLOWANCE_WEI` | `20000000000000` | what a whole run is assumed to cost in gas |
 | `WRASSE_RUNS_PER_SESSION` | `3` | how many settlements one visitor may perform |
 | `WRASSE_TOTAL_RUN_CEILING` | `400` | how many this deployment will perform at all |
 | `WRASSE_DEMO_ACCEPT_WINDOW` | `1800` | acceptance time a hosted run quotes |
@@ -102,6 +103,19 @@ buyer into escrow and then to the provider, so at the demo's original baseline o
 buyer wallet funds only single-digit runs before it is empty. The ceiling bounds the settled
 price rather than the baseline, because the settled price is what actually leaves the wallet,
 and a quote above it is refused before anything is signed.
+
+The ceiling is sized against the demo's own front page: the page opens at a baseline of
+0.0001 ETH, the urgent profile settles that at 0.000118 ETH, and a ceiling below that would
+refuse every judge who pressed the button without changing anything. It guards against a
+visitor typing a large baseline. It does not make a nearly empty wallet safe, and nothing does
+except funding it.
+
+**Fund both wallets before opening the link.** At the demo baseline a run moves 0.000118 ETH
+out of the buyer, so a wallet holding 0.00089 ETH funds about seven runs, which is not enough
+for asynchronous judging. `faucets.chain.link/base-sepolia` drips 0.5 ETH and works for these
+wallets, which is several thousand runs. The service refuses to start a run neither wallet can
+finish and says so in a sentence, rather than creating a deal and failing on the third
+transaction, but that is a good error message and not a substitute for the faucet.
 
 Check the two balances before opening the link:
 
