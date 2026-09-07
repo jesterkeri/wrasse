@@ -2144,3 +2144,11 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2, sort_keys=True))
         return 0
     raise AssertionError("unreachable")
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by the executor's subprocesses
+    # `python -m wrasse.cli`, so a caller that already knows which interpreter it wants does
+    # not have to find a console script on `PATH` as well. The executor runs every chain step
+    # this way: in a container the script directory may not be on the path at all, and the
+    # interpreter running the service is the only one guaranteed to have the package installed.
+    raise SystemExit(main())

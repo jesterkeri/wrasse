@@ -1,7 +1,7 @@
-"""The hosted quote service: one route, no keys, nothing written.
+"""The hosted service: a quote anyone can read, and a settlement anyone can perform.
 
-**The rule this module exists to keep.** The service holds no keys, signs nothing, and writes
-no receipt, no learned dimension and no outcome. Everything else here follows from it, and
+**The rule the quoting surface keeps.** Quoting holds no keys, signs nothing, and writes no
+receipt, no learned dimension and no outcome. Everything in that half follows from it, and
 every constraint below has a reason attached so none of them get traded away at two in the
 morning.
 
@@ -14,20 +14,25 @@ receipt, and stating it as "writes nothing" was still a guarantee the code does 
 So the metadata is written once at startup, before anything is served, and the health endpoint
 says what is actually true rather than what is convenient.
 
-An earlier design had this service driving transactions so a judge could execute a deal from
-the page. That reinherits three problems the read-only split deletes outright. The ledger
-permits one unresolved transaction per wallet, so concurrent visitors serialise behind each
-other and need a queue. A receipt lost to a closed tab holds that wallet, which ends the demo
-for every judge after the first. And a host that signs is a host holding a key.
+**The quoting surface still keeps that rule, and a second surface does not.** This module used
+to argue that the service should never sign, on three grounds: concurrent visitors serialise
+behind one unresolved transaction per wallet and would need a queue, a receipt lost to a closed
+tab holds that wallet and ends the demo for everyone after the first, and a host that signs is
+a host holding a key. Two of those are now answered and one is accepted, and the argument is
+recorded in `executor` rather than deleted, because a reversal with no reason attached is how a
+constraint gets traded away twice.
 
-So settlement stays on the operator's machine, driven live. What is hosted is the part that
-carries the argument: two memories, two positions, and a deterministic rule that resolves them
-or refuses. That part reads and returns.
+The short of it: a demo a judge cannot perform is a demo a judge does not believe, and that is
+the requirement this build exists to meet. So execution lives behind `WRASSE_ENABLE_EXECUTION`,
+it is off by default, and `/api/health` reports which of the two deployments this one is rather
+than making a claim that is true only sometimes.
 
-**Why this needs no worker, no queue, no locks and no per-session copies.** All four were
-consequences of writing. `_bilateral_quote` performs no ingest, no commit, no insert and no
-status change; it reads both stores under their locks and returns. Two visitors asking for a
-quote at the same moment are two readers, which is what the stores already permit.
+**Why quoting still needs no worker, no queue and no locks.** Those were consequences of
+writing, and quoting does not write: `_bilateral_quote` performs no ingest, no commit, no
+insert and no status change; it reads both stores under their locks and returns. Two visitors
+asking for a quote at the same moment are two readers, which is what the stores already permit.
+Per-session copies are the one exception, and they exist for a different reason: a visitor who
+executes teaches a memory, and every visitor is entitled to the same starting point.
 
 **Why it makes no network calls.** A quote is memory plus arithmetic. The only RPC on the
 `policy` path is the chain-time observation, and supplying `reference_timestamp` and
@@ -59,6 +64,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +76,7 @@ from pydantic import BaseModel, Field
 
 from sibyl_memory_client import MemoryClient
 
-from . import cli
+from . import cli, executor, sessions
 from .evidence import CHAIN_EVENT_CATEGORY
 from .page import page_view
 from .store import persona_digest
@@ -98,6 +105,16 @@ _PATHS = {
 #: A read-only source, copied once into a writable working directory at startup. Unset in
 #: development, where the databases beside the repository are the working copies already.
 SOURCE_DIR = os.getenv("WRASSE_MEMORY_SOURCE_DIR")
+
+#: Whether this deployment signs. Off by default, so the read-only deployment stays a real
+#: option and its health answer stays true. A deployment with this on holds two Base Sepolia
+#: keys and says so; one with it off refuses every execute route with the reason.
+EXECUTION = os.getenv("WRASSE_ENABLE_EXECUTION") == "1"
+
+#: A global ceiling on settlements per process lifetime, under the per-session one. Both
+#: wallets are faucet-funded and the page is public, so a griefer with a fresh session for
+#: every run is cheaper than the wallets are.
+RUN_CEILING = int(os.getenv("WRASSE_TOTAL_RUN_CEILING", "400"))
 
 
 def prepare_working_copies() -> None:
@@ -219,12 +236,21 @@ def health() -> dict:
         "engine_version": cli.ENGINE_VERSION,
         "chain_id": cli._chain_id(),
         "contract_address": cli._escrow_address(),
-        "signs": False,
-        "holds_keys": False,
+        # Whether this deployment signs is a property of the deployment, not of the code, so it
+        # is read rather than asserted. A single hard-coded `false` here was true of the
+        # read-only build and would be a lie the moment anyone set the variable.
+        "signs": EXECUTION,
+        "holds_keys": EXECUTION,
+        "execution_enabled": EXECUTION,
         # Not `writes: false`, which was untrue on a cold deployment. Store identity and the
         # persona commitment are written when a store is first opened, and both happen at
         # startup rather than while serving.
-        "writes_receipts_or_outcomes": False,
+        #
+        # On the quoting path this is still exactly true. Execution writes an outcome by
+        # definition, and only ever into the session copy belonging to the visitor who asked
+        # for it.
+        "quote_writes_receipts_or_outcomes": False,
+        "queue_depth": _queue().depth() if EXECUTION else 0,
     }
 
 
@@ -240,6 +266,7 @@ def quote(
     payout_delay: int = Query(1_800),
     reference_timestamp: int = Query(1_788_666_320),
     accept_by: int = Query(1_788_666_920),
+    session_id: str | None = Query(None),
 ) -> JSONResponse:
     """One quote, as the document the command produces, not a reshaping of it.
 
@@ -256,6 +283,7 @@ def quote(
         memory=memory, price_wei=price_wei, provider_bond_bps=provider_bond_bps,
         service_window=service_window, payout_delay=payout_delay,
         reference_timestamp=reference_timestamp, accept_by=accept_by,
+        session_id=session_id,
     )
 
 
@@ -268,8 +296,22 @@ def _quote(
     payout_delay: int,
     reference_timestamp: int = 1_788_666_320,
     accept_by: int = 1_788_666_920,
+    session_id: str | None = None,
 ) -> JSONResponse:
-    """One implementation, two request shapes. Neither reshapes the document."""
+    """One implementation, two request shapes. Neither reshapes the document.
+
+    A session quotes against its own warm pair, which is the whole point of having one: after a
+    run has taught those two stores, the same request returns terms that have moved. Without a
+    session the shared pair answers, and it is the same pair for everybody and stays untaught.
+
+    The cold pair is shared either way. Nothing on any path writes to it, so there is nothing a
+    visitor could do to it that another visitor would see.
+    """
+
+    if session_id is not None and memory == WARM:
+        stores = _open_session(_session_or_404(session_id))
+    else:
+        stores = _open(memory)
 
     basis = cli.TimeBasis(reference_timestamp, accept_by, None, 0)
     try:
@@ -283,7 +325,7 @@ def _quote(
             basis=basis,
             executability=cli._executability(_SuppliedTime(), basis),
             inclusion_margin=0,
-            stores=_open(memory),
+            stores=stores,
         )
     except RuntimeError as error:
         # The baseline domain is refused by the writer before anything is produced. The page
@@ -323,6 +365,7 @@ class QuoteRequest(BaseModel):
 
     baseline: Baseline = Field(default_factory=Baseline)
     memory: bool = True
+    session_id: str | None = None
 
 
 @app.post("/api/quote")
@@ -335,7 +378,164 @@ def quote_post(request: QuoteRequest = Body(default_factory=QuoteRequest)) -> JS
         provider_bond_bps=request.baseline.provider_bond_bps,
         service_window=request.baseline.service_window,
         payout_delay=request.baseline.payout_delay,
+        session_id=request.session_id,
     )
+
+
+# ----------------------------------------------------------------------------------------
+# The second surface: performing the settlement rather than reading it.
+# ----------------------------------------------------------------------------------------
+#
+# Everything below signs. It is reachable only when `WRASSE_ENABLE_EXECUTION` is set, it runs
+# every chain step in a subprocess with its own environment, and it serialises every run behind
+# one worker because the two wallets are shared. The reasoning for all three lives in
+# `executor`, next to the code it constrains.
+
+_QUEUE: executor.Queue | None = None
+_SESSIONS: sessions.Sessions | None = None
+_STARTED = 0
+_START_LOCK = threading.Lock()
+
+#: One store pair per session, opened once. Opening per request would put two open file
+#: descriptions on one database inside one process, and `fcntl` locks belong to a description
+#: rather than to a process, so the second would block on the first instead of excluding
+#: another process. That is a deadlock, not a mutual exclusion.
+_session_stores: dict[str, dict[str, Any]] = {}
+
+
+def _queue() -> executor.Queue:
+    """The worker, started on first use rather than at import.
+
+    At import it would start a thread in every test process and in every tool that merely reads
+    this module, which is how a background thread ends up outliving the thing that wanted it.
+    """
+
+    global _QUEUE
+    if _QUEUE is None:
+        _QUEUE = executor.Queue()
+    return _QUEUE
+
+
+def _session_registry() -> sessions.Sessions:
+    global _SESSIONS
+    if _SESSIONS is None:
+        _SESSIONS = sessions.Sessions(_PATHS[WARM])
+    return _SESSIONS
+
+
+def _require_execution() -> None:
+    if not EXECUTION:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "this deployment is the read-only one: it holds no keys and signs nothing. "
+                "The settlement it quotes is performed by a deployment with execution enabled."
+            ),
+        )
+
+
+def _open_session(session: sessions.Session) -> dict[str, Any]:
+    """This session's own pair, opened once and kept.
+
+    A run teaches these stores from a subprocess, and this object sees that write because
+    SQLite hands a reader the latest committed snapshot at the start of each read. What it must
+    not do is open a second description on the same file while the first is alive.
+    """
+
+    if session.session_id not in _session_stores:
+        _session_stores[session.session_id] = cli._open_stores(
+            buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
+            provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
+            paths=session.paths,
+        )
+    return _session_stores[session.session_id]
+
+
+def _session_or_404(session_id: str) -> sessions.Session:
+    session = _session_registry().get(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "no such session. Sessions are held in memory and the oldest are evicted, so a "
+                "link from a previous deployment will not resolve. Start a new one."
+            ),
+        )
+    return session
+
+
+@app.post("/api/session")
+def open_session() -> dict:
+    """A private copy of both memories, so this visitor's run is theirs alone."""
+
+    _require_execution()
+    session = _session_registry().create()
+    return {**session.view(), "queue_depth": _queue().depth()}
+
+
+class ExecuteRequest(BaseModel):
+    """Which profile to settle, against which baseline, in whose session."""
+
+    session_id: str
+    profile: str = Field(pattern="^(urgent|budget|sensitive)$")
+    baseline: Baseline = Field(default_factory=Baseline)
+
+
+@app.post("/api/execute")
+def execute(request: ExecuteRequest) -> dict:
+    """Queue one real settlement on Base Sepolia. Returns immediately with something to poll.
+
+    The response is a run id and nothing else that matters, because the interesting part takes
+    two minutes and an HTTP request that waits that long is a request that times out in a
+    proxy nobody controls.
+    """
+
+    global _STARTED
+    _require_execution()
+    session = _session_or_404(request.session_id)
+
+    with _START_LOCK:
+        if _STARTED >= RUN_CEILING:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"this deployment has run its {RUN_CEILING} settlements. Both wallets are "
+                    "faucet-funded and shared; the quote surface is unaffected."
+                ),
+            )
+        _STARTED += 1
+
+    try:
+        _session_registry().spend(session)
+    except PermissionError as error:
+        with _START_LOCK:
+            _STARTED -= 1
+        raise HTTPException(status_code=429, detail=str(error)) from error
+
+    run_id = uuid.uuid4().hex
+    workdir = session.directory / "runs" / run_id
+    workdir.mkdir(parents=True, exist_ok=True)
+    run = executor.Run(
+        run_id=run_id,
+        session_id=session.session_id,
+        profile=request.profile,
+        baseline=request.baseline.model_dump(),
+        paths=session.paths,
+        workdir=workdir,
+    )
+    _queue().submit(run)
+    return {"run_id": run_id, "queue_position": _queue().position(run_id)}
+
+
+@app.get("/api/run/{run_id}")
+def run_status(run_id: str) -> dict:
+    """Per-step progress, transaction hashes and a link to each one on the explorer."""
+
+    _require_execution()
+    run = _queue().get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="no such run")
+    return run.view(position=_queue().position(run_id))
 
 
 class _SuppliedTime:

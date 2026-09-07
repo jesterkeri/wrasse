@@ -357,3 +357,47 @@ def compute_policy_hash_onchain(web3: Any, address: str, preimage: Any) -> str:
         Web3.to_bytes(hexstr=preimage.provider_evidence_hash),
     ).call()
     return "0x" + bytes(result).hex()
+
+
+#: `DealCreated`'s topic zero. The deal id is `topics[1]`, indexed, so it needs no ABI decode.
+DEAL_CREATED_SIGNATURE = Web3.keccak(
+    text="DealCreated(uint256,address,address,uint256,uint256,uint256,uint64,uint64,uint64,bytes32)"
+)
+
+
+def deal_id_from_receipt(web3: Any, address: str, tx_hash: str) -> int:
+    """The id the contract assigned to a deal, read from its own creation receipt.
+
+    `createDeal` returns the id to a caller, and a transaction has no return value, so the id
+    exists nowhere the sender can see until the log does. Nothing downstream can proceed
+    without it: every later action in the lifecycle names the deal by id.
+
+    Exactly one `DealCreated` from the configured escrow is accepted. Two would mean this
+    receipt describes two creations and no rule here could say which one the caller meant;
+    none means the transaction did not create a deal at all. Both refuse rather than guess,
+    for the same reason `reconciler.verify_outcome` refuses a receipt carrying two outcomes.
+    """
+
+    escrow_address = Web3.to_checksum_address(address)
+    receipt = web3.eth.get_transaction_receipt(tx_hash)
+    logs = receipt["logs"] if isinstance(receipt, dict) else receipt.logs
+    found: list[int] = []
+    for log in logs:
+        emitter = log["address"] if isinstance(log, dict) else log.address
+        if Web3.to_checksum_address(emitter) != escrow_address:
+            continue
+        topics = log["topics"] if isinstance(log, dict) else log.topics
+        if not topics or bytes(topics[0]) != bytes(DEAL_CREATED_SIGNATURE):
+            continue
+        if len(topics) != 4:
+            raise DeploymentMismatch(
+                f"a DealCreated in {tx_hash} carries {len(topics)} topics, not 4"
+            )
+        found.append(int.from_bytes(bytes(topics[1]), "big"))
+
+    if len(found) != 1:
+        raise DeploymentMismatch(
+            f"{tx_hash} carries {len(found)} DealCreated logs from {address}, and exactly one "
+            "is the only count that names a single deal"
+        )
+    return found[0]

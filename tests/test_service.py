@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -272,11 +273,17 @@ def test_a_baseline_outside_the_domain_is_refused_with_its_bound(service):
 def test_health_says_plainly_what_it_does_not_do(service):
     client, _ = service
     body = client.get("/api/health").json()
+    # These are now properties of the deployment rather than of the code. This fixture sets no
+    # execution variable, so this is the read-only deployment and all three agree.
     assert body["signs"] is False and body["holds_keys"] is False
+    assert body["execution_enabled"] is False
     # Not `writes: false`. That was untrue on a cold deployment: opening a store that does not
     # exist writes its identity record, and the first quote writes the persona commitment when
     # it is absent. Both now happen at startup, and the claim says what is actually kept.
-    assert body["writes_receipts_or_outcomes"] is False
+    #
+    # Renamed to name the surface it is true of. Execution writes an outcome by definition, so
+    # an unqualified claim would have become false the moment a deployment enabled it.
+    assert body["quote_writes_receipts_or_outcomes"] is False
     assert "writes" not in body, "the claim that was too broad must not come back"
     assert body["chain_id"] == 84532
 
@@ -473,3 +480,150 @@ def test_a_cold_deployment_writes_its_metadata_before_it_serves(tmp_path, monkey
     for _ in range(3):
         assert client.get("/api/quote", params={"memory": "off"}).status_code == 200
     assert fingerprint(cold) == before, "a cold quote wrote to the store it quoted from"
+
+
+# ------------------------------------------------------------------------------------------
+# The executing surface. Everything above holds for a deployment that signs nothing; these
+# hold for the one that does, and the first of them is the boundary between the two.
+# ------------------------------------------------------------------------------------------
+
+
+def test_a_read_only_deployment_refuses_to_execute_and_says_why(service):
+    """The routes exist in both deployments and only one of them will act.
+
+    Returning 404 would be the easy alternative and it would be a worse answer: a judge given
+    a link to the read-only deployment would conclude the feature does not exist rather than
+    that this particular host does not hold keys.
+    """
+
+    client, _ = service
+    for method, path, body in (
+        ("post", "/api/session", None),
+        ("post", "/api/execute", {"session_id": "x", "profile": "urgent"}),
+        ("get", "/api/run/anything", None),
+    ):
+        response = getattr(client, method)(path, **({"json": body} if body else {}))
+        assert response.status_code == 503
+        assert "holds no keys" in response.json()["detail"]
+
+
+@pytest.fixture
+def executing(service, tmp_path, monkeypatch):
+    """The same service with execution enabled and a runner that touches nothing.
+
+    The runner is replaced rather than the command, because what these tests are about is the
+    HTTP surface: which requests are admitted, what they are charged against, and what they
+    return. The procedure itself is covered against its own fakes in `test_executor`.
+    """
+
+    from wrasse import executor, service as module
+    from wrasse.sessions import Sessions
+
+    client, warm = service
+    monkeypatch.setattr(module, "EXECUTION", True)
+    monkeypatch.setattr(module, "_STARTED", 0)
+    monkeypatch.setattr(module, "_session_stores", {})
+
+    executed: list[executor.Run] = []
+
+    class Recording(executor.Runner):
+        def __init__(self) -> None:
+            pass
+
+        def execute(self, run: executor.Run) -> None:
+            executed.append(run)
+            run.status = executor.SUCCEEDED
+
+    queue = executor.Queue(Recording())
+    monkeypatch.setattr(module, "_QUEUE", queue)
+    monkeypatch.setattr(
+        module, "_SESSIONS",
+        Sessions(module._PATHS[module.WARM], root=tmp_path / "sessions",
+                 limit=10, runs_per_session=2),
+    )
+    yield client, executed, queue
+    queue.stop()
+
+
+def test_a_session_gets_its_own_copy_of_both_memories(executing):
+    """And the copy is a copy: the source is not what the run will be pointed at."""
+
+    client, _, _ = executing
+    from wrasse import service as module
+
+    body = client.post("/api/session").json()
+    session = module._SESSIONS.get(body["session_id"])
+    assert session is not None
+    for role in ("buyer", "provider"):
+        assert session.paths[role].is_file()
+        assert session.paths[role] != module._PATHS[module.WARM][role]
+
+
+def test_a_run_is_queued_against_the_session_that_asked_for_it(executing):
+    """The run carries that session's paths, which is what every subprocess will inherit."""
+
+    client, executed, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    body = client.post(
+        "/api/execute", json={"session_id": session_id, "profile": "urgent"}
+    ).json()
+
+    deadline = time.time() + 5
+    while not executed and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert len(executed) == 1
+    assert executed[0].session_id == session_id
+    assert executed[0].paths["buyer"].parent.name == session_id
+    assert client.get(f"/api/run/{body['run_id']}").json()["status"] == "succeeded"
+
+
+def test_a_session_cannot_run_past_its_allowance(executing):
+    """Both wallets are shared and faucet-funded, so this is what stops one visitor spending
+    the demo. The refusal is a 429 rather than a 403 because it is a rate, not a permission."""
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    request = {"session_id": session_id, "profile": "urgent"}
+    assert client.post("/api/execute", json=request).status_code == 200
+    assert client.post("/api/execute", json=request).status_code == 200
+    refused = client.post("/api/execute", json=request)
+    assert refused.status_code == 429
+    assert "limit" in refused.json()["detail"]
+
+
+def test_a_refused_run_is_not_charged_against_the_deployment_ceiling(executing):
+    """A run that was never queued must not consume the global allowance.
+
+    The per-session check happens after the global counter is taken, because the counter has
+    to be taken under a lock and the session check can raise. Without the decrement, a visitor
+    hammering a spent session would burn the whole deployment's budget without ever running
+    anything, which is a denial of service with no transactions in it.
+    """
+
+    from wrasse import service as module
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    request = {"session_id": session_id, "profile": "urgent"}
+    client.post("/api/execute", json=request)
+    client.post("/api/execute", json=request)
+    before = module._STARTED
+    client.post("/api/execute", json=request)
+    assert module._STARTED == before
+
+
+def test_an_unknown_session_is_refused_before_anything_is_queued(executing):
+    client, executed, _ = executing
+    response = client.post(
+        "/api/execute", json={"session_id": "0" * 32, "profile": "urgent"}
+    )
+    assert response.status_code == 404
+    assert executed == []
+
+
+def test_health_says_this_deployment_signs_when_it_does(executing):
+    client, _, _ = executing
+    body = client.get("/api/health").json()
+    assert body["signs"] is True and body["holds_keys"] is True
+    assert body["execution_enabled"] is True
