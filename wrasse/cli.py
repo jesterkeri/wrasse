@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from sibyl_memory_client import MemoryClient
 from web3 import HTTPProvider, Web3
 
-from . import chain, escrow, negotiation
+from . import agent, chain, escrow, negotiation
 from .chain_time import ChainObservation, observe_chain_time, past_lag, require_recent
 from .dimensions import (
     DIMENSION_CATEGORY,
@@ -210,6 +210,25 @@ def _open_stores(
         )
         for role in ("buyer", "provider")
     }
+
+
+def _open_store(role: str) -> WrasseStore:
+    """One identified memory, for a process that is only entitled to one.
+
+    `_open_stores` opens the pair, which is right for the joint path and wrong for an agent:
+    the whole point of running one side in its own process is that it cannot reach the other's
+    store. Opening both and using one would leave the isolation as a convention.
+    """
+
+    if role not in ("buyer", "provider"):
+        raise RuntimeError(f"{role!r} is not a side of this negotiation")
+    owner = _required_env(
+        "WRASSE_BUYER_ADDRESS" if role == "buyer" else "WRASSE_PROVIDER_A_ADDRESS"
+    )
+    return WrasseStore.open(
+        _store_path(role), role=role, owner_address=owner,
+        chain_id=_chain_id(), escrow_address=_required_env("WRASSE_ESCROW_ADDRESS"),
+    )
 
 
 def _provider_persona(store: WrasseStore) -> ProviderPersona:
@@ -786,6 +805,30 @@ def build_parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--deal-id", type=int, required=True)
         command.set_defaults(deal_action=action)
+
+    positions = sub.add_parser(
+        "agent-positions",
+        help="publish one side's numbers from one side's memory, in this process alone",
+    )
+    positions.add_argument("--role", required=True, choices=("buyer", "provider"))
+    # The same defaults and the same environment names as every other command, so two
+    # agents run with no flags publish against one baseline rather than two.
+    positions.add_argument(
+        "--base-price-wei", type=int, default=_baseline("WRASSE_BASE_PRICE_WEI", 10**14)
+    )
+    positions.add_argument(
+        "--base-bond-bps", type=int, default=_baseline("WRASSE_BASE_BOND_BPS", 500)
+    )
+    positions.add_argument(
+        "--service-window", type=int, default=_baseline("WRASSE_SERVICE_WINDOW", 3_600)
+    )
+    positions.add_argument(
+        "--payout-delay", type=int, default=_baseline("WRASSE_PAYOUT_DELAY", 1_800)
+    )
+    positions.add_argument(
+        "--outcome", action="append", default=[],
+        help="simulate against this outcome instead of what the memory holds; repeatable",
+    )
 
     collect = sub.add_parser("withdraw", help="collect everything this role is owed")
     collect.add_argument("--role", choices=("buyer", "provider"), required=True)
@@ -1788,6 +1831,45 @@ def _rebind_policy(args) -> int:
     return 0
 
 
+def _agent_positions(args) -> int:
+    """Publish one side's numbers, from one side's memory, in one process.
+
+    Prints the same JSON the coordinator would otherwise have computed for this side while
+    holding both stores. The difference is not the output, it is who was able to see what while
+    producing it.
+    """
+
+    role = args.role
+    store = _open_store(role)
+    counterparty = _required_env(
+        "WRASSE_PROVIDER_A_ADDRESS" if role == "buyer" else "WRASSE_BUYER_ADDRESS"
+    )
+    evidence = None
+    if args.outcome:
+        from .simulate import build_history
+
+        evidence = build_history(
+            args.outcome,
+            buyer=_required_env("WRASSE_BUYER_ADDRESS"),
+            provider=_required_env("WRASSE_PROVIDER_A_ADDRESS"),
+        )
+
+    with store.lock():
+        published = agent.publish_positions(
+            role=role,
+            store=store,
+            counterparty=Web3.to_checksum_address(counterparty),
+            base_price_wei=args.base_price_wei,
+            base_bond_bps=args.base_bond_bps,
+            base_service_window=args.service_window,
+            base_payout_delay=args.payout_delay,
+            persona=_provider_persona(store) if role == "provider" else None,
+            evidence=evidence,
+        )
+    print(json.dumps(published, indent=2, sort_keys=True))
+    return 0
+
+
 def quote_document(
     *,
     buyer: str,
@@ -2148,6 +2230,8 @@ def main(argv: list[str] | None = None) -> int:
             "note": "both memories receive the same neutral fact; each draws its own conclusion",
         }, indent=2, sort_keys=True))
         return 0
+    if args.command == "agent-positions":
+        return _agent_positions(args)
     raise AssertionError("unreachable")
 
 
