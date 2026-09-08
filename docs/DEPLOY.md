@@ -95,6 +95,15 @@ Worth changing before opening the link, all with defaults that are already sane:
 | `WRASSE_TOTAL_RUN_CEILING` | `400` | how many this deployment will perform at all |
 | `WRASSE_DEMO_ACCEPT_WINDOW` | `1800` | acceptance time a hosted run quotes |
 | `WRASSE_SESSION_LIMIT` | `200` | session copies kept before the oldest is deleted |
+| `WRASSE_WAIT_TIMEOUT` | `1200` | the longest deadline a waiting ending may sit out |
+
+**`WRASSE_WAIT_TIMEOUT` is the one to think about before opening the link.** Two of the three
+endings are produced by letting a deadline the contract enforces actually run out, so the run
+occupies the single worker for the whole of it. At the page's default baseline the settled
+payout delay is 900 seconds, so a made-to-wait run takes about eighteen minutes and everyone
+queued behind it waits too. A settled duration above this budget is refused at the quote, with
+nothing signed and a sentence naming which number to lower, rather than being discovered after
+the deposit is already locked in an accepted deal.
 
 ## Why the price ceiling exists
 

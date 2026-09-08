@@ -172,11 +172,15 @@
     released: 'The seller delivers and the buyer pays at once. Four transactions, about three '
       + 'and a half minutes, and most of that is Base confirming it.',
     timeout: 'Nothing is delivered and the buyer takes the deal back once the window has run '
-      + 'out. The contract will not allow the claim before then, so this costs the delivery '
-      + 'time you set above on top of the usual three and a half minutes.',
+      + 'out. The contract will not allow the claim before then, so this costs the '
+      + 'settled delivery window on top of the usual three and a half minutes. The settled '
+      + 'window is what the two of them agreed, not the number you typed, and a run that '
+      + 'would have to wait more than twenty minutes is refused before anything is signed.',
     delayed: 'The seller delivers, the buyer does not release, and the seller waits out the '
-      + 'agreed delay before the contract will pay it. This costs the payment wait you set '
-      + 'above on top of the usual three and a half minutes.'
+      + 'agreed delay before the contract will pay it. That is the settled payment delay '
+      + 'rather than the one you typed, and at the starting numbers above it is fifteen '
+      + 'minutes on top of the usual three and a half. A run that would have to wait more '
+      + 'than twenty minutes is refused before anything is signed.'
   };
 
   var ticker = null;

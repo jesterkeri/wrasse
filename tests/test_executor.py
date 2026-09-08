@@ -467,3 +467,188 @@ def test_the_wait_is_measured_against_the_chain_and_the_deal(environment):
 
     assert run.status == executor.SUCCEEDED, run.error
     assert asked == [7], "the deadline must come from the deal the contract is holding"
+
+
+# ------------------------------------------------------------------------------------------
+# The waiting endings, and the budget they are actually held to.
+# ------------------------------------------------------------------------------------------
+
+
+def _waiting_run(environment, outcome):
+    run = make_run(environment)
+    run.outcome = outcome
+    run.steps = [executor.Step(*step) for step in executor.SHAPES[outcome]]
+    return run
+
+
+@pytest.mark.parametrize(
+    ("outcome", "term", "settled"),
+    [(executor.TIMEOUT, "service window", 300), (executor.DELAYED, "payout delay", 900)],
+)
+def test_an_ending_nobody_can_wait_out_is_refused_before_the_deal_exists(
+    environment, monkeypatch, outcome, term, settled
+):
+    """The deposit is not locked up to discover a number that was known one step earlier.
+
+    Both of these endings are produced by letting a deadline the contract enforces actually
+    pass, so the run has to stay alive for the whole of it. The settled number is in the
+    document before anything is signed. Comparing it there costs nothing; comparing it after
+    `acceptDeal` costs the visitor their run, their gas, and a price and a stake locked inside
+    a deal this procedure has already given up on.
+    """
+
+    monkeypatch.setattr(executor, "WAIT_TIMEOUT", 120.0)
+    chain = FakeChain()
+    run = _waiting_run(environment, outcome)
+
+    runner(chain, clock=bounded_clock()).execute(run)
+
+    assert chain.commands() == ["policy"], "nothing may be signed for a run that cannot finish"
+    assert run.status == executor.FAILED
+    assert str(settled) in run.error and term in run.error, run.error
+
+
+def test_the_ending_that_waits_for_nothing_is_never_refused_for_waiting(
+    environment, monkeypatch
+):
+    """The guard is about the ending, not about the terms.
+
+    A delivered-and-paid run outlasts no deadline at all, so a budget below every settled
+    duration must not touch it. Without this the same constant that protects two endings
+    quietly deletes the third.
+    """
+
+    monkeypatch.setattr(executor, "WAIT_TIMEOUT", 1.0)
+    chain = FakeChain()
+    run = make_run(environment)
+
+    runner(chain, clock=bounded_clock()).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+
+
+def test_the_wait_is_bounded_by_its_own_budget_and_not_the_confirmation_one(environment):
+    """Two different questions, and for a while they shared a constant.
+
+    A confirmation wait is bounded by how far behind the tip Base's safe head runs, which is a
+    property of the chain. This wait is bounded by a number the visitor typed. Sharing
+    `CONFIRMATION_TIMEOUT` at 420 seconds made every ending that waits fail at the default
+    baseline, because the settled payout delay there is 900.
+
+    The clock advances a minute per read, so the two budgets are distinguishable by how many
+    readings a stalled wait takes: seven for the confirmation budget, twenty for this one.
+    """
+
+    chain = FakeChain()
+    run = _waiting_run(environment, executor.TIMEOUT)
+    reads = []
+
+    def clock():
+        reads.append(len(reads) * 60)
+        return reads[-1]
+
+    Runner(
+        command=chain, deal_id_reader=lambda tx_hash: 7, balance_reader=lambda: RICH,
+        deal_reader=lambda deal_id: {"deadline": 10**9, "payout_available_at": 10**9},
+        chain_now=lambda: 0, sleep=lambda _: None, clock=clock,
+    ).execute(run)
+
+    assert run.status == executor.FAILED
+    assert "gave up waiting" in run.error, run.error
+    assert reads[-1] >= executor.WAIT_TIMEOUT > executor.CONFIRMATION_TIMEOUT, (
+        "a stalled wait gave up on the confirmation budget rather than its own"
+    )
+
+
+# ------------------------------------------------------------------------------------------
+# The refund, which has to look at both sides of the escrow.
+# ------------------------------------------------------------------------------------------
+
+
+def _refund_run(tmp_path):
+    return Run(
+        run_id="r", session_id="s", kind=executor.REFUND, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"},
+        workdir=tmp_path,
+    )
+
+
+class _Withdrawals:
+    def __init__(self):
+        self.roles = []
+
+    def __call__(self, argv, env, timeout):
+        if argv[0] == "withdraw":
+            self.roles.append(argv[argv.index("--role") + 1])
+            return 0, json.dumps(
+                {"intent_id": f"i-{len(self.roles)}", "tx_hash": "0xw", "status": "pending"}
+            ), ""
+        if argv[0] == "tx-resolve":
+            return 0, json.dumps(
+                [{"intent_id": f"i-{n}", "status": "included_success"}
+                 for n in range(1, len(self.roles) + 1)]
+            ), ""
+        raise AssertionError(argv[0])
+
+
+def test_a_session_whose_only_outcome_was_a_timeout_still_gets_its_money_back(
+    environment, tmp_path
+):
+    """`claimTimeout` credits the buyer, and the refund used to collect only the seller.
+
+    So a visitor who produced the failure the demo exists to show left the price and the stake
+    sitting in the escrow, and `withdraw` reverts on a zero credit, so the refund reported a
+    failure while the money it never looked at stayed put.
+    """
+
+    withdrawals = _Withdrawals()
+    run = _refund_run(tmp_path)
+
+    Runner(
+        command=withdrawals,
+        balance_reader=lambda: {"buyer": 1, "provider": 10**18},
+        credit_reader=lambda: {"buyer": 5 * 10**14, "provider": 0},
+        sleep=lambda _: None,
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert withdrawals.roles == ["buyer"]
+
+
+def test_a_refund_collects_every_side_the_escrow_is_holding_for(environment, tmp_path):
+    """A session of mixed endings leaves a credit on both sides, and both are owed back."""
+
+    withdrawals = _Withdrawals()
+    run = _refund_run(tmp_path)
+
+    Runner(
+        command=withdrawals,
+        balance_reader=lambda: {"buyer": 1, "provider": 10**18},
+        credit_reader=lambda: {"buyer": 10**14, "provider": 10**14},
+        sleep=lambda _: None,
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert sorted(withdrawals.roles) == ["buyer", "provider"]
+
+
+def test_an_empty_escrow_is_not_a_failed_refund(environment, tmp_path):
+    """Nothing to collect is an answer, and sending a transaction to prove it is not.
+
+    `withdraw` reverts on a zero credit, so asking anyway would spend gas to produce an error
+    and show the visitor a failure at the end of a session that went perfectly well.
+    """
+
+    withdrawals = _Withdrawals()
+    run = _refund_run(tmp_path)
+
+    Runner(
+        command=withdrawals,
+        balance_reader=lambda: {"buyer": 1, "provider": 10**18},
+        credit_reader=lambda: {"buyer": 0, "provider": 0},
+        sleep=lambda _: None,
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert withdrawals.roles == []
+    assert run.refund_wei == 0

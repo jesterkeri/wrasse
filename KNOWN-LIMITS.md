@@ -37,15 +37,32 @@ genuinely read-only file does not open. The source is mounted read-only and copi
 writable working directory at startup instead. The deployed artifact cannot be mutated and the
 working copy is recreated on every restart.
 
-**The service writes metadata at startup, and nothing while serving.** A store that does not
+**The quote path writes metadata at startup and nothing while serving.** A store that does not
 exist gets its identity record written on first open, and the persona commitment is written
-when it is absent. Both happen before the first request, so the serving path writes no receipt,
-no learned dimension and no outcome. The module used to claim it wrote nothing at all, which
+when it is absent. Both happen before the first request, so quoting writes no receipt, no
+learned dimension and no outcome. `/api/health` reports this as
+`quote_writes_receipts_or_outcomes`. The module used to claim it wrote nothing at all, which
 was false on a cold deployment.
 
-**The service holds no keys and signs nothing.** Settlement runs on the operator's machine.
-That is a design constraint rather than a limitation, and it is recorded here because removing
-it reintroduces the wallet serialisation and wallet-death problems it was chosen to delete.
+**Two deployments, and only one of them signs.** With `WRASSE_ENABLE_EXECUTION` unset the
+service holds no keys and sends nothing. With it set the service holds both keystores, signs
+on behalf of both wallets, and writes receipts into the visitor's own copy of the two
+memories. `/api/health` reports `signs` and `holds_keys` from the same flag, so which one is
+running is a fact a reader can check rather than a claim in a document. An earlier version of
+this file said the service never signs, which stopped being true the moment a judge could
+perform a settlement.
+
+**The executing deployment shares two wallets between every visitor.** One worker runs one
+settlement at a time, which is what stops two sends taking the same nonce, and it means the
+third visitor in a queue waits for the two ahead of them. The bounds are
+`WRASSE_RUNS_PER_SESSION` and `WRASSE_TOTAL_RUN_CEILING`, and neither makes an empty wallet
+safe.
+
+**An ending that waits is bounded by `WRASSE_WAIT_TIMEOUT`, not by the contract.** Two of the
+three endings are produced by letting a deadline actually pass, so the run has to stay alive
+for the whole of it. A settled duration longer than that budget is refused at the quote, before
+anything is signed, naming the number to lower. The contract would happily enforce a thirty day
+window; this service will not sit through one.
 
 ## The transaction orchestrator
 

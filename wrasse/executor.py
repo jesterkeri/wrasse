@@ -151,6 +151,15 @@ INCLUSION_TIMEOUT = float(os.getenv("WRASSE_INCLUSION_TIMEOUT", "180"))
 #: How long the confirmation wait may take. The safe head is about 66 seconds behind, and a
 #: slow stretch of blocks widens that, so this is deliberately several times the expectation.
 CONFIRMATION_TIMEOUT = float(os.getenv("WRASSE_CONFIRMATION_TIMEOUT", "420"))
+#: How long a run may sit waiting out a deadline the contract enforces. Its own constant, and
+#: the separation is the whole point: a confirmation wait is bounded by how far behind the safe
+#: head runs, which is a property of Base, while this one is bounded by a number the visitor
+#: typed. Sharing `CONFIRMATION_TIMEOUT` made every ending that waits fail at the default
+#: baseline, because the settled payout delay is 900 seconds and that budget was 420.
+WAIT_TIMEOUT = float(os.getenv("WRASSE_WAIT_TIMEOUT", "1200"))
+#: What the wait costs beyond the deadline itself: four blocks of margin, and the acceptance or
+#: delivery that has to be included before the clock the contract reads even starts.
+_WAIT_MARGIN = 60
 #: A single command's own wall-clock bound, so a hung RPC cannot hold the worker forever.
 COMMAND_TIMEOUT = float(os.getenv("WRASSE_COMMAND_TIMEOUT", "120"))
 
@@ -299,6 +308,27 @@ def _default_balance_reader() -> dict[str, int]:
     }
 
 
+def _default_credit_reader() -> dict[str, int]:
+    """What the escrow is holding for each wallet, as opposed to what each wallet holds.
+
+    A settlement never sends: every terminal path credits the recipient and `withdraw` is the
+    only call that moves value out. So the escrow's own ledger is the thing a refund has to
+    read, and a wallet balance says nothing about it.
+    """
+
+    from . import cli
+    from .escrow import contract
+
+    escrow = contract(cli._web3(), cli._required_env("WRASSE_ESCROW_ADDRESS"))
+    return {
+        role: int(escrow.functions.withdrawable(cli._required_env(name)).call())
+        for role, name in (
+            ("buyer", "WRASSE_BUYER_ADDRESS"),
+            ("provider", "WRASSE_PROVIDER_A_ADDRESS"),
+        )
+    }
+
+
 def _default_deal_reader(deal_id: int) -> dict[str, Any]:
     from . import cli
     from .escrow import read_deal
@@ -341,6 +371,7 @@ class Runner:
         command: Callable[..., tuple[int, str, str]] | None = None,
         deal_id_reader: Callable[[str], int] | None = None,
         balance_reader: Callable[[], dict[str, int]] | None = None,
+        credit_reader: Callable[[], dict[str, int]] | None = None,
         deal_reader: Callable[[int], dict[str, Any]] | None = None,
         chain_now: Callable[[], int | None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -349,6 +380,7 @@ class Runner:
         self._command = command or _default_command
         self._deal_id = deal_id_reader or _default_deal_id_reader
         self._balances = balance_reader or _default_balance_reader
+        self._credits = credit_reader or _default_credit_reader
         self._deal = deal_reader or _default_deal_reader
         self._chain_now = chain_now or _default_chain_now
         self._sleep = sleep
@@ -488,18 +520,46 @@ class Runner:
 
         step = self._begin(run, "refund")
         try:
-            balances = self._balances()
-            run.refund_to = min(balances, key=lambda role: balances[role])
-            destination = self._address(run.refund_to)
-            sent = self._cli(run, ["withdraw", "--role", "provider", "--to", destination])
-            if sent.get("status") == UNBROADCAST_STATUS:
-                raise ExecutionError(sent.get("error", "the refund was refused before sending"))
-            step.tx_hash = sent.get("tx_hash")
-            self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
+            before = self._balances()
+            credits = self._credits()
+            # Both sides, because which side is holding a credit depends on how the session's
+            # runs ended. A released deal credits the seller its price and stake back; a
+            # timeout credits the buyer the same total. Collecting only the seller left every
+            # timeout a visitor produced sitting in the escrow, and `withdraw` reverts on a
+            # zero credit, so a session made only of timeouts refunded nothing and reported a
+            # failure while the money it could not see stayed put.
+            owed = [role for role in ("provider", "buyer") if credits.get(role, 0) > 0]
+            if not owed:
+                run.refund_to = min(before, key=lambda role: before[role])
+                run.refund_wei = 0
+                self._end(step, detail="the escrow was holding nothing for either wallet")
+                run.status = SUCCEEDED
+                run.finished_at = _now()
+                return
+
+            hashes = []
+            for role in owed:
+                # Recomputed per collection rather than chosen once. The first withdrawal
+                # changes which wallet is emptier, and the point of choosing at all is to keep
+                # the pair level.
+                standing = self._balances()
+                run.refund_to = min(standing, key=lambda name: standing[name])
+                destination = self._address(run.refund_to)
+                sent = self._cli(run, ["withdraw", "--role", role, "--to", destination])
+                if sent.get("status") == UNBROADCAST_STATUS:
+                    raise ExecutionError(
+                        sent.get("error", "the refund was refused before sending")
+                    )
+                hashes.append(sent.get("tx_hash"))
+                self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
+            step.tx_hash = hashes[-1]
             after = self._balances()
-            run.refund_wei = after[run.refund_to] - balances[run.refund_to]
+            run.refund_wei = sum(
+                max(0, after[role] - before[role]) for role in after
+            )
             self._end(step, detail=(
-                f"returned to the {run.refund_to} wallet, which was the emptier of the two"
+                f"collected what the escrow held for the {' and the '.join(owed)}, into "
+                f"whichever wallet was emptier at the time"
             ))
         except ExecutionError as error:
             self._fail(run, str(error))
@@ -530,7 +590,7 @@ class Runner:
         step = self._begin(run, "wait")
         deal = self._deal(run.deal_id)
         until = int(deal[field]) + 4
-        deadline = self._clock() + CONFIRMATION_TIMEOUT
+        deadline = self._clock() + WAIT_TIMEOUT
         while True:
             now = self._chain_now()
             if now is not None and now >= until:
@@ -631,11 +691,48 @@ class Runner:
                 "single run is bounded. Quote a smaller baseline price and run it again."
             )
         self._require_funded(terms)
+        self._require_waitable(run, terms)
         run.settled = {"agreed": True, **terms}
         self._end(step, detail=(
             f"bond {terms['provider_bond_bps']} bps, window {terms['service_window']}s, "
             f"price {terms['price_wei']} wei, payout delay {terms['payout_delay']}s"
         ))
+
+    #: Which settled term each ending has to outlast, and which baseline number moves it. An
+    #: ending that waits for nothing is absent, which is why `released` is not here.
+    _WAITS_ON: dict[str, tuple[str, str, str]] = {
+        TIMEOUT: ("service_window", "the delivery window", "service window"),
+        DELAYED: ("payout_delay", "the payment delay", "payout delay"),
+    }
+
+    def _require_waitable(self, run: Run, terms: dict[str, Any]) -> None:
+        """Refuse an ending this run cannot sit out, before the deal exists.
+
+        Two of the three endings are produced by letting a deadline the contract enforces
+        actually pass, so the run has to be alive for the whole of it. The settled number is
+        known here, one step before anything is signed, and comparing it against the budget
+        here is the difference between a sentence naming the number to lower and a visitor
+        watching a progress bar for twenty minutes before being told the same thing with their
+        deposit already locked inside an accepted deal.
+
+        Checked against the settled term rather than the baseline, because the settlement is
+        what the contract will enforce: a baseline delay of 800 seconds settles at 900 when the
+        buyer's floor binds, and it is the 900 this run has to outlast.
+        """
+
+        waits_on = self._WAITS_ON.get(run.outcome)
+        if waits_on is None:
+            return
+        term, what, knob = waits_on
+        needed = int(terms[term])
+        if needed + _WAIT_MARGIN <= WAIT_TIMEOUT:
+            return
+        raise ExecutionError(
+            f"this ending is produced by letting {what} run out, and the two memories settled "
+            f"it at {needed}s. A single run may wait {WAIT_TIMEOUT:.0f}s. Lower the {knob} and "
+            "run it again, or choose the ending where the work is delivered and paid for, "
+            "which waits for nothing."
+        )
 
     def _require_funded(self, terms: dict[str, Any]) -> None:
         """Refuse a run neither wallet can finish, before the first transaction rather than

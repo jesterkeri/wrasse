@@ -868,6 +868,10 @@ def test_a_refund_goes_to_whichever_wallet_is_emptier(tmp_path):
         runner = executor.Runner(
             command=command,
             balance_reader=lambda p=poorer, r=richer: {p: 1, r: 10**18},
+            # The escrow is holding the seller's price and stake, which is what a released
+            # deal leaves behind. Injected rather than read, because what this test is about
+            # is where the money goes, not what the chain says is owed.
+            credit_reader=lambda: {"provider": 5 * 10**14, "buyer": 0},
             sleep=lambda _: None,
         )
         runner.execute(run)
