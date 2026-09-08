@@ -159,7 +159,17 @@
       body: JSON.stringify(body || {})
     });
     var data = await res.json().catch(function () { return {}; });
-    if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+    if (!res.ok) {
+      // The detail is a string for the routes that refuse in one sentence and an object for
+      // the ones that also return the bounds they refused against. Passing the object
+      // straight to Error printed "[object Object]" on the page, which tells a reader
+      // nothing except that something went wrong somewhere.
+      var detail = data.detail;
+      var message = typeof detail === 'string' ? detail
+        : (detail && detail.error) ? detail.error
+        : ('HTTP ' + res.status);
+      throw new Error(message);
+    }
     return data;
   }
 
@@ -266,13 +276,17 @@
     var run = await res.json();
     drawSteps(run);
 
-    if (run.queue_position !== null && run.queue_position !== undefined) {
+    // The button says what the run is doing and this says only how many are in front of it.
+    // They used to both say "running", which is how a reader learns to stop reading one of
+    // them. When nothing is in front, this says nothing at all.
+    if (run.status === 'queued' && typeof run.queue_position === 'number') {
       text(queueLabel, run.queue_position === 0
         ? 'next, once the run in front finishes'
         : run.queue_position + ' ahead of you');
     } else {
-      text(queueLabel, run.status === 'running' ? 'running' : '');
+      text(queueLabel, '');
     }
+    text(button, run.status === 'queued' ? 'Waiting\u2026' : 'Running\u2026');
     return run;
   }
 
@@ -302,16 +316,13 @@
           run.baseline = body.baseline;
           if (run.status === 'succeeded') {
             finish(null);
-            text(queueLabel, '');
             await afterQuote(run);
           } else if (run.status === 'refused') {
             finish('No deal exists at this baseline for the ' + body.profile + ' profile, and '
               + 'that is an answer rather than a failure. The two memories left no overlap, so '
               + 'nothing was signed.');
-            text(queueLabel, '');
           } else if (run.status === 'failed') {
             finish(run.error || 'the run stopped');
-            text(queueLabel, '');
           }
         } catch (error) {
           finish(String(error.message || error));
