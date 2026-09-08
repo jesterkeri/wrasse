@@ -31,6 +31,8 @@
       margin-top:10px}
     #wrasse-sim .ws-guide dt:first-child{margin-top:0}
     #wrasse-sim .ws-guide dd{margin:2px 0 0;color:var(--fg-muted,inherit);font-size:13px}
+    #wrasse-sim .ws-caveat{background:var(--surface-2,transparent);border-radius:12px;
+      padding:12px 14px;max-width:78ch;color:var(--fg-subtle,inherit);font-size:13px}
     #wrasse-sim .ws-warn{color:var(--bad,inherit);
       font:600 12px/1.5 'Geist Mono',ui-monospace,monospace;margin-top:4px}
     #wrasse-sim .ws-fields{display:grid;gap:16px;
@@ -132,10 +134,16 @@
 
   <div class="ws-card" id="ws-next" hidden>
     <div class="ws-step">Step four</div>
-    <h2>Say what happened on this job</h2>
+    <h2>Teach the agents what happened</h2>
     <p>
-      Whatever you choose becomes something both of them remember, and the next negotiation
-      starts from it. Nothing is erased when you add to it.
+      A different thing from the numbers above. Those decide what the two of them will agree
+      to. This decides what they remember afterwards, and the next negotiation starts from it.
+      Nothing is erased when you add to it.
+    </p>
+    <p class="ws-caveat">
+      Here you are supposing an outcome. On the live quote nothing can be supposed: a memory is
+      only ever written from a receipt Base has confirmed, so an intention that was never
+      executed is never treated as misconduct.
     </p>
     <div class="ws-row" id="ws-outcomes"></div>
   </div>
@@ -269,6 +277,7 @@
   var profile = 'urgent';
   var baseline = {};
   var timers = [];
+  var lastRefusal = null;
 
   function text(el, value) { el.textContent = value; }
   function pct(bps) { return (Number(bps) / 100).toFixed(1).replace(/\.0$/, '') + '%'; }
@@ -494,6 +503,7 @@
         throw new Error(typeof detail === 'string' ? detail : (detail.error || ('HTTP ' + res.status)));
       }
       var found = (data.profiles || []).filter(function (p) { return p.id === profile; })[0];
+      lastRefusal = found && !found.agreed ? found.failed_on : null;
       var wait = 0;
       if (found && found.agreed) {
         wait = play(lines(found));
@@ -509,6 +519,15 @@
       }
       timers.push(setTimeout(function () {
         drawOutcome(data);
+        if (lastRefusal === 'provider_bond_bps') {
+          note('Refused on your numbers, not on their history. The stake you asked for is '
+            + 'outside what any seller will lock up, so there was nothing to negotiate. Change '
+            + 'it at the top and they will talk again.');
+        } else if (lastRefusal === 'price_bps') {
+          note('Refused on their history, not on your numbers. The seller will not go below a '
+            + 'floor its own record of this buyer has raised, and this posting will not reach '
+            + 'it. Clear the history and the same numbers settle.');
+        }
         note(history.length
           ? 'Worked out from ' + history.length + ' remembered job'
             + (history.length === 1 ? '' : 's') + '. Nothing was rewritten to get here, and the '
