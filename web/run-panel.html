@@ -6,46 +6,76 @@
      it. `web/apply-overrides.py` puts it back after every export. -->
 <section id="wrasse-run" hidden>
   <style>
-    /* The design's root is a custom element with no CSS rule of its own, so it defaults to
-       `display:inline` and does not contain the block content inside it. Nothing followed it
-       until this panel did, which is why the bug appeared the moment the panel landed rather
-       than being the panel's fault. One line, and it belongs here because it is the panel's
-       arrival that made it matter. */
+    /* Two rules, and both are about the page containing itself rather than about this panel.
+       Measured rather than guessed: with the panel reporting its own geometry, the body
+       computed to 485px tall while the document scrolled to 2719. The design's content
+       overflows its own box, so anything placed after it lands at 485px, on top of the middle
+       of the page. That is the overlap, and it was never the panel's styling.
+
+       `height:100%` on html and body is the loader's, and it pins the page to the viewport.
+       Switching to auto with a 100% minimum keeps the full-height background and lets the box
+       grow to its content, which also fixes the app's own root: a percentage height against an
+       auto parent resolves to auto.
+
+       The second is the design's root element, which has no CSS rule of its own and so
+       defaults to inline. Nothing had ever followed it, so nothing had ever noticed. */
+    html,body{height:auto;min-height:100%}
     x-dc{display:block}
-    #wrasse-run{position:relative;clear:both;max-width:none;margin:0 auto;padding:0 clamp(14px,3vw,44px) 96px;
-      font:14px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif;color:var(--fg,#141412)}
-    #wrasse-run .wr-card{border:1px solid var(--line,#C7C0AF);background:var(--surface,transparent);
-      padding:clamp(16px,2.5vw,28px)}
-    #wrasse-run h2{font-size:clamp(19px,2.2vw,25px);line-height:1.2;margin:0 0 8px;font-weight:600}
-    #wrasse-run p{max-width:74ch;margin:0 0 14px;color:var(--fg,#141412);opacity:.78}
-    #wrasse-run .wr-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 0}
-    #wrasse-run select,#wrasse-run button{font:inherit;padding:8px 14px;border:1px solid var(--fg,#141412);
-      background:transparent;color:var(--fg,#141412);border-radius:0;cursor:pointer}
-    /* The design's own call-to-action colour when it has one, falling back to the
-       foreground so a future export that drops the token still gets a real button. */
-    #wrasse-run button.wr-go{background:var(--primary,var(--fg,#141412));
-      color:var(--on-primary,var(--bg,#EBE5D9));border-color:var(--primary,var(--fg,#141412));
-      font-weight:600}
+
+    /* Every value below is lifted from the design rather than chosen: the card is its 16px
+       radius on `--surface`, the action button is its 12px radius, 2px `--line-strong` border,
+       0.18em tracking and 52px minimum height, and the fields are its 8px radius on `--bg` in
+       the mono face. A panel that invented its own radius is the one thing that would make it
+       read as bolted on, which is exactly what it looked like. */
+    #wrasse-run{position:relative;clear:both;max-width:none;margin:0 auto;
+      padding:0 clamp(14px,3vw,44px) 96px;
+      font:14px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;color:var(--fg,#141412)}
+    #wrasse-run .wr-card{background:var(--surface,transparent);border-radius:16px;
+      padding:clamp(20px,2.5vw,28px)}
+    #wrasse-run h2{font:600 clamp(19px,2.2vw,26px)/1.2 Inter,sans-serif;letter-spacing:-0.4px;
+      color:var(--fg-strong,inherit);margin:0 0 10px}
+    #wrasse-run p{max-width:74ch;margin:0 0 14px;color:var(--fg-muted,inherit)}
+    #wrasse-run .wr-eyebrow{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
+      text-transform:uppercase;color:var(--fg-subtle,inherit);margin:0 0 10px}
+    #wrasse-run .wr-controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:20px 0 0}
+    #wrasse-run label{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
+      text-transform:uppercase;color:var(--fg-subtle,inherit)}
+    #wrasse-run select{border:1px solid var(--line-strong,#c4c4cc);border-radius:8px;
+      background:var(--bg,#fff);color:var(--fg,#141412);
+      font:700 13px/1.4 'Geist Mono',ui-monospace,monospace;padding:12px 14px;min-height:44px;
+      cursor:pointer}
+    #wrasse-run button.wr-go{flex:0 0 auto;min-width:230px;min-height:52px;padding:15px 14px;
+      border:2px solid var(--line-strong,#c4c4cc);border-radius:12px;
+      background:var(--primary,var(--fg,#141412));color:var(--on-primary,var(--bg,#fff));
+      font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.18em;text-transform:uppercase;
+      cursor:pointer}
     #wrasse-run button[disabled]{opacity:.45;cursor:default}
-    #wrasse-run ol{list-style:none;margin:20px 0 0;padding:0;border-top:1px solid var(--line,#C7C0AF)}
-    #wrasse-run li{display:flex;gap:12px;align-items:baseline;padding:9px 0;
-      border-bottom:1px solid var(--line,#C7C0AF)}
-    #wrasse-run li .wr-mark{width:1.5em;flex:none;font-variant-numeric:tabular-nums;opacity:.6}
+    #wrasse-run ol{list-style:none;margin:22px 0 0;padding:0}
+    #wrasse-run li{display:flex;gap:12px;align-items:baseline;
+      background:var(--surface-2,transparent);border-radius:12px;padding:12px 14px;
+      margin:0 0 6px}
+    #wrasse-run li .wr-mark{width:1.5em;flex:none;font-variant-numeric:tabular-nums;
+      color:var(--fg-subtle,inherit)}
     #wrasse-run li .wr-body{flex:1;min-width:0}
-    #wrasse-run li .wr-detail{opacity:.68;font-size:13px}
+    #wrasse-run li .wr-detail{color:var(--fg-muted,inherit);
+      font:13px/1.5 'Geist Mono',ui-monospace,monospace}
     #wrasse-run li[data-state="running"]{font-weight:600}
     #wrasse-run li[data-state="pending"],#wrasse-run li[data-state="skipped"]{opacity:.42}
     #wrasse-run a{color:inherit}
-    #wrasse-run table{border-collapse:collapse;margin-top:18px;font-variant-numeric:tabular-nums}
-    #wrasse-run th,#wrasse-run td{text-align:left;padding:6px 22px 6px 0;
-      border-bottom:1px solid var(--line,#C7C0AF)}
-    #wrasse-run th{font-weight:600;opacity:.7}
-    #wrasse-run .wr-note{margin-top:14px;padding:10px 12px;border-left:2px solid var(--fg,#141412);
-      opacity:.85;max-width:74ch}
-    #wrasse-run .wr-moved{font-weight:600}
+    #wrasse-run table{border-collapse:separate;border-spacing:0;margin-top:20px;width:100%;
+      max-width:640px;font-variant-numeric:tabular-nums;
+      background:var(--surface-2,transparent);border-radius:12px;overflow:hidden}
+    #wrasse-run th,#wrasse-run td{text-align:left;padding:10px 16px}
+    #wrasse-run th{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.14em;
+      text-transform:uppercase;color:var(--fg-subtle,inherit)}
+    #wrasse-run td{font:13px/1.5 'Geist Mono',ui-monospace,monospace}
+    #wrasse-run .wr-note{margin-top:16px;padding:14px 16px;border-radius:12px;
+      background:var(--surface-2,transparent);color:var(--fg-muted,inherit);max-width:74ch}
+    #wrasse-run .wr-moved{color:var(--fg-strong,inherit);font-weight:700}
   </style>
 
   <div class="wr-card">
+    <div class="wr-eyebrow">Perform it</div>
     <h2>Settle it yourself, on Base Sepolia</h2>
     <p id="wr-intro">
       Everything above is memory and arithmetic. This performs it: four transactions on a public
@@ -299,5 +329,6 @@
   }
 
   boot();
+
 })();
 </script>
