@@ -28,5 +28,20 @@
     "name": "the refusal shown is the one the engine produced",
     "old": "        const budget = (Array.isArray(warm.profiles) ? warm.profiles : []).filter(function (p) { return !p.agreed; })[0];",
     "new": "        const budget = (Array.isArray((st.simData || warm).profiles) ? (st.simData || warm).profiles : []).filter(function (p) { return !p.agreed; })[0];"
+  },
+  {
+    "name": "the live quote says what it is and what it proves",
+    "old": "      <div style=\"margin-top:12px;font:500 11px/1.5 Inter,sans-serif;color:var(--fg-muted);max-width:72ch;text-wrap:pretty\">Set a job below. It gets quoted twice: with memory, and with none.</div>",
+    "new": "      <div style=\"margin-top:16px;padding:12px 14px;background:var(--surface-2);border-radius:12px;max-width:78ch;font:500 12px/1.6 Inter,sans-serif;color:var(--fg-muted);text-wrap:pretty\"><b style=\"color:var(--fg-strong)\">The live quote.</b> Every number below is produced from two transactions that really settled on Base Sepolia, and each receipt links to the block explorer. This is the tab where the claim can be checked, and the only one where you can settle a deal yourself.</div>\n      <div style=\"margin-top:12px;font:500 11px/1.5 Inter,sans-serif;color:var(--fg-muted);max-width:72ch;text-wrap:pretty\">Set a job below. It gets quoted twice: with memory, and with none.</div>"
+  },
+  {
+    "name": "the simulator says what it is and what it cannot prove",
+    "old": "  <sc-if value=\"{{ isSim }}\" hint-placeholder-val=\"{{ false }}\">\n    <div style=\"margin-top:16px\">",
+    "new": "  <sc-if value=\"{{ isSim }}\" hint-placeholder-val=\"{{ false }}\">\n    <div style=\"margin-top:16px;padding:12px 14px;background:var(--surface-2);border-radius:12px;max-width:78ch;font:500 12px/1.6 Inter,sans-serif;color:var(--fg-muted);text-wrap:pretty\"><b style=\"color:var(--fg-strong)\">A what-if, not a record.</b> You choose the history and the two agents negotiate from it, using the same engine and the same readings of an outcome they really hold. Nothing here happened on any chain, so nothing here has a receipt to check. It shows the rule holds for histories the real one never produced.</div>\n    <div style=\"margin-top:16px\">"
+  },
+  {
+    "name": "the argument says where its numbers can be verified",
+    "old": "  <sc-if value=\"{{ story.show }}\" hint-placeholder-val=\"{{ false }}\">\n    <section style=\"margin-top:18px;background:var(--surface);padding:20px 18px;border-radius:16px\">",
+    "new": "  <sc-if value=\"{{ story.show }}\" hint-placeholder-val=\"{{ false }}\">\n    <div style=\"margin-top:16px;padding:12px 14px;background:var(--surface-2);border-radius:12px;max-width:78ch;font:500 12px/1.6 Inter,sans-serif;color:var(--fg-muted);text-wrap:pretty\"><b style=\"color:var(--fg-strong)\">The argument, in plain words.</b> Every number it cites appears again on the live quote, where you can open the transaction behind it.</div>\n    <section style=\"margin-top:18px;background:var(--surface);padding:20px 18px;border-radius:16px\">"
   }
 ]
