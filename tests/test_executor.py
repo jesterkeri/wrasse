@@ -408,7 +408,7 @@ def test_a_timeout_is_produced_rather_than_asserted(environment):
     seen: list[int] = []
     run = make_run(environment)
     run.outcome = executor.TIMEOUT
-    run.steps = [executor.Step(n, l) for n, l in executor.SHAPES[executor.TIMEOUT]]
+    run.steps = [executor.Step(*step) for step in executor.SHAPES[executor.TIMEOUT]]
     _waiting_chain(chain, [900, 950, 1010, 1010, 1010, 1010], seen).execute(run)
 
     assert run.status == executor.SUCCEEDED, run.error
@@ -428,7 +428,7 @@ def test_a_delayed_claim_delivers_first_then_waits(environment):
     seen: list[int] = []
     run = make_run(environment)
     run.outcome = executor.DELAYED
-    run.steps = [executor.Step(n, l) for n, l in executor.SHAPES[executor.DELAYED]]
+    run.steps = [executor.Step(*step) for step in executor.SHAPES[executor.DELAYED]]
     _waiting_chain(chain, [1500, 1900, 2010, 2010, 2010, 2010], seen).execute(run)
 
     assert run.status == executor.SUCCEEDED, run.error
@@ -455,7 +455,7 @@ def test_the_wait_is_measured_against_the_chain_and_the_deal(environment):
     asked = []
     run = make_run(environment)
     run.outcome = executor.TIMEOUT
-    run.steps = [executor.Step(n, l) for n, l in executor.SHAPES[executor.TIMEOUT]]
+    run.steps = [executor.Step(*step) for step in executor.SHAPES[executor.TIMEOUT]]
 
     times = iter([900, 1010, 1010, 1010, 1010])
     Runner(
