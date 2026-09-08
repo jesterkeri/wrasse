@@ -58,5 +58,40 @@
     "name": "the tab is deep-linkable and stamped on first paint",
     "old": "      view: url.view, clamped: url.clamped, stage: (deepLinked || seen) ? 'app' : 'story'",
     "new": "      view: url.view, clamped: url.clamped,\n      // A tab you cannot link to is a tab you cannot show anybody. `?stage=` names it,\n      // and the body is stamped on the first paint as well as on every later click so\n      // a panel outside this runtime does not have to wait for one.\n      //\n      // The site always opens on the argument. It used to remember that you had seen\n      // it and skip straight to the quote, which is right for the person who built it\n      // and wrong for everybody else: a judge arriving at a screen of numbers with no\n      // reason to care about them is the one visit that has to go well. A link that\n      // carries a job is still a link to that job, because someone sent it on purpose.\n      stage: (function () {\n        const asked = new URLSearchParams(location.search).get('stage');\n        const stage = (asked === 'sim' || asked === 'story' || asked === 'app') ? asked\n          : (deepLinked ? 'app' : 'story');\n        try { document.body.setAttribute('data-stage', stage); } catch (e) { /* no dom */ }\n        return stage;\n      })()"
+  },
+  {
+    "name": "the live quote's form speaks ETH, per cent and minutes",
+    "old": "const DEFAULT_BASELINE = { price_wei: 100000000000000, provider_bond_bps: 500, service_window: 600, payout_delay: 1800 };",
+    "new": "const DEFAULT_BASELINE = { price_wei: 100000000000000, provider_bond_bps: 500, service_window: 600, payout_delay: 1800 };\n\n// The form asks in ETH, per cent and minutes; the engine and the contract are told wei, basis\n// points and seconds. Nothing required the reader to do that conversion in their head: the\n// contract wants those units at the moment of signing, not at the moment of typing, and Sibyl\n// has no opinion on units at all.\n//\n// ETH goes through the decimal string rather than a float. A float cannot hold eighteen\n// significant figures, so 0.1 ETH would become 99999999999999998 wei and the page would be\n// quietly lying about the number it sent.\nfunction ethToWei(text) {\n  const m = /^\\s*([0-9]*)(?:\\.([0-9]*))?\\s*$/.exec(String(text));\n  if (!m || (!m[1] && !m[2])) return null;\n  let frac = (m[2] || '').slice(0, 18);\n  while (frac.length < 18) frac += '0';\n  const digits = ((m[1] || '0') + frac).replace(/^0+(?=[0-9])/, '');\n  return digits === '' ? '0' : digits;\n}\nfunction weiToEth(wei) {\n  let s = String(wei);\n  while (s.length < 19) s = '0' + s;\n  const whole = s.slice(0, -18).replace(/^0+(?=[0-9])/, '');\n  const frac = s.slice(-18).replace(/0+$/, '');\n  return frac ? whole + '.' + frac : whole;\n}\nfunction toMachine(f, text) {\n  const raw = String(text === undefined ? '' : text).trim().replace(/[_,\\s]/g, '');\n  if (raw === '') return null;\n  if (f.unit === 'eth') return ethToWei(raw);\n  const n = Number(raw);\n  if (!isFinite(n) || n < 0) return null;\n  return String(Math.round(f.unit === 'pct' ? n * 100 : n * 60));\n}\nfunction toHuman(f, machine) {\n  if (f.unit === 'eth') return weiToEth(machine);\n  return String(Number(machine) / (f.unit === 'pct' ? 100 : 60));\n}\n//: What each box is asking for, said in the box rather than left to be guessed.\nconst ASKS = { eth: 'in ETH', pct: 'in % of the price', dur: 'in minutes' };"
+  },
+  {
+    "name": "the live quote parses what the reader typed",
+    "old": "      const text = String(raw[f.name] === undefined ? '' : raw[f.name]).trim().replace(/[_,\\s]/g, '');\n      if (!/^\\d+$/.test(text)) return { error: 'A value of \"' + raw[f.name] + '\" for ' + f.plain + ' is not a whole number this engine can read.', next: f.name + ' runs ' + f.bound + '. Nothing was computed and your input is unchanged.' };\n      const n = Number(text);",
+    "new": "      const converted = toMachine(f, raw[f.name]);\n      if (converted === null) return { error: 'A value of \"' + raw[f.name] + '\" for ' + f.plain + ' is not a number this engine can read.', next: f.plain + ' is asked for ' + ASKS[f.unit] + '. Nothing was computed and your input is unchanged.' };\n      const text = converted;\n      const n = Number(text);"
+  },
+  {
+    "name": "a link's numbers are shown the way they were typed",
+    "old": "    FIELDS.forEach(function (f) { texts[f.name] = String(url.baseline[f.name]); });",
+    "new": "    FIELDS.forEach(function (f) { texts[f.name] = toHuman(f, url.baseline[f.name]); });"
+  },
+  {
+    "name": "going back shows them the same way",
+    "old": "      FIELDS.forEach(function (f) { t[f.name] = String(u.baseline[f.name]); });",
+    "new": "      FIELDS.forEach(function (f) { t[f.name] = toHuman(f, u.baseline[f.name]); });"
+  },
+  {
+    "name": "restoring shows them the same way",
+    "old": "    FIELDS.forEach(function (f) { texts[f.name] = String(DEFAULT_BASELINE[f.name]); });",
+    "new": "    FIELDS.forEach(function (f) { texts[f.name] = toHuman(f, DEFAULT_BASELINE[f.name]); });"
+  },
+  {
+    "name": "the hint under each box shows the exact value that will be sent",
+    "old": "      const readable = /^\\d+$/.test(text) && n >= f.min && n <= f.max\n        ? f.bound + ', that is ' + (f.unit === 'pct' ? pct(n) : (f.unit === 'eth' ? eth(n) : dur(n)))\n        : f.range;",
+    "new": "      // Turned around. The box takes the readable number now, so the hint carries the exact\n      // value that reaches the engine: nothing is hidden, and a reader checking a transaction\n      // against this page still finds the number they are looking at.\n      const machine = toMachine(f, text);\n      const readable = machine !== null && Number(machine) >= f.min && Number(machine) <= f.max\n        ? f.name + ' = ' + machine + (f.unit === 'pct' ? ' bps' : (f.unit === 'eth' ? ' wei' : ' s'))\n        : ASKS[f.unit] + ', ' + f.range;"
+  },
+  {
+    "name": "the label above each box names the unit, not the field twice",
+    "old": "        name: f.name, plain: f.plain, bound: readable, value: pick(st.baseline[f.name], String(DEFAULT_BASELINE[f.name])),",
+    "new": "        // The small label used to repeat the field's name, which the hint underneath now\n        // carries along with its exact value. Saying what unit the box wants is the thing\n        // a reader actually needs before they type.\n        name: ASKS[f.unit], plain: f.plain, bound: readable,\n        value: pick(st.baseline[f.name], toHuman(f, DEFAULT_BASELINE[f.name])),"
   }
 ]
