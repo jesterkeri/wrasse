@@ -627,3 +627,134 @@ def test_health_says_this_deployment_signs_when_it_does(executing):
     body = client.get("/api/health").json()
     assert body["signs"] is True and body["holds_keys"] is True
     assert body["execution_enabled"] is True
+
+
+# ------------------------------------------------------------------------------------------
+# Simulation: what these two agents would settle on, given a history a visitor chose.
+# ------------------------------------------------------------------------------------------
+
+
+def test_no_history_settles_everything_at_the_baseline(service):
+    """Two strangers. Nothing to hold against each other, so no term moves.
+
+    This is the control the rest of the simulation is read against: every later difference has
+    to be attributable to an outcome the visitor added, and that is only true if the empty
+    history is genuinely inert.
+    """
+
+    client, _ = service
+    body = client.post("/api/simulate", json={"history": []}).json()
+
+    assert body["simulated"] is True
+    assert body["memories"]["buyer"]["risk"] == "0.0000"
+    assert body["memories"]["provider"]["risk"] == "0.0000"
+    for profile in body["profiles"]:
+        assert profile["agreed"]
+        assert profile["terms"] == {
+            "price_wei": 100_000_000_000_000, "provider_bond_bps": 500,
+            "service_window": 600, "payout_delay": 1_800,
+        }
+
+
+def test_the_history_that_really_happened_reproduces_the_live_quote(service):
+    """The strongest thing this simulator can be asked to prove.
+
+    Given the outcomes these two memories actually hold, the simulation has to produce the same
+    terms the live quote produces from the receipts themselves. If it did not, it would be
+    predicting a system nobody is running, and the difference would be invisible until a judge
+    put the two screens side by side.
+    """
+
+    client, _ = service
+    live = client.post("/api/quote", json={"memory": True}).json()
+    simulated = client.post(
+        "/api/simulate", json={"history": ["timeout_claimed_without_delivery"]}
+    ).json()
+
+    def terms(body):
+        return {p["id"]: (p["terms"] if p["agreed"] else p["failed_on"]) for p in body["profiles"]}
+
+    assert terms(simulated) == terms(live)
+    assert simulated["memories"]["buyer"]["risk"] == live["memories"]["buyer"]["risk"]
+
+
+def test_an_outcome_neither_memory_can_read_is_refused_by_name(service):
+    """Not scored as zero, which would say it was harmless.
+
+    A dimension is learned once from an outcome that really settled. Until one does, the honest
+    answer is that this history cannot be priced, and it has to name which outcome and why.
+    Silently contributing nothing would make an unknown look like a neutral, and the whole
+    argument here is that the engine says what it is doing.
+    """
+
+    client, _ = service
+    response = client.post(
+        "/api/simulate", json={"history": ["delivered_and_released_by_buyer"]}
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "delivered_and_released_by_buyer" in detail["error"]
+    assert "harmless" in detail["error"]
+    assert "delivered_and_released_by_buyer" in detail["outcomes"]
+
+
+def test_an_outcome_the_escrow_cannot_produce_is_refused(service):
+    """The closed set is the contract's, so a simulation cannot explore a world it could not
+    reach. Free text here would let the page invent an outcome and price it."""
+
+    client, _ = service
+    response = client.post("/api/simulate", json={"history": ["seller_was_rude"]})
+    assert response.status_code == 422
+    assert "not an outcome this escrow can produce" in response.json()["detail"]["error"]
+
+
+def test_a_history_longer_than_the_bound_is_refused(service):
+    client, _ = service
+    response = client.post(
+        "/api/simulate", json={"history": ["timeout_claimed_without_delivery"] * 13}
+    )
+    assert response.status_code == 422
+    assert "at most" in response.json()["detail"]["error"]
+
+
+def test_simulating_writes_nothing_to_either_memory(service):
+    """A simulation that could deposit a receipt would make every later quote unfalsifiable.
+
+    Checked by file hash rather than by reading the code, because the property is about what
+    the whole request did and not about what one function intended.
+    """
+
+    import hashlib
+
+    client, warm = service
+
+    def fingerprint():
+        digest = hashlib.sha256()
+        for path in sorted(warm.iterdir()):
+            if path.is_file():
+                digest.update(path.name.encode())
+                digest.update(path.read_bytes())
+        return digest.hexdigest()
+
+    client.post("/api/quote", json={"memory": True})  # settle any first-open writes
+    before = fingerprint()
+    for history in ([], ["timeout_claimed_without_delivery"], ["timeout_claimed_without_delivery"] * 3):
+        assert client.post("/api/simulate", json={"history": history}).status_code == 200
+    assert fingerprint() == before
+
+
+def test_the_same_history_simulates_to_the_same_document_twice(service):
+    """A simulated result a reader cannot reproduce is an assertion, not a demonstration.
+
+    The identifiers behind hypothetical outcomes are derived from their position and type
+    rather than minted randomly, which is what makes the policy hash stable across two
+    identical requests.
+    """
+
+    client, _ = service
+    body = {"history": ["timeout_claimed_without_delivery", "timeout_claimed_without_delivery"]}
+    first = client.post("/api/simulate", json=body).json()
+    second = client.post("/api/simulate", json=body).json()
+
+    hashes = lambda d: [p.get("policy_hash") for p in d["profiles"]]  # noqa: E731
+    assert hashes(first) == hashes(second)

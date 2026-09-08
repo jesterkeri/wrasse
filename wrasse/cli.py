@@ -1800,6 +1800,7 @@ def quote_document(
     executability: dict,
     inclusion_margin: int,
     stores: dict[str, WrasseStore] | None = None,
+    quote: "BilateralQuote | None" = None,
 ) -> dict:
     """One quote, as the document a reader receives.
 
@@ -1839,7 +1840,11 @@ def quote_document(
         )
 
     stores = stores or _open_stores(buyer=buyer, provider=provider)
-    quote = _bilateral_quote(
+    # A caller may supply the quote instead of having it recalled. The simulator does: its
+    # history is chosen rather than remembered, and everything after this point, the
+    # settlement, the limits, the commitment and the contract validity check, has to be the
+    # same code or the simulated answer stops predicting the real one.
+    quote = quote or _bilateral_quote(
         stores, buyer=buyer, provider=provider,
         base_price_wei=base_price_wei, base_bond_bps=base_bond_bps,
         base_service_window=service_window, base_payout_delay=payout_delay,

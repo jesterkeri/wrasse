@@ -76,7 +76,7 @@ from pydantic import BaseModel, Field
 
 from sibyl_memory_client import MemoryClient
 
-from . import cli, executor, sessions
+from . import cli, executor, sessions, simulate as simulation
 from .evidence import CHAIN_EVENT_CATEGORY
 from .page import page_view
 from .store import persona_digest
@@ -536,6 +536,85 @@ def run_status(run_id: str) -> dict:
     if run is None:
         raise HTTPException(status_code=404, detail="no such run")
     return run.view(position=_queue().position(run_id))
+
+
+class SimulateRequest(BaseModel):
+    """A baseline and a history the visitor chose, rather than one that happened."""
+
+    baseline: Baseline = Field(default_factory=Baseline)
+    #: Outcomes in the order they occurred. An empty list is two strangers, which is the
+    #: control the rest of the simulation is read against.
+    history: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/simulate")
+def simulate(request: SimulateRequest) -> JSONResponse:
+    """What these two agents would settle on, given a history you set.
+
+    Real engine, real settlement rule, real persona, real ontology, hypothetical outcomes. It
+    is the same document writer the live quote uses, so the two cannot drift: a simulation that
+    predicted something the live path would not produce would be worse than no simulation.
+
+    Stateless on purpose. The history arrives with every request, so clearing it is a client
+    deleting a list rather than a server forgetting something, and two visitors simulating at
+    once cannot see each other's history.
+    """
+
+    stores = _open(WARM)
+    try:
+        quote = simulation.simulated_quote(
+            stores=stores,
+            buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
+            provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
+            outcomes=request.history,
+            base_price_wei=request.baseline.price_wei,
+            base_bond_bps=request.baseline.provider_bond_bps,
+            base_service_window=request.baseline.service_window,
+            base_payout_delay=request.baseline.payout_delay,
+            persona=cli._provider_persona(stores["provider"]),
+            quote_class=cli.BilateralQuote,
+        )
+    except simulation.SimulationRefused as error:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": str(error), "outcomes": list(simulation.OUTCOMES)},
+        ) from error
+
+    basis = cli.TimeBasis(1_788_666_320, 1_788_666_920, None, 0)
+    try:
+        document = cli.quote_document(
+            buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
+            provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
+            base_price_wei=request.baseline.price_wei,
+            base_bond_bps=request.baseline.provider_bond_bps,
+            service_window=request.baseline.service_window,
+            payout_delay=request.baseline.payout_delay,
+            basis=basis,
+            executability=cli._executability(_SuppliedTime(), basis),
+            inclusion_margin=0,
+            stores=stores,
+            quote=quote,
+        )
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": str(error),
+                "baseline_bounds": {
+                    field: list(bounds) for field, bounds in BASELINE_BOUNDS.items()
+                },
+            },
+        ) from error
+
+    body = page_view(document, memory=bool(request.history))
+    # Said in the response as well as in the module, because this is the boundary a reader
+    # crosses. A document with a policy hash and no marking is one somebody will eventually
+    # try to sign, and the hash over a history that never happened is a real hash of a
+    # fiction.
+    body["simulated"] = True
+    body["history"] = list(request.history)
+    body["outcomes_available"] = list(simulation.OUTCOMES)
+    return JSONResponse(body)
 
 
 class _SuppliedTime:
