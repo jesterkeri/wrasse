@@ -38,12 +38,25 @@
     #wrasse-run .wr-eyebrow{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
       text-transform:uppercase;color:var(--fg-subtle,inherit);margin:0 0 10px}
     #wrasse-run .wr-controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:20px 0 0}
-    #wrasse-run label{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
+    #wrasse-run .wr-legend{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
       text-transform:uppercase;color:var(--fg-subtle,inherit)}
-    #wrasse-run select{border:1px solid var(--line-strong,#c4c4cc);border-radius:8px;
-      background:var(--bg,#fff);color:var(--fg,#141412);
-      font:700 13px/1.4 'Geist Mono',ui-monospace,monospace;padding:12px 14px;min-height:44px;
-      cursor:pointer}
+    /* A native select cannot be styled where it matters. Its option list is drawn by the
+       operating system, so the open menu arrived with a grey highlight and a system font in
+       the middle of a page that had agreed on neither. There is no CSS that fixes that.
+
+       The design already answers this question elsewhere on the page, with a segmented
+       control for the memory switch, so this uses that answer rather than inventing a second
+       one: active is `--fg-strong` on `--bg`, inactive is transparent on `--fg-muted`, 11px
+       Inter at 0.14em, 36px minimum. Three profiles fit a segment each, and nothing about it
+       is drawn by the operating system. */
+    #wrasse-run .wr-segmented{display:inline-flex;border:1px solid var(--line-strong,#c4c4cc);
+      border-radius:10px;overflow:hidden}
+    #wrasse-run .wr-segmented button{border:0;cursor:pointer;padding:0 18px;min-height:36px;
+      background:transparent;color:var(--fg-muted,inherit);
+      font:600 11px/1.15 Inter,sans-serif;letter-spacing:0.14em;text-transform:uppercase;
+      white-space:nowrap}
+    #wrasse-run .wr-segmented button[aria-pressed="true"]{background:var(--fg-strong,#000);
+      color:var(--bg,#fff)}
     #wrasse-run button.wr-go{flex:0 0 auto;min-width:230px;min-height:52px;padding:15px 14px;
       border:2px solid var(--line-strong,#c4c4cc);border-radius:12px;
       background:var(--primary,var(--fg,#141412));color:var(--on-primary,var(--bg,#fff));
@@ -84,12 +97,12 @@
       rather than merely mined.
     </p>
     <div class="wr-controls" id="wr-controls" hidden>
-      <label for="wr-profile">Profile</label>
-      <select id="wr-profile">
-        <option value="urgent">urgent</option>
-        <option value="sensitive">sensitive</option>
-        <option value="budget">budget</option>
-      </select>
+      <span class="wr-legend">Profile</span>
+      <span class="wr-segmented" id="wr-profile" role="group" aria-label="Profile">
+        <button type="button" data-profile="urgent" aria-pressed="true">urgent</button>
+        <button type="button" data-profile="sensitive" aria-pressed="false">sensitive</button>
+        <button type="button" data-profile="budget" aria-pressed="false">budget</button>
+      </span>
       <button class="wr-go" id="wr-go" type="button">Run it on Base</button>
       <span id="wr-queue" class="wr-detail"></span>
     </div>
@@ -116,7 +129,8 @@
   var stepList = document.getElementById('wr-steps');
   var outcome = document.getElementById('wr-outcome');
   var button = document.getElementById('wr-go');
-  var profile = document.getElementById('wr-profile');
+  var profileGroup = document.getElementById('wr-profile');
+  var chosen = 'urgent';
   var queueLabel = document.getElementById('wr-queue');
   var timer = null;
 
@@ -276,7 +290,7 @@
     outcome.innerHTML = '';
     try {
       var sessionId = await session();
-      var body = { session_id: sessionId, profile: profile.value, baseline: baseline() };
+      var body = { session_id: sessionId, profile: chosen, baseline: baseline() };
       var queued = await post('/api/execute', body);
       var runId = queued.run_id;
 
@@ -326,6 +340,15 @@
     }
     controls.hidden = false;
     button.addEventListener('click', start);
+    profileGroup.addEventListener('click', function (event) {
+      var pressed = event.target.closest('button[data-profile]');
+      if (!pressed) return;
+      chosen = pressed.getAttribute('data-profile');
+      var all = profileGroup.querySelectorAll('button[data-profile]');
+      for (var i = 0; i < all.length; i++) {
+        all[i].setAttribute('aria-pressed', all[i] === pressed ? 'true' : 'false');
+      }
+    });
   }
 
   boot();
