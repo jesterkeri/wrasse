@@ -479,6 +479,9 @@ class ExecuteRequest(BaseModel):
     session_id: str
     profile: str = Field(pattern="^(urgent|budget|sensitive)$")
     baseline: Baseline = Field(default_factory=Baseline)
+    #: Which of the three the run performs. Not a label on a result: the run actually produces
+    #: it, so what ends up in memory is a receipt for the thing that was asked for.
+    outcome: str = Field(default="released", pattern="^(released|timeout|delayed)$")
 
 
 @app.post("/api/execute")
@@ -519,6 +522,7 @@ def execute(request: ExecuteRequest) -> dict:
         run_id=run_id,
         session_id=session.session_id,
         profile=request.profile,
+        outcome=request.outcome,
         baseline=request.baseline.model_dump(),
         paths=session.paths,
         workdir=workdir,

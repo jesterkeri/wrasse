@@ -30,6 +30,8 @@ INTENTS = {
     "accept-deal": "i-accept",
     "mark-delivered": "i-deliver",
     "release-deal": "i-release",
+    "claim-timeout": "i-claim",
+    "claim-payment": "i-claim",
 }
 
 
@@ -363,3 +365,105 @@ def test_the_shipped_ceiling_admits_the_page_s_own_default_baseline(environment,
     assert settled <= executor.MAX_PRICE_WEI, (
         f"the demo settles at {settled} wei and the ceiling is {executor.MAX_PRICE_WEI}"
     )
+
+
+# ------------------------------------------------------------------------------------------
+# The two outcomes that cost real time, because the contract enforces the deadlines.
+# ------------------------------------------------------------------------------------------
+
+
+def _waiting_chain(chain: FakeChain, clock_values, seen=None):
+    """A runner whose chain clock advances through the supplied values.
+
+    `seen` collects every reading. Asserting the command order alone did not test the wait at
+    all: with the wait deleted the sequence is identical and only the timing changes, so two
+    mutations survived until these tests started counting how many times the clock was asked.
+    """
+
+    times = iter(clock_values)
+
+    def now():
+        value = next(times)
+        if seen is not None:
+            seen.append(value)
+        return value
+
+    return Runner(
+        command=chain, deal_id_reader=lambda tx_hash: 7,
+        balance_reader=lambda: RICH,
+        deal_reader=lambda deal_id: {"deadline": 1000, "payout_available_at": 2000},
+        chain_now=now, sleep=lambda _: None, clock=bounded_clock(),
+    )
+
+
+def test_a_timeout_is_produced_rather_than_asserted(environment):
+    """Nothing is delivered, the window runs out, and the buyer takes the deal back.
+
+    The point of doing it this way is that the receipt at the end is the outcome. A page that
+    let a visitor declare a timeout would be teaching a memory something nobody could check,
+    which is the one thing this design refuses.
+    """
+
+    chain = FakeChain()
+    seen: list[int] = []
+    run = make_run(environment)
+    run.outcome = executor.TIMEOUT
+    run.steps = [executor.Step(n, l) for n, l in executor.SHAPES[executor.TIMEOUT]]
+    _waiting_chain(chain, [900, 950, 1010, 1010, 1010, 1010], seen).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    # It waited: the clock was read while the deadline was still ahead, more than once, and the
+    # claim only went out once a reading was past it.
+    assert seen[:3] == [900, 950, 1010]
+    lifecycle = [name for name in chain.commands() if name != "tx-resolve"]
+    assert lifecycle == ["policy", "create-deal", "accept-deal", "claim-timeout", "reconcile"]
+    assert "mark-delivered" not in chain.commands()
+    assert "release-deal" not in chain.commands()
+
+
+def test_a_delayed_claim_delivers_first_then_waits(environment):
+    """Delivered, not released, and the seller waits out the delay it agreed to."""
+
+    chain = FakeChain()
+    seen: list[int] = []
+    run = make_run(environment)
+    run.outcome = executor.DELAYED
+    run.steps = [executor.Step(n, l) for n, l in executor.SHAPES[executor.DELAYED]]
+    _waiting_chain(chain, [1500, 1900, 2010, 2010, 2010, 2010], seen).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    # And it waited on the payment delay, which is a later deadline than the delivery window.
+    assert seen[:3] == [1500, 1900, 2010]
+    lifecycle = [name for name in chain.commands() if name != "tx-resolve"]
+    assert lifecycle == [
+        "policy", "create-deal", "accept-deal", "mark-delivered", "claim-payment", "reconcile"
+    ]
+    assert "release-deal" not in chain.commands()
+
+
+def test_the_wait_is_measured_against_the_chain_and_the_deal(environment):
+    """Not against this machine's clock, and not against the terms.
+
+    A deadline is enforced by the block that mines the transaction, and the window runs from
+    the block that mined the acceptance rather than from when this process sent it. A wait
+    derived from either of the convenient wrong sources is a transaction that reverts for a
+    reason nobody can see afterwards.
+    """
+
+    chain = FakeChain()
+    INTENTS["claim-timeout"] = "i-claim"
+    asked = []
+    run = make_run(environment)
+    run.outcome = executor.TIMEOUT
+    run.steps = [executor.Step(n, l) for n, l in executor.SHAPES[executor.TIMEOUT]]
+
+    times = iter([900, 1010, 1010, 1010, 1010])
+    Runner(
+        command=chain, deal_id_reader=lambda tx_hash: 7, balance_reader=lambda: RICH,
+        deal_reader=lambda deal_id: (asked.append(deal_id) or
+                                     {"deadline": 1000, "payout_available_at": 2000}),
+        chain_now=lambda: next(times), sleep=lambda _: None, clock=bounded_clock(),
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert asked == [7], "the deadline must come from the deal the contract is holding"

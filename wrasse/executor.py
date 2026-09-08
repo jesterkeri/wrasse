@@ -71,18 +71,53 @@ REFUSED = "refused"
 #: Step states, reported per entry of `STEPS`.
 PENDING, DONE, SKIPPED = "pending", "done", "skipped"
 
-#: The steps a judge sees, in order, with the label each one is rendered under. Declared here
-#: rather than assembled during the run so the page can draw the whole list before anything has
-#: happened, which is what makes a queued run legible instead of blank.
-STEPS: tuple[tuple[str, str], ...] = (
-    ("quote", "Settle the terms from both memories"),
-    ("create", "Buyer opens the deal and escrows the price"),
-    ("accept", "Provider accepts and posts the bond"),
-    ("deliver", "Provider marks the work delivered"),
-    ("release", "Buyer releases the payment"),
-    ("confirm", "Base confirms the outcome at the safe head"),
-    ("teach", "Both memories record what happened"),
-)
+#: The three outcomes the escrow can actually produce, and the only three a run may aim at.
+#: Named for what happens rather than for the call that ends it, because the visitor is picking
+#: a story and not a function.
+RELEASED, TIMEOUT, DELAYED = "released", "timeout", "delayed"
+
+#: The steps a run walks, per outcome, with the label each is rendered under. Declared up front
+#: so the page can draw the whole list before anything has happened, which is what makes a
+#: queued run legible instead of blank.
+#:
+#: The two failures cost real time and the contract is why. `claimTimeout` requires the
+#: service window to have passed and `claimPayment` requires the payout delay to have passed,
+#: both measured in block time, so a history containing either one has to be waited for rather
+#: than asserted. Set those two durations short and a failure costs a couple of minutes; set
+#: them long and it costs exactly as long as you asked for.
+SHAPES: dict[str, tuple[tuple[str, str], ...]] = {
+    RELEASED: (
+        ("quote", "Settle the terms from both memories"),
+        ("create", "Buyer opens the deal and escrows the price"),
+        ("accept", "Provider accepts and posts the bond"),
+        ("deliver", "Provider marks the work delivered"),
+        ("release", "Buyer releases the payment"),
+        ("confirm", "Base confirms the outcome at the safe head"),
+        ("teach", "Both memories record what happened"),
+    ),
+    TIMEOUT: (
+        ("quote", "Settle the terms from both memories"),
+        ("create", "Buyer opens the deal and escrows the price"),
+        ("accept", "Provider accepts and posts the bond"),
+        ("wait", "Nothing is delivered. Waiting out the window the seller agreed to"),
+        ("claim", "Buyer claims the deal back after the deadline"),
+        ("confirm", "Base confirms the outcome at the safe head"),
+        ("teach", "Both memories record what happened"),
+    ),
+    DELAYED: (
+        ("quote", "Settle the terms from both memories"),
+        ("create", "Buyer opens the deal and escrows the price"),
+        ("accept", "Provider accepts and posts the bond"),
+        ("deliver", "Provider marks the work delivered"),
+        ("wait", "The buyer does not release. Waiting out the agreed payment delay"),
+        ("claim", "Seller claims its payment once the delay has passed"),
+        ("confirm", "Base confirms the outcome at the safe head"),
+        ("teach", "Both memories record what happened"),
+    ),
+}
+
+#: Kept for callers that still ask for the shape of an ordinary settlement.
+STEPS: tuple[tuple[str, str], ...] = SHAPES[RELEASED]
 
 #: What a refund does, as one visible step. Its own list because a refund is not a
 #: settlement: nothing is negotiated, nothing is remembered, and the only thing it produces is
@@ -187,6 +222,9 @@ class Run:
     paths: dict[str, Path]
     workdir: Path
     kind: str = SETTLEMENT
+    #: Which of the three the run is aiming at. A choice, not a description: the run performs
+    #: it rather than asserting it, so the receipt at the end is the outcome.
+    outcome: str = RELEASED
     status: str = QUEUED
     error: str | None = None
     deal_id: int | None = None
@@ -199,7 +237,7 @@ class Run:
 
     def __post_init__(self) -> None:
         if not self.steps:
-            shape = REFUND_STEPS if self.kind == REFUND else STEPS
+            shape = REFUND_STEPS if self.kind == REFUND else SHAPES[self.outcome]
             self.steps = [Step(name, label) for name, label in shape]
 
     def step(self, name: str) -> Step:
@@ -213,6 +251,7 @@ class Run:
             "run_id": self.run_id,
             "session_id": self.session_id,
             "kind": self.kind,
+            "outcome": self.outcome,
             "profile": self.profile,
             "refund_to": self.refund_to,
             "refund_wei": self.refund_wei,
@@ -260,6 +299,26 @@ def _default_balance_reader() -> dict[str, int]:
     }
 
 
+def _default_deal_reader(deal_id: int) -> dict[str, Any]:
+    from . import cli
+    from .escrow import read_deal
+
+    return read_deal(cli._web3(), cli._required_env("WRASSE_ESCROW_ADDRESS"), deal_id)
+
+
+def _default_chain_now() -> int | None:
+    """Block time, never local time.
+
+    A deadline is enforced by the block that mines the transaction, so a wait measured against
+    this machine's clock would be measuring the wrong thing. Two seconds of drift is the
+    difference between claiming a timeout and having it reverted.
+    """
+
+    from . import cli
+
+    return cli._chain_now(cli._web3())
+
+
 def _default_deal_id_reader(tx_hash: str) -> int:
     from . import cli
     from .escrow import deal_id_from_receipt
@@ -282,12 +341,16 @@ class Runner:
         command: Callable[..., tuple[int, str, str]] | None = None,
         deal_id_reader: Callable[[str], int] | None = None,
         balance_reader: Callable[[], dict[str, int]] | None = None,
+        deal_reader: Callable[[int], dict[str, Any]] | None = None,
+        chain_now: Callable[[], int | None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._command = command or _default_command
         self._deal_id = deal_id_reader or _default_deal_id_reader
         self._balances = balance_reader or _default_balance_reader
+        self._deal = deal_reader or _default_deal_reader
+        self._chain_now = chain_now or _default_chain_now
         self._sleep = sleep
         self._clock = clock
 
@@ -372,10 +435,22 @@ class Runner:
             self._quote(run)
             self._create(run)
             self._accept(run)
-            self._deliver(run)
-            release = self._release(run)
-            self._confirm(run, release)
-            self._teach(run, release)
+            if run.outcome == TIMEOUT:
+                # Nothing is delivered. This is the buyer's grievance, and the only way to
+                # produce it is to let the window the seller agreed to actually run out.
+                self._wait_for(run, "deadline", "the delivery window")
+                ending = self._claim(run, "claim-timeout", "the buyer took the deal back")
+            elif run.outcome == DELAYED:
+                self._deliver(run)
+                # Delivered, and the buyer does not release. The seller has to wait out the
+                # delay it agreed to before the contract will pay it.
+                self._wait_for(run, "payout_available_at", "the payment delay")
+                ending = self._claim(run, "claim-payment", "the seller took its payment")
+            else:
+                self._deliver(run)
+                ending = self._release(run)
+            self._confirm(run, ending)
+            self._teach(run, ending)
         except _Refused:
             # Every later step is marked skipped rather than pending, so the page does not
             # draw a run that looks like it is still going to do something.
@@ -441,6 +516,41 @@ class Runner:
         return cli._required_env(
             "WRASSE_BUYER_ADDRESS" if role == "buyer" else "WRASSE_PROVIDER_A_ADDRESS"
         )
+
+    def _wait_for(self, run: Run, field: str, what: str) -> None:
+        """Hold until the chain's own clock passes a deadline the contract will check.
+
+        Read from the deal rather than computed from the terms. The window runs from the block
+        that mined the acceptance, not from when this process sent it, and a wait derived from
+        the wrong start is a transaction that reverts for a reason nobody can see afterwards.
+
+        The margin is a block, because the transaction is mined after it is sent.
+        """
+
+        step = self._begin(run, "wait")
+        deal = self._deal(run.deal_id)
+        until = int(deal[field]) + 4
+        deadline = self._clock() + CONFIRMATION_TIMEOUT
+        while True:
+            now = self._chain_now()
+            if now is not None and now >= until:
+                self._end(step, detail=f"{what} has passed; the claim is now allowed")
+                return
+            if self._clock() >= deadline:
+                raise ExecutionError(f"gave up waiting for {what} to pass")
+            step.detail = (
+                f"{max(0, until - now)}s of {what} left" if now is not None
+                else "the chain's clock is unreadable"
+            )
+            self._sleep(POLL_SECONDS)
+
+    def _claim(self, run: Run, command: str, detail: str) -> dict[str, Any]:
+        step = self._begin(run, "claim")
+        sent = self._cli(run, [command, "--deal-id", str(run.deal_id)])
+        step.tx_hash = sent.get("tx_hash")
+        self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
+        self._end(step, detail=detail)
+        return sent
 
     def _skip_remaining(self, run: Run) -> None:
         for step in run.steps:
