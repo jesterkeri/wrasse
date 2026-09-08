@@ -91,7 +91,7 @@ Worth changing before opening the link, all with defaults that are already sane:
 |---|---|---|
 | `WRASSE_DEMO_MAX_PRICE_WEI` | `200000000000000` | the largest settled price a single run may move |
 | `WRASSE_DEMO_GAS_ALLOWANCE_WEI` | `20000000000000` | what a whole run is assumed to cost in gas |
-| `WRASSE_RUNS_PER_SESSION` | `3` | how many settlements one visitor may perform |
+| `WRASSE_RUNS_PER_SESSION` | `5` | how many settlements one visitor may perform |
 | `WRASSE_TOTAL_RUN_CEILING` | `400` | how many this deployment will perform at all |
 | `WRASSE_DEMO_ACCEPT_WINDOW` | `1800` | acceptance time a hosted run quotes |
 | `WRASSE_SESSION_LIMIT` | `200` | session copies kept before the oldest is deleted |
@@ -109,6 +109,27 @@ The ceiling is sized against the demo's own front page: the page opens at a base
 refuse every judge who pressed the button without changing anything. It guards against a
 visitor typing a large baseline. It does not make a nearly empty wallet safe, and nothing does
 except funding it.
+
+**The demo funds itself, so a faucet is a fallback rather than a step.** A settlement leaves
+the price and the seller's stake credited inside the escrow. At the end of a session, once the
+visitor has spent their runs or pressed finish, the service collects that credit and sends it
+to whichever of the two wallets currently holds less.
+
+The recipient is chosen rather than fixed, and the reason is arithmetic. Sending it to the
+buyer every time leaves the provider short by a stake per run; sending it to the provider every
+time leaves the buyer short by a price. Emptier-first balances the pair on its own, so the two
+of them together lose only gas, measured at roughly 0.000002 ETH across a whole four
+transaction run.
+
+It refunds at the end rather than after each run because each run teaches both memories, and
+the point of allowing five is that a visitor can watch terms move across a history they built.
+Collecting deposits between runs would put two transactions nobody asked for in the middle of
+that.
+
+**If the wallets do need topping up anyway,** use a faucet that does not require a mainnet
+balance. Chainlink's does require one, despite what an earlier note here said. QuickNode drips
+once per network every twelve hours with no account and no minimum, and ZalalenA needs no login
+at all.
 
 **Fund both wallets before opening the link.** At the demo baseline a run moves 0.000118 ETH
 out of the buyer, so a wallet holding 0.00089 ETH funds about seven runs, which is not enough

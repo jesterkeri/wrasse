@@ -104,7 +104,10 @@
         <button type="button" data-profile="budget" aria-pressed="false">budget</button>
       </span>
       <button class="wr-go" id="wr-go" type="button">Run it on Base</button>
+      <button class="wr-go" id="wr-finish" type="button" hidden
+        style="background:transparent;color:var(--fg-strong,inherit);min-width:0">Finish and take the deposits back</button>
       <span id="wr-queue" class="wr-detail"></span>
+      <span id="wr-count" class="wr-detail"></span>
     </div>
     <ol id="wr-steps" hidden></ol>
     <div id="wr-outcome"></div>
@@ -132,6 +135,8 @@
   var profileGroup = document.getElementById('wr-profile');
   var chosen = 'urgent';
   var queueLabel = document.getElementById('wr-queue');
+  var countLabel = document.getElementById('wr-count');
+  var finishButton = document.getElementById('wr-finish');
   var timer = null;
 
   function text(el, value) { el.textContent = value; }
@@ -307,6 +312,7 @@
       var body = { session_id: sessionId, profile: chosen, baseline: baseline() };
       var queued = await post('/api/execute', body);
       var runId = queued.run_id;
+      text(countLabel, 'run ' + queued.run_number + ' of ' + queued.runs_allowed);
 
       timer = setInterval(async function () {
         try {
@@ -316,6 +322,16 @@
           run.baseline = body.baseline;
           if (run.status === 'succeeded') {
             finish(null);
+            // Each run teaches both memories, so the interesting thing is what the next
+            // quote says rather than what the escrow is holding. The deposits stay put
+            // until the visitor is done with them.
+            var left = (run.session || {}).runs_left;
+            finishButton.hidden = !!(run.session || {}).refunded;
+            if (typeof left === 'number') {
+              text(countLabel, left ? left + ' more run' + (left === 1 ? '' : 's') + ' left in this session'
+                : 'that was the last run of this session');
+            }
+            if (run.refund) watchRefund(run.refund.run_id);
             await afterQuote(run);
           } else if (run.status === 'refused') {
             finish('No deal exists at this baseline for the ' + body.profile + ' profile, and '
@@ -335,6 +351,46 @@
     }
   }
 
+  async function watchRefund(runId) {
+    // The refund is a run like any other, so it is watched like one. Showing the transaction
+    // matters more than the amount: the amount is whatever the escrow was holding at
+    // execution, which is not something a page can promise in advance.
+    finishButton.hidden = true;
+    var poll = setInterval(async function () {
+      try {
+        var res = await fetch('/api/run/' + encodeURIComponent(runId));
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        var run = await res.json();
+        if (run.status === 'succeeded' || run.status === 'failed') {
+          clearInterval(poll);
+          var step = (run.steps || [])[0] || {};
+          if (run.status === 'failed') {
+            note('The deposits could not be returned: ' + (run.error || 'unknown'));
+            return;
+          }
+          var line = document.createElement('div');
+          line.className = 'wr-note';
+          text(line, 'Deposits returned to the ' + (run.refund_to || 'emptier')
+            + ' wallet, which was the emptier of the two. Nothing is left in the escrow.');
+          if (step.explorer_url) {
+            var link = document.createElement('a');
+            link.href = step.explorer_url;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.className = 'wr-detail';
+            link.style.display = 'block';
+            text(link, step.tx_hash);
+            line.appendChild(link);
+          }
+          outcome.appendChild(line);
+        }
+      } catch (error) {
+        clearInterval(poll);
+        note(String(error.message || error));
+      }
+    }, 2000);
+  }
+
   async function boot() {
     var health;
     try {
@@ -351,6 +407,20 @@
     }
     controls.hidden = false;
     button.addEventListener('click', start);
+    finishButton.addEventListener('click', async function () {
+      finishButton.disabled = true;
+      try {
+        var held = null;
+        try { held = sessionStorage.getItem('wrasse-session'); } catch (e) { held = null; }
+        if (!held) return;
+        var body = await post('/api/finish', { session_id: held });
+        watchRefund(body.run_id);
+      } catch (error) {
+        note(String(error.message || error));
+      } finally {
+        finishButton.disabled = false;
+      }
+    });
     profileGroup.addEventListener('click', function (event) {
       var pressed = event.target.closest('button[data-profile]');
       if (!pressed) return;

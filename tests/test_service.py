@@ -538,8 +538,7 @@ def executing(service, tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_QUEUE", queue)
     monkeypatch.setattr(
         module, "_SESSIONS",
-        Sessions(module._PATHS[module.WARM], root=tmp_path / "sessions",
-                 limit=10, runs_per_session=2),
+        Sessions(module._PATHS[module.WARM], root=tmp_path / "sessions", limit=10),
     )
     yield client, executed, queue
     queue.stop()
@@ -582,11 +581,13 @@ def test_a_session_cannot_run_past_its_allowance(executing):
     """Both wallets are shared and faucet-funded, so this is what stops one visitor spending
     the demo. The refusal is a 429 rather than a 403 because it is a rate, not a permission."""
 
+    from wrasse import sessions as session_module
+
     client, _, _ = executing
     session_id = client.post("/api/session").json()["session_id"]
     request = {"session_id": session_id, "profile": "urgent"}
-    assert client.post("/api/execute", json=request).status_code == 200
-    assert client.post("/api/execute", json=request).status_code == 200
+    for _ in range(session_module.RUNS_PER_SESSION):
+        assert client.post("/api/execute", json=request).status_code == 200
     refused = client.post("/api/execute", json=request)
     assert refused.status_code == 429
     assert "limit" in refused.json()["detail"]
@@ -601,13 +602,13 @@ def test_a_refused_run_is_not_charged_against_the_deployment_ceiling(executing):
     anything, which is a denial of service with no transactions in it.
     """
 
-    from wrasse import service as module
+    from wrasse import service as module, sessions as session_module
 
     client, _, _ = executing
     session_id = client.post("/api/session").json()["session_id"]
     request = {"session_id": session_id, "profile": "urgent"}
-    client.post("/api/execute", json=request)
-    client.post("/api/execute", json=request)
+    for _ in range(session_module.RUNS_PER_SESSION):
+        client.post("/api/execute", json=request)
     before = module._STARTED
     client.post("/api/execute", json=request)
     assert module._STARTED == before
@@ -758,3 +759,120 @@ def test_the_same_history_simulates_to_the_same_document_twice(service):
 
     hashes = lambda d: [p.get("policy_hash") for p in d["profiles"]]  # noqa: E731
     assert hashes(first) == hashes(second)
+
+
+# ------------------------------------------------------------------------------------------
+# Refunds: once, at the end of a session, into whichever wallet is emptier.
+# ------------------------------------------------------------------------------------------
+
+
+def test_a_session_refunds_once_however_many_times_it_is_asked(executing):
+    """Idempotent by session, and marked before the worker starts.
+
+    `withdraw` collects everything owed at execution time, so a second call moves nothing, and
+    still costs gas, and still looks to a reader like a second refund happened. A visitor who
+    presses finish twice, or who presses it after the last run already triggered one, has to
+    get the same refund back.
+    """
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+
+    first = client.post("/api/finish", json={"session_id": session_id}).json()
+    second = client.post("/api/finish", json={"session_id": session_id}).json()
+
+    assert first["already_refunded"] is False
+    assert second["already_refunded"] is True
+    assert second["run_id"] == first["run_id"]
+    assert second["refunded"] is True
+
+
+def test_the_last_run_of_a_session_refunds_without_being_asked(executing):
+    """A visitor who has spent their allowance has finished whether or not they press anything.
+
+    Leaving the escrow holding their deposits until somebody remembers is how a demo runs out
+    of money, which is the failure this whole mechanism exists to prevent.
+    """
+
+    from wrasse import sessions as session_module
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    request = {"session_id": session_id, "profile": "urgent"}
+
+    last = None
+    for _ in range(session_module.RUNS_PER_SESSION):
+        last = client.post("/api/execute", json=request).json()
+
+    deadline = time.time() + 5
+    body = {}
+    while time.time() < deadline:
+        body = client.get(f"/api/run/{last['run_id']}").json()
+        if body.get("status") == "succeeded":
+            break
+        time.sleep(0.01)
+
+    assert body["status"] == "succeeded"
+    assert body["refund"]["already_refunded"] is False
+    assert body["session"]["refunded"] is True
+    assert body["session"]["runs_left"] == 0
+
+
+def test_a_run_reports_which_number_it_is(executing):
+    """`Run 2 of 5` is the difference between a queue and a sequence a visitor is building."""
+
+    from wrasse import sessions as session_module
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    request = {"session_id": session_id, "profile": "urgent"}
+
+    first = client.post("/api/execute", json=request).json()
+    second = client.post("/api/execute", json=request).json()
+
+    assert first["run_number"] == 1
+    assert second["run_number"] == 2
+    assert first["runs_allowed"] == session_module.RUNS_PER_SESSION
+
+
+def test_a_refund_goes_to_whichever_wallet_is_emptier(tmp_path):
+    """The recipient is chosen, and the reason is arithmetic.
+
+    A settlement moves the price from the buyer to the provider and the bond from the provider
+    and back again, so the provider's credit is price plus bond. Sending it to the buyer every
+    time leaves the provider short by a bond per run; sending it to the provider every time
+    leaves the buyer short by a price. Either way one wallet drains and somebody goes looking
+    for a faucet. Emptier-first balances the pair on its own.
+    """
+
+    from wrasse import executor
+
+    os.environ["WRASSE_BUYER_ADDRESS"] = BUYER
+    os.environ["WRASSE_PROVIDER_A_ADDRESS"] = PROVIDER
+    seen = {}
+
+    def command(argv, env, timeout):
+        if argv[0] == "withdraw":
+            seen["to"] = argv[argv.index("--to") + 1]
+            return 0, json.dumps({"intent_id": "i-w", "tx_hash": "0xw", "status": "pending"}), ""
+        if argv[0] == "tx-resolve":
+            return 0, json.dumps([{"intent_id": "i-w", "status": "included_success"}]), ""
+        raise AssertionError(argv[0])
+
+    for poorer, richer in (("buyer", "provider"), ("provider", "buyer")):
+        run = executor.Run(
+            run_id="r", session_id="s", kind=executor.REFUND, profile="", baseline={},
+            paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"},
+            workdir=tmp_path,
+        )
+        runner = executor.Runner(
+            command=command,
+            balance_reader=lambda p=poorer, r=richer: {p: 1, r: 10**18},
+            sleep=lambda _: None,
+        )
+        runner.execute(run)
+        assert run.status == executor.SUCCEEDED, run.error
+        assert run.refund_to == poorer
+        assert seen["to"].lower() == os.environ[
+            "WRASSE_BUYER_ADDRESS" if poorer == "buyer" else "WRASSE_PROVIDER_A_ADDRESS"
+        ].lower()

@@ -524,7 +524,63 @@ def execute(request: ExecuteRequest) -> dict:
         workdir=workdir,
     )
     _queue().submit(run)
-    return {"run_id": run_id, "queue_position": _queue().position(run_id)}
+    return {
+        "run_id": run_id,
+        "queue_position": _queue().position(run_id),
+        "run_number": session.runs,
+        "runs_allowed": sessions.RUNS_PER_SESSION,
+    }
+
+
+class FinishRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/api/finish")
+def finish(request: FinishRequest) -> dict:
+    """Empty the escrow back into the wallets, once, at the end of a session.
+
+    Not after each run. The credits sitting in the escrow are the least interesting thing about
+    a settlement, and collecting them between runs would put two transactions nobody asked for
+    in the middle of the story a visitor is watching. They accumulate, and one refund at the
+    end returns the lot.
+
+    Idempotent by session. A visitor who presses finish twice, or who presses it after the last
+    run triggered it, gets the same refund back rather than a second one: `withdraw` collects
+    everything owed at execution, so a second call would move nothing and still cost gas and
+    still look to a reader like a second refund happened.
+    """
+
+    _require_execution()
+    session = _session_or_404(request.session_id)
+    return {**_refund(session), **session.view()}
+
+
+def _refund(session: sessions.Session) -> dict:
+    """Queue this session's one refund, or hand back the one it already has."""
+
+    if session.refunded and session.refund_run_id:
+        return {"run_id": session.refund_run_id, "already_refunded": True}
+
+    run_id = uuid.uuid4().hex
+    workdir = session.directory / "runs" / run_id
+    workdir.mkdir(parents=True, exist_ok=True)
+    run = executor.Run(
+        run_id=run_id,
+        session_id=session.session_id,
+        kind=executor.REFUND,
+        profile="",
+        baseline={},
+        paths=session.paths,
+        workdir=workdir,
+    )
+    # Marked before the worker starts rather than after it finishes. A second press arriving
+    # while the first is still in flight would otherwise queue a second withdrawal, and the
+    # ledger would be right to refuse it while the page showed two refunds.
+    session.refunded = True
+    session.refund_run_id = run_id
+    _queue().submit(run)
+    return {"run_id": run_id, "already_refunded": False}
 
 
 @app.get("/api/run/{run_id}")
@@ -535,7 +591,23 @@ def run_status(run_id: str) -> dict:
     run = _queue().get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="no such run")
-    return run.view(position=_queue().position(run_id))
+
+    # The last run of a session refunds without being asked. A visitor who has spent their
+    # allowance has finished whether or not they press anything, and leaving the escrow holding
+    # their deposits until someone remembers is how a demo runs out of money.
+    body = run.view(position=_queue().position(run_id))
+    session = _session_registry().get(run.session_id)
+    if (
+        session is not None
+        and run.kind == executor.SETTLEMENT
+        and run.status == executor.SUCCEEDED
+        and session.runs >= sessions.RUNS_PER_SESSION
+        and not session.refunded
+    ):
+        body["refund"] = _refund(session)
+    if session is not None:
+        body["session"] = session.view()
+    return body
 
 
 class SimulateRequest(BaseModel):

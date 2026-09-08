@@ -35,9 +35,10 @@ SESSION_ROOT = Path(os.getenv("WRASSE_SESSION_ROOT", ".wrasse/sessions"))
 #: has been evicted is given a new one.
 SESSION_LIMIT = int(os.getenv("WRASSE_SESSION_LIMIT", "200"))
 
-#: How many settlements one session may execute. Both wallets are shared and faucet-funded, so
-#: this is what stops one visitor from spending the demo.
-RUNS_PER_SESSION = int(os.getenv("WRASSE_RUNS_PER_SESSION", "3"))
+#: How many settlements one session may execute. The point of allowing several is that each
+#: one teaches both memories, so a visitor can watch terms move across a history they built
+#: rather than inferring it from one deal.
+RUNS_PER_SESSION = int(os.getenv("WRASSE_RUNS_PER_SESSION", "5"))
 
 
 def copy_database(origin: Path, destination: Path) -> None:
@@ -72,6 +73,12 @@ class Session:
     created_at: str
     runs: int = 0
     paths: dict[str, Path] = field(default_factory=dict)
+    #: Set once, when the escrow has been emptied back into the wallets. A session refunds at
+    #: the end rather than after each run, because the credits sitting in the escrow are the
+    #: least interesting thing about a run and collecting them between runs would put two
+    #: transactions nobody asked for in the middle of the story.
+    refunded: bool = False
+    refund_run_id: str | None = None
 
     def view(self) -> dict[str, object]:
         return {
@@ -79,6 +86,9 @@ class Session:
             "created_at": self.created_at,
             "runs_used": self.runs,
             "runs_allowed": RUNS_PER_SESSION,
+            "runs_left": max(0, RUNS_PER_SESSION - self.runs),
+            "refunded": self.refunded,
+            "refund_run_id": self.refund_run_id,
         }
 
 

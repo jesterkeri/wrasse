@@ -84,11 +84,24 @@ STEPS: tuple[tuple[str, str], ...] = (
     ("teach", "Both memories record what happened"),
 )
 
+#: What a refund does, as one visible step. Its own list because a refund is not a
+#: settlement: nothing is negotiated, nothing is remembered, and the only thing it produces is
+#: a transaction returning what the escrow is holding.
+REFUND_STEPS: tuple[tuple[str, str], ...] = (
+    ("refund", "Return what the escrow is holding to the emptier wallet"),
+)
+
+#: The two kinds of work the queue carries.
+SETTLEMENT, REFUND = "settlement", "refund"
+
 #: Statuses that free a wallet. Inclusion consumes the nonce, which is the only question the
 #: next step is asking; permanence is a different question and only the teach step asks it.
 _INCLUDED = frozenset({"included_success", "confirmed_success"})
 #: The only status a receipt may have before it is allowed to become memory.
 _CONFIRMED = frozenset({"confirmed_success"})
+#: What the ledger calls a send that never reached a node.
+UNBROADCAST_STATUS = "unbroadcast"
+
 #: Reaching any of these means the run is over and the outcome is not the one it wanted.
 _DEAD = frozenset(
     {"included_reverted", "confirmed_reverted", "stuck", "unbroadcast",
@@ -173,15 +186,21 @@ class Run:
     baseline: dict[str, int]
     paths: dict[str, Path]
     workdir: Path
+    kind: str = SETTLEMENT
     status: str = QUEUED
     error: str | None = None
     deal_id: int | None = None
+    refund_to: str | None = None
+    refund_wei: int | None = None
     settled: dict[str, Any] | None = None
     created_at: str = field(default_factory=_now)
     finished_at: str | None = None
-    steps: list[Step] = field(
-        default_factory=lambda: [Step(name, label) for name, label in STEPS]
-    )
+    steps: list[Step] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.steps:
+            shape = REFUND_STEPS if self.kind == REFUND else STEPS
+            self.steps = [Step(name, label) for name, label in shape]
 
     def step(self, name: str) -> Step:
         for entry in self.steps:
@@ -193,7 +212,10 @@ class Run:
         return {
             "run_id": self.run_id,
             "session_id": self.session_id,
+            "kind": self.kind,
             "profile": self.profile,
+            "refund_to": self.refund_to,
+            "refund_wei": self.refund_wei,
             "status": self.status,
             "error": self.error,
             "deal_id": self.deal_id,
@@ -343,6 +365,9 @@ class Runner:
         """Quote, settle on chain, and teach both memories what happened."""
 
         run.status = RUNNING
+        if run.kind == REFUND:
+            self._run_refund(run)
+            return
         try:
             self._quote(run)
             self._create(run)
@@ -366,6 +391,56 @@ class Runner:
             return
         run.status = SUCCEEDED
         run.finished_at = _now()
+
+    def _run_refund(self, run: Run) -> None:
+        """Collect what the escrow is holding and send it to whichever wallet holds less.
+
+        The recipient is chosen rather than fixed, and the reason is arithmetic. A settlement
+        moves the price from the buyer to the provider and the bond from the provider and back
+        again, so the provider's credit is price plus bond. Sending that to the buyer every
+        time leaves the provider short by a bond per run; sending it to the provider every time
+        leaves the buyer short by a price. Either way one wallet drains and somebody goes
+        looking for a faucet.
+
+        Sending it to whichever wallet is currently emptier balances the pair on its own. The
+        two of them together lose only gas, which on Base Sepolia is a rounding error, so the
+        demo funds itself for as long as anyone wants to use it.
+
+        `withdraw` collects the caller's entire credit at execution time. The amount is not
+        calldata and cannot be, so what is reported here is what the chain moved rather than
+        what was intended.
+        """
+
+        step = self._begin(run, "refund")
+        try:
+            balances = self._balances()
+            run.refund_to = min(balances, key=lambda role: balances[role])
+            destination = self._address(run.refund_to)
+            sent = self._cli(run, ["withdraw", "--role", "provider", "--to", destination])
+            if sent.get("status") == UNBROADCAST_STATUS:
+                raise ExecutionError(sent.get("error", "the refund was refused before sending"))
+            step.tx_hash = sent.get("tx_hash")
+            self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
+            after = self._balances()
+            run.refund_wei = after[run.refund_to] - balances[run.refund_to]
+            self._end(step, detail=(
+                f"returned to the {run.refund_to} wallet, which was the emptier of the two"
+            ))
+        except ExecutionError as error:
+            self._fail(run, str(error))
+            return
+        except Exception as error:  # noqa: BLE001
+            self._fail(run, f"unexpected failure: {error}")
+            return
+        run.status = SUCCEEDED
+        run.finished_at = _now()
+
+    def _address(self, role: str) -> str:
+        from . import cli
+
+        return cli._required_env(
+            "WRASSE_BUYER_ADDRESS" if role == "buyer" else "WRASSE_PROVIDER_A_ADDRESS"
+        )
 
     def _skip_remaining(self, run: Run) -> None:
         for step in run.steps:
