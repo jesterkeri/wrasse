@@ -129,11 +129,65 @@
 (function () {
   'use strict';
 
+  // ETH is converted through the decimal string rather than through a float. A float cannot
+  // hold 18 significant figures, so 0.1 ETH would arrive as 99999999999999998 wei, and the
+  // page would be quietly lying about the number it sent.
+  function ethToWei(text) {
+    var m = /^\s*([0-9]*)(?:\.([0-9]*))?\s*$/.exec(String(text));
+    if (!m || (!m[1] && !m[2])) return null;
+    var frac = (m[2] || '').slice(0, 18);
+    while (frac.length < 18) frac += '0';
+    var digits = ((m[1] || '0') + frac).replace(/^0+(?=[0-9])/, '');
+    return digits === '' ? '0' : digits;
+  }
+  function weiToEth(wei) {
+    var s = String(wei);
+    while (s.length < 19) s = '0' + s;
+    var whole = s.slice(0, -18).replace(/^0+(?=[0-9])/, '');
+    var frac = s.slice(-18).replace(/0+$/, '');
+    return frac ? whole + '.' + frac : whole;
+  }
+  function pctToBps(text) {
+    var n = Number(String(text).trim());
+    if (!isFinite(n) || n < 0 || String(text).trim() === '') return null;
+    return String(Math.round(n * 100));
+  }
+  function bpsToPct(bps) { return String(Number(bps) / 100); }
+  function minToSeconds(text) {
+    var n = Number(String(text).trim());
+    if (!isFinite(n) || n <= 0 || String(text).trim() === '') return null;
+    return String(Math.round(n * 60));
+  }
+  function secondsToMin(seconds) { return String(Number(seconds) / 60); }
+
+  // Human units in, machine units out. Nothing requires wei, basis points and seconds at the
+  // input box: the contract wants them at the moment of signing, and Sibyl has no opinion at
+  // all. Asking a reader to type 100000000000000 to mean a hundredth of a cent was showing
+  // them the inside of the machine and calling it a form.
+  //
+  // The exact value that will be sent is printed under every field, so nothing is hidden and a
+  // reader checking a transaction against this page still finds the number they are looking at.
   var FIELDS = [
-    { key: 'price_wei', name: 'what the buyer pays', param: 'price', d: 100000000000000 },
-    { key: 'provider_bond_bps', name: "the seller's stake", param: 'bond', d: 500 },
-    { key: 'service_window', name: 'time to deliver', param: 'window', d: 600 },
-    { key: 'payout_delay', name: 'wait before payment', param: 'delay', d: 1800 }
+    {
+      key: 'price_wei', name: 'what the buyer pays', unit: 'ETH', param: 'price',
+      field: 'price_wei', human: '0.0001',
+      toMachine: ethToWei, toHuman: weiToEth, says: function (v) { return v + ' wei'; }
+    },
+    {
+      key: 'provider_bond_bps', name: "the seller's stake", unit: '% of the price', param: 'bond',
+      field: 'provider_bond_bps', human: '5',
+      toMachine: pctToBps, toHuman: bpsToPct, says: function (v) { return v + ' basis points'; }
+    },
+    {
+      key: 'service_window', name: 'time to deliver', unit: 'minutes', param: 'window',
+      field: 'service_window', human: '10',
+      toMachine: minToSeconds, toHuman: secondsToMin, says: function (v) { return v + ' seconds'; }
+    },
+    {
+      key: 'payout_delay', name: 'wait before payment', unit: 'minutes', param: 'delay',
+      field: 'payout_delay', human: '30',
+      toMachine: minToSeconds, toHuman: secondsToMin, says: function (v) { return v + ' seconds'; }
+    }
   ];
 
   //: Who proposes each term. Fixed by the term's identity, exactly as the engine has it: a
@@ -174,47 +228,51 @@
     if (s % 60 === 0) return (s / 60) + 'm';
     return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
   }
-  function eth(wei) {
-    var n = Number(wei) / 1e18;
-    var s = n.toFixed(9).replace(/0+$/, '').replace(/\.$/, '');
-    return s + ' ETH';
+  function eth(wei) { return weiToEth(wei) + ' ETH'; }
+  function bpsEth(bps) {
+    // Through the string again: the baseline is exact and multiplying it by a rate in a
+    // float would put a different number on the screen than the one in the settlement.
+    var whole = BigInt(baseline.price_wei) * BigInt(bps) / 10000n;
+    return weiToEth(whole.toString()) + ' ETH';
   }
-  function bpsEth(bps) { return eth(baseline.price_wei * Number(bps) / 10000); }
 
   // ---- conditions ------------------------------------------------------------------
 
   function buildFields() {
     var url = new URLSearchParams(location.search);
     FIELDS.forEach(function (f) {
-      var raw = url.get(f.param);
-      baseline[f.key] = raw !== null && /^[0-9]+$/.test(raw) ? Number(raw) : f.d;
+      // A link carries the machine value, because that is what the rest of the system speaks.
+      // It is turned back into something readable for the box.
+      var carried = url.get(f.param);
+      var machine = carried !== null && /^[0-9]+$/.test(carried) ? carried : f.toMachine(f.human);
+      baseline[f.key] = machine;
 
       var wrap = document.createElement('div');
       var name = document.createElement('div');
       name.className = 'ws-name'; text(name, f.name);
-      var key = document.createElement('div');
-      key.className = 'ws-key'; text(key, f.key);
+      var unit = document.createElement('div');
+      unit.className = 'ws-key'; text(unit, 'in ' + f.unit);
+
       var input = document.createElement('input');
       input.type = 'text';
-      input.inputMode = 'numeric';
-      input.value = String(baseline[f.key]);
-      input.setAttribute('aria-label', f.name);
-      var hint = document.createElement('div');
-      hint.className = 'ws-hint';
+      input.inputMode = 'decimal';
+      input.value = f.toHuman(machine);
+      input.setAttribute('aria-label', f.name + ' in ' + f.unit);
 
-      function readable() {
-        text(hint, f.key === 'price_wei' ? 'that is ' + eth(baseline.price_wei)
-          : f.key === 'provider_bond_bps' ? 'that is ' + pct(baseline.provider_bond_bps)
-          : 'that is ' + dur(baseline[f.key]));
-      }
+      var exact = document.createElement('div');
+      exact.className = 'ws-hint';
+
+      function show() { text(exact, f.field + ' = ' + f.says(baseline[f.key])); }
       input.addEventListener('input', function () {
-        var v = input.value.trim();
-        if (/^[0-9]+$/.test(v)) { baseline[f.key] = Number(v); readable(); }
+        var converted = f.toMachine(input.value);
+        if (converted === null) { text(exact, f.field + ' = not a number'); return; }
+        baseline[f.key] = converted;
+        show();
       });
-      readable();
+      show();
 
-      wrap.appendChild(name); wrap.appendChild(key);
-      wrap.appendChild(input); wrap.appendChild(hint);
+      wrap.appendChild(name); wrap.appendChild(unit);
+      wrap.appendChild(input); wrap.appendChild(exact);
       fieldsBox.appendChild(wrap);
     });
   }
