@@ -1,0 +1,474 @@
+<!-- The simulator, as a flow the tester drives.
+     The design ships a fixed two-job script with no way to set the job, which is why it read
+     as a placeholder: it acted like one. This replaces it. The tester sets the conditions,
+     presses negotiate, watches the exchange arrive line by line, sees the outcome, then either
+     records what happened on that job and runs another against the accumulated history, or
+     clears it and starts from two strangers.
+
+     Every line is derived from the settlement the engine returned. Nothing is written here and
+     nothing is random: the same conditions and the same history always produce the same
+     exchange, which is what makes it checkable rather than theatre. What changes it is what
+     the tester changes. -->
+<section id="wrasse-sim" hidden>
+  <style>
+    #wrasse-sim{position:relative;max-width:none;margin:0 auto;
+      padding:0 clamp(14px,3vw,44px) 96px;
+      font:14px/1.55 Inter,ui-sans-serif,system-ui,sans-serif;color:var(--fg,#141412)}
+    #wrasse-sim .ws-card{background:var(--surface,transparent);border-radius:16px;
+      padding:clamp(20px,2.5vw,28px);margin-bottom:14px}
+    #wrasse-sim h2{font:600 clamp(19px,2.2vw,26px)/1.2 Inter,sans-serif;letter-spacing:-0.4px;
+      color:var(--fg-strong,inherit);margin:0 0 10px}
+    #wrasse-sim p{max-width:74ch;margin:0 0 14px;color:var(--fg-muted,inherit)}
+    #wrasse-sim .ws-step{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
+      text-transform:uppercase;color:var(--fg-subtle,inherit);margin:0 0 8px}
+    #wrasse-sim .ws-fields{display:grid;gap:16px;
+      grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin:0 0 4px}
+    #wrasse-sim .ws-name{font:600 13px/1.4 Inter,sans-serif;color:var(--fg-strong,inherit)}
+    #wrasse-sim .ws-key,#wrasse-sim .ws-hint{font:500 11px/1.5 'Geist Mono',ui-monospace,monospace;
+      color:var(--fg-subtle,inherit)}
+    #wrasse-sim input{width:100%;border:1px solid var(--line-strong,#c4c4cc);border-radius:8px;
+      background:var(--bg,#fff);color:var(--fg,#141412);
+      font:700 13px/1.4 'Geist Mono',ui-monospace,monospace;padding:12px 14px;min-height:44px;
+      margin:6px 0 4px}
+    #wrasse-sim .ws-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:18px}
+    #wrasse-sim .wr-segmented{display:inline-flex;border:1px solid var(--line-strong,#c4c4cc);
+      border-radius:10px;overflow:hidden}
+    #wrasse-sim .wr-segmented button{border:0;cursor:pointer;padding:0 18px;min-height:36px;
+      background:transparent;color:var(--fg-muted,inherit);
+      font:600 11px/1.15 Inter,sans-serif;letter-spacing:0.14em;text-transform:uppercase;
+      white-space:nowrap}
+    #wrasse-sim .wr-segmented button[aria-pressed="true"]{background:var(--fg-strong,#000);
+      color:var(--bg,#fff)}
+    #wrasse-sim button.ws-go{flex:0 0 auto;min-width:200px;min-height:52px;padding:15px 14px;
+      border:2px solid var(--line-strong,#c4c4cc);border-radius:12px;
+      background:var(--primary,var(--fg,#141412));color:var(--on-primary,var(--bg,#fff));
+      font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.18em;text-transform:uppercase;
+      cursor:pointer}
+    #wrasse-sim button.ws-quiet{border:0;background:transparent;cursor:pointer;
+      padding:26px 0 6px;border-bottom:2px solid var(--primary,currentColor);
+      color:var(--fg-strong,inherit);font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
+      text-transform:uppercase}
+    #wrasse-sim button[disabled]{opacity:.45;cursor:default}
+    #wrasse-sim .ws-history{display:flex;flex-direction:column;gap:6px;margin:0 0 4px}
+    #wrasse-sim .ws-held{display:flex;gap:12px;align-items:baseline;
+      background:var(--surface-2,transparent);border-radius:12px;padding:10px 14px}
+    #wrasse-sim .ws-held .ws-n{font:700 12px/1.4 'Geist Mono',ui-monospace,monospace;
+      color:var(--fg-subtle,inherit)}
+    #wrasse-sim .ws-line{max-width:min(560px,64%);border-radius:14px;padding:12px 16px;
+      margin:0 0 10px;opacity:0;transform:translateY(6px);
+      transition:opacity .28s ease,transform .28s ease}
+    #wrasse-sim .ws-line.ws-in{opacity:1;transform:none}
+    #wrasse-sim .ws-line.ws-buyer{background:var(--surface-2,transparent);margin-right:auto}
+    #wrasse-sim .ws-line.ws-seller{background:var(--tint-memory-soft,var(--surface-2,transparent));
+      margin-left:auto}
+    #wrasse-sim .ws-who{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
+      text-transform:uppercase;color:var(--fg-subtle,inherit);margin-bottom:4px}
+    #wrasse-sim .ws-said{font:600 14px/1.5 Inter,sans-serif;color:var(--fg-strong,inherit)}
+    #wrasse-sim .ws-meta{font:500 12px/1.5 'Geist Mono',ui-monospace,monospace;
+      color:var(--fg-muted,inherit);margin-top:4px}
+    #wrasse-sim .ws-cards{display:grid;gap:12px;
+      grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-top:6px}
+    #wrasse-sim .ws-outcome{background:var(--surface-2,transparent);border-radius:12px;
+      padding:14px 16px}
+    #wrasse-sim .ws-verdict{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.14em;
+      text-transform:uppercase}
+    #wrasse-sim .ws-note{margin-top:14px;padding:12px 14px;border-radius:12px;
+      background:var(--surface-2,transparent);color:var(--fg-muted,inherit);max-width:78ch}
+  </style>
+
+  <div class="ws-card">
+    <div class="ws-step">Step one</div>
+    <h2>Set the job</h2>
+    <p>
+      These are the starting numbers, before either agent remembers anything. Everything the two
+      of them say afterwards is worked out from these four and from what they hold against each
+      other.
+    </p>
+    <div class="ws-fields" id="ws-fields"></div>
+  </div>
+
+  <div class="ws-card">
+    <div class="ws-step">Step two</div>
+    <h2>What they remember</h2>
+    <div class="ws-history" id="ws-history"></div>
+    <button type="button" class="ws-quiet" id="ws-clear">Start over from two strangers</button>
+  </div>
+
+  <div class="ws-card">
+    <div class="ws-step">Step three</div>
+    <h2>Let them negotiate</h2>
+    <p id="ws-lede">
+      Pick how the buyer is posting the job, then watch the exchange. Each line names the number
+      it is about and what decided it, either a receipt they hold, the other side's published
+      limit, or a rule.
+    </p>
+    <div class="ws-row">
+      <span class="wr-segmented" id="ws-profile" role="group" aria-label="Posting">
+        <button type="button" data-profile="urgent" aria-pressed="true">urgent</button>
+        <button type="button" data-profile="sensitive" aria-pressed="false">sensitive</button>
+        <button type="button" data-profile="budget" aria-pressed="false">budget</button>
+      </span>
+      <button type="button" class="ws-go" id="ws-run">Negotiate</button>
+    </div>
+    <div id="ws-exchange" style="margin-top:22px"></div>
+    <div id="ws-outcome"></div>
+  </div>
+
+  <div class="ws-card" id="ws-next" hidden>
+    <div class="ws-step">Step four</div>
+    <h2>Say what happened on this job</h2>
+    <p>
+      Whatever you choose becomes something both of them remember, and the next negotiation
+      starts from it. Nothing is erased when you add to it.
+    </p>
+    <div class="ws-row" id="ws-outcomes"></div>
+  </div>
+</section>
+
+<script>
+(function () {
+  'use strict';
+
+  var FIELDS = [
+    { key: 'price_wei', name: 'what the buyer pays', param: 'price', d: 100000000000000 },
+    { key: 'provider_bond_bps', name: "the seller's stake", param: 'bond', d: 500 },
+    { key: 'service_window', name: 'time to deliver', param: 'window', d: 600 },
+    { key: 'payout_delay', name: 'wait before payment', param: 'delay', d: 1800 }
+  ];
+
+  //: Who proposes each term. Fixed by the term's identity, exactly as the engine has it: a
+  //: side cannot propose a number the other side owns.
+  var ORDER = [
+    { term: 'provider_bond_bps', by: 'buyer' },
+    { term: 'service_window', by: 'buyer' },
+    { term: 'price_bps', by: 'seller' },
+    { term: 'payout_delay', by: 'seller' }
+  ];
+
+  var OUTCOMES = [
+    { id: 'timeout_claimed_without_delivery', label: 'the seller took the money and never delivered' },
+    { id: 'delivered_and_claimed_after_delay', label: 'it was delivered, and the seller was made to wait' },
+    { id: 'delivered_and_released_by_buyer', label: 'it was delivered and paid promptly' }
+  ];
+
+  var root = document.getElementById('wrasse-sim');
+  var fieldsBox = document.getElementById('ws-fields');
+  var historyBox = document.getElementById('ws-history');
+  var exchangeBox = document.getElementById('ws-exchange');
+  var outcomeBox = document.getElementById('ws-outcome');
+  var nextCard = document.getElementById('ws-next');
+  var outcomesBox = document.getElementById('ws-outcomes');
+  var runButton = document.getElementById('ws-run');
+  var clearButton = document.getElementById('ws-clear');
+  var profileGroup = document.getElementById('ws-profile');
+
+  var history = [];
+  var profile = 'urgent';
+  var baseline = {};
+  var timers = [];
+
+  function text(el, value) { el.textContent = value; }
+  function pct(bps) { return (Number(bps) / 100).toFixed(1).replace(/\.0$/, '') + '%'; }
+  function dur(s) {
+    s = Number(s);
+    if (s % 60 === 0) return (s / 60) + 'm';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
+  function eth(wei) {
+    var n = Number(wei) / 1e18;
+    var s = n.toFixed(9).replace(/0+$/, '').replace(/\.$/, '');
+    return s + ' ETH';
+  }
+  function bpsEth(bps) { return eth(baseline.price_wei * Number(bps) / 10000); }
+
+  // ---- conditions ------------------------------------------------------------------
+
+  function buildFields() {
+    var url = new URLSearchParams(location.search);
+    FIELDS.forEach(function (f) {
+      var raw = url.get(f.param);
+      baseline[f.key] = raw !== null && /^[0-9]+$/.test(raw) ? Number(raw) : f.d;
+
+      var wrap = document.createElement('div');
+      var name = document.createElement('div');
+      name.className = 'ws-name'; text(name, f.name);
+      var key = document.createElement('div');
+      key.className = 'ws-key'; text(key, f.key);
+      var input = document.createElement('input');
+      input.type = 'text';
+      input.inputMode = 'numeric';
+      input.value = String(baseline[f.key]);
+      input.setAttribute('aria-label', f.name);
+      var hint = document.createElement('div');
+      hint.className = 'ws-hint';
+
+      function readable() {
+        text(hint, f.key === 'price_wei' ? 'that is ' + eth(baseline.price_wei)
+          : f.key === 'provider_bond_bps' ? 'that is ' + pct(baseline.provider_bond_bps)
+          : 'that is ' + dur(baseline[f.key]));
+      }
+      input.addEventListener('input', function () {
+        var v = input.value.trim();
+        if (/^[0-9]+$/.test(v)) { baseline[f.key] = Number(v); readable(); }
+      });
+      readable();
+
+      wrap.appendChild(name); wrap.appendChild(key);
+      wrap.appendChild(input); wrap.appendChild(hint);
+      fieldsBox.appendChild(wrap);
+    });
+  }
+
+  // ---- history ---------------------------------------------------------------------
+
+  function label(id) {
+    for (var i = 0; i < OUTCOMES.length; i++) if (OUTCOMES[i].id === id) return OUTCOMES[i].label;
+    return id;
+  }
+
+  function drawHistory() {
+    historyBox.innerHTML = '';
+    if (!history.length) {
+      var empty = document.createElement('div');
+      empty.className = 'ws-held';
+      text(empty, 'Nothing. These two have never met, so neither has anything to hold against the other.');
+      historyBox.appendChild(empty);
+      return;
+    }
+    history.forEach(function (id, index) {
+      var row = document.createElement('div');
+      row.className = 'ws-held';
+      var n = document.createElement('span');
+      n.className = 'ws-n'; text(n, 'job ' + (index + 1));
+      var body = document.createElement('span');
+      var said = document.createElement('div');
+      text(said, label(id));
+      var meta = document.createElement('div');
+      meta.className = 'ws-meta'; text(meta, id);
+      body.appendChild(said); body.appendChild(meta);
+      row.appendChild(n); row.appendChild(body);
+      historyBox.appendChild(row);
+    });
+  }
+
+  // ---- the exchange ----------------------------------------------------------------
+
+  function phrase(term, value) {
+    if (term === 'provider_bond_bps') return ['Stake ' + pct(value) + ' of the price as a deposit.', 'provider_bond_bps = ' + value];
+    if (term === 'service_window') return ['Deliver inside ' + dur(value) + '.', 'service_window = ' + value];
+    if (term === 'price_bps') return ['The price is ' + bpsEth(value) + '.', 'price_bps = ' + value];
+    return ['Pay me ' + dur(value) + ' after delivery.', 'payout_delay = ' + value];
+  }
+
+  function settledPhrase(term, value) {
+    if (term === 'provider_bond_bps') return 'Agreed, ' + pct(value) + '.';
+    if (term === 'service_window') return 'Agreed, ' + dur(value) + '.';
+    if (term === 'price_bps') return 'Agreed, ' + bpsEth(value) + '.';
+    return 'Agreed, ' + dur(value) + '.';
+  }
+
+  function lines(found) {
+    // Every line is read out of the settlement the engine returned. A term that moved has a
+    // move naming what moved it; a term that stood has the limit it was measured against.
+    var out = [];
+    ORDER.forEach(function (entry) {
+      var move = (found.moves || []).filter(function (m) { return m.term === entry.term; })[0];
+      var stood = (found.stood || []).filter(function (s) { return s.term === entry.term; })[0];
+      if (!move && !stood) return;
+
+      var proposed = move ? move.from : stood.value;
+      var settled = move ? move.to : stood.value;
+      var said = phrase(entry.term, proposed);
+      var other = entry.by === 'buyer' ? 'seller' : 'buyer';
+
+      out.push({ side: entry.by, said: said[0], meta: said[1] });
+
+      if (!move) {
+        out.push({ side: other, said: 'Inside my limit. No objection.', meta: stood.because });
+        return;
+      }
+      out.push({
+        side: other,
+        said: move.kind === 'concession'
+          ? 'That is past what I will accept.'
+          : 'A rule stops it there.',
+        meta: move.because + (move.kind === 'memory' ? ' / from memory' : '')
+      });
+      out.push({ side: entry.by, said: settledPhrase(entry.term, settled), meta: 'settles at ' + settled });
+    });
+    return out;
+  }
+
+  function clearTimers() {
+    timers.forEach(clearTimeout);
+    timers = [];
+  }
+
+  function play(all) {
+    exchangeBox.innerHTML = '';
+    all.forEach(function (line, index) {
+      var el = document.createElement('div');
+      el.className = 'ws-line ws-' + line.side;
+      var who = document.createElement('div');
+      who.className = 'ws-who'; text(who, line.side === 'buyer' ? 'Buyer agent' : 'Seller agent');
+      var said = document.createElement('div');
+      said.className = 'ws-said'; text(said, line.said);
+      var meta = document.createElement('div');
+      meta.className = 'ws-meta'; text(meta, line.meta);
+      el.appendChild(who); el.appendChild(said); el.appendChild(meta);
+      exchangeBox.appendChild(el);
+      timers.push(setTimeout(function () { el.classList.add('ws-in'); }, 90 + index * 420));
+    });
+    return 90 + all.length * 420;
+  }
+
+  // ---- outcome ---------------------------------------------------------------------
+
+  function drawOutcome(data) {
+    outcomeBox.innerHTML = '';
+    var cards = document.createElement('div');
+    cards.className = 'ws-cards';
+    (data.profiles || []).forEach(function (p) {
+      var card = document.createElement('div');
+      card.className = 'ws-outcome';
+      var verdict = document.createElement('div');
+      verdict.className = 'ws-verdict';
+      verdict.style.color = p.agreed ? 'var(--good, inherit)' : 'var(--bad, inherit)';
+      text(verdict, p.agreed ? 'They agree' : 'No deal');
+      var who = document.createElement('div');
+      who.style.font = '600 13px/1.4 Inter,sans-serif';
+      text(who, p.id);
+      var body = document.createElement('div');
+      body.className = 'ws-meta';
+      text(body, p.agreed
+        ? 'pays ' + eth(p.terms.price_wei) + ', delivered in ' + dur(p.terms.service_window)
+          + ', seller stakes ' + pct(p.terms.provider_bond_bps)
+          + ', paid after ' + dur(p.terms.payout_delay)
+        : 'refused on ' + p.failed_on + ', ' + p.gap + ' bps apart');
+      card.appendChild(verdict); card.appendChild(who); card.appendChild(body);
+      cards.appendChild(card);
+    });
+    outcomeBox.appendChild(cards);
+  }
+
+  function note(message) {
+    var div = document.createElement('div');
+    div.className = 'ws-note';
+    text(div, message);
+    outcomeBox.appendChild(div);
+  }
+
+  // ---- driving ---------------------------------------------------------------------
+
+  async function negotiate() {
+    clearTimers();
+    runButton.disabled = true;
+    text(runButton, 'Negotiating…');
+    exchangeBox.innerHTML = '';
+    outcomeBox.innerHTML = '';
+    nextCard.hidden = true;
+
+    try {
+      var res = await fetch('/api/simulate', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ baseline: baseline, history: history })
+      });
+      var data = await res.json();
+      if (!res.ok) {
+        var detail = data.detail || {};
+        throw new Error(typeof detail === 'string' ? detail : (detail.error || ('HTTP ' + res.status)));
+      }
+      var found = (data.profiles || []).filter(function (p) { return p.id === profile; })[0];
+      var wait = 0;
+      if (found && found.agreed) {
+        wait = play(lines(found));
+      } else if (found) {
+        wait = play([
+          { side: 'seller', said: 'I will not go below ' + bpsEth(found.provider_floor_bps) + '.',
+            meta: 'provider_price_floor_bps=' + found.provider_floor_bps },
+          { side: 'buyer', said: 'I will not pay above ' + bpsEth(found.buyer_ceiling_bps) + '.',
+            meta: 'buyer_max_price_bps=' + found.buyer_ceiling_bps },
+          { side: 'buyer', said: 'Then there is no deal.',
+            meta: found.gap + ' bps apart on ' + found.failed_on }
+        ]);
+      }
+      timers.push(setTimeout(function () {
+        drawOutcome(data);
+        note(history.length
+          ? 'Worked out from ' + history.length + ' remembered job'
+            + (history.length === 1 ? '' : 's') + '. Nothing was rewritten to get here, and the '
+            + 'same conditions and the same history will always produce this same exchange.'
+          : 'Neither side has anything to hold against the other, so no term moves and nobody '
+            + 'is refused. Add an outcome below and run it again.');
+        nextCard.hidden = false;
+        runButton.disabled = false;
+        text(runButton, 'Negotiate again');
+      }, wait + 120));
+    } catch (error) {
+      note(String(error.message || error));
+      runButton.disabled = false;
+      text(runButton, 'Negotiate');
+    }
+  }
+
+  function buildOutcomeButtons() {
+    outcomesBox.innerHTML = '';
+    OUTCOMES.forEach(function (outcome) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'ws-go';
+      button.style.minWidth = '0';
+      button.style.background = 'transparent';
+      button.style.color = 'var(--fg-strong, inherit)';
+      text(button, outcome.label);
+      button.addEventListener('click', function () {
+        history.push(outcome.id);
+        drawHistory();
+        nextCard.hidden = true;
+        exchangeBox.innerHTML = '';
+        outcomeBox.innerHTML = '';
+        text(runButton, 'Negotiate');
+        root.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+      outcomesBox.appendChild(button);
+    });
+  }
+
+  buildFields();
+  drawHistory();
+  buildOutcomeButtons();
+
+  runButton.addEventListener('click', negotiate);
+  clearButton.addEventListener('click', function () {
+    clearTimers();
+    history = [];
+    drawHistory();
+    exchangeBox.innerHTML = '';
+    outcomeBox.innerHTML = '';
+    nextCard.hidden = true;
+    text(runButton, 'Negotiate');
+  });
+  profileGroup.addEventListener('click', function (event) {
+    var pressed = event.target.closest('button[data-profile]');
+    if (!pressed) return;
+    profile = pressed.getAttribute('data-profile');
+    var all = profileGroup.querySelectorAll('button[data-profile]');
+    for (var i = 0; i < all.length; i++) {
+      all[i].setAttribute('aria-pressed', all[i] === pressed ? 'true' : 'false');
+    }
+  });
+
+  // The tab the design is showing is stamped on the body, so this island appears exactly
+  // where the design's own simulator used to and nowhere else.
+  function follow() {
+    var sim = document.body.getAttribute('data-stage') === 'sim';
+    root.hidden = !sim;
+    var settle = document.getElementById('wrasse-run');
+    if (settle) settle.style.display = sim ? 'none' : '';
+  }
+  new MutationObserver(follow).observe(document.body, {
+    attributes: true, attributeFilter: ['data-stage']
+  });
+  follow();
+})();
+</script>

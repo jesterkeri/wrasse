@@ -23,7 +23,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "index.html"
-PANEL = HERE / "run-panel.html"
+#: The islands, in the order they are appended. Each is wrapped in its own markers so a
+#: re-run replaces it rather than adding a second copy.
+PANELS = [
+    ("the settlement panel", HERE / "run-panel.html", "run-panel"),
+    ("the simulator", HERE / "sim-panel.html", "sim-panel"),
+]
 SOURCE = HERE / "src" / "app.html"
 
 #: Edits to the application source, kept as data rather than as Python string literals.
@@ -31,10 +36,6 @@ SOURCE = HERE / "src" / "app.html"
 #: is how an escaping mistake becomes a corrupted bundle nobody can read back.
 EDITS = HERE / "source-edits.json"
 
-#: The panel is wrapped in these so re-running replaces it rather than appending a second copy.
-#: Editing `run-panel.html` and running this again is the whole update path.
-START = "<!-- wrasse:run-panel:start -->"
-END = "<!-- wrasse:run-panel:end -->"
 
 #: Each entry is (name, pattern, replacement, already). `pattern` is a regular expression
 #: because an exact literal broke on the first re-export it met: the design changed the shell's
@@ -94,20 +95,23 @@ def inject_panel() -> None:
         document = document.replace(edit["old"], edit["new"], 1)
         print(f"  applied: {edit['name']}")
 
-    # The trailing newline is part of what gets removed. Without it every run left one
-    # behind and the file grew a byte at a time, which is not idempotent even though it
-    # looked like it: the panel count stayed at one and only the whitespace drifted.
-    document = re.sub(
-        re.escape(START) + ".*?" + re.escape(END) + r"\n?", "", document, flags=re.S
-    )
-
-    block = f"{START}\n{PANEL.read_text(encoding='utf-8').rstrip()}\n{END}\n"
     if "</body>" not in document:
-        raise SystemExit("the exported document has no </body>; the panel has nowhere to go")
-    document = document.replace("</body>", block + "</body>", 1)
+        raise SystemExit("the exported document has no </body>; the panels have nowhere to go")
+
+    for name, source, marker in PANELS:
+        start, end = f"<!-- wrasse:{marker}:start -->", f"<!-- wrasse:{marker}:end -->"
+        # The trailing newline is part of what gets removed. Without it every run left one
+        # behind and the file grew a byte at a time, which is not idempotent even though it
+        # looked like it: the panel count stayed at one and only the whitespace drifted.
+        document = re.sub(
+            re.escape(start) + ".*?" + re.escape(end) + r"\n?", "", document, flags=re.S
+        )
+        block = f"{start}\n{source.read_text(encoding='utf-8').rstrip()}\n{end}\n"
+        document = document.replace("</body>", block + "</body>", 1)
+        print(f"  applied: {name}")
+
     SOURCE.write_text(document, encoding="utf-8")
     _bundle("pack")
-    print("  applied: the settlement panel")
 
 
 def main() -> int:

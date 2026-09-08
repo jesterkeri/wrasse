@@ -43,5 +43,20 @@
     "name": "the argument says where its numbers can be verified",
     "old": "  <sc-if value=\"{{ story.show }}\" hint-placeholder-val=\"{{ false }}\">\n    <section style=\"margin-top:18px;background:var(--surface);padding:20px 18px;border-radius:16px\">",
     "new": "  <sc-if value=\"{{ story.show }}\" hint-placeholder-val=\"{{ false }}\">\n    <div style=\"margin-top:16px;padding:12px 14px;background:var(--surface-2);border-radius:12px;max-width:78ch;font:500 12px/1.6 Inter,sans-serif;color:var(--fg-muted);text-wrap:pretty\"><b style=\"color:var(--fg-strong)\">The argument, in plain words.</b> Every number it cites appears again on the live quote, where you can open the transaction behind it.</div>\n    <section style=\"margin-top:18px;background:var(--surface);padding:20px 18px;border-radius:16px\">"
+  },
+  {
+    "name": "the design's own simulator stands down",
+    "old": "      isSim: st.stage === 'sim',",
+    "new": "      // The tab is served by `web/sim-panel.html` instead. The design ships a fixed\n      // two-job script with no way to set the job, and the tester has to be able to\n      // set the conditions, which is the whole difference between a simulator and a\n      // slideshow. Left false rather than deleted so the block is still here to read.\n      isSim: false,"
+  },
+  {
+    "name": "the tab in view is stamped on the body",
+    "old": "    this.set({ stage: tab === 'try' ? 'app' : (tab === 'sim' ? 'sim' : 'story') });",
+    "new": "    const stage = tab === 'try' ? 'app' : (tab === 'sim' ? 'sim' : 'story');\n    // Stamped so a panel outside this runtime can appear on the right tab. Reading\n    // the nav's own styling to work out which tab is active would break the first\n    // time a colour changed.\n    try { document.body.setAttribute('data-stage', stage); } catch (e) { /* no dom */ }\n    this.set({ stage: stage });"
+  },
+  {
+    "name": "the tab is deep-linkable and stamped on first paint",
+    "old": "      view: url.view, clamped: url.clamped, stage: (deepLinked || seen) ? 'app' : 'story'",
+    "new": "      view: url.view, clamped: url.clamped,\n      // A tab you cannot link to is a tab you cannot show anybody. `?stage=` names it,\n      // and the body is stamped on the first paint as well as on every later click so\n      // a panel outside this runtime does not have to wait for one.\n      stage: (function () {\n        const asked = new URLSearchParams(location.search).get('stage');\n        const stage = (asked === 'sim' || asked === 'story' || asked === 'app') ? asked\n          : ((deepLinked || seen) ? 'app' : 'story');\n        try { document.body.setAttribute('data-stage', stage); } catch (e) { /* no dom */ }\n        return stage;\n      })()"
   }
 ]
