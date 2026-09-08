@@ -7,7 +7,28 @@
 set -eu
 
 KEYS=/run/wrasse
+SERVICE_USER=wrasse
 umask 077
+
+# --- the volume, which the platform hands over owned by root ------------------------------
+#
+# The mount replaces whatever the image had at this path, so nothing in the Dockerfile can
+# prepare it and the ownership has to be taken here, while this script is still root. Only the
+# directories the service writes; the seeded source is left exactly as it was uploaded.
+take_volume () {
+    for path in "${WRASSE_TX_DB:-}" "${WRASSE_BUYER_MEMORY_PATH:-}" \
+                "${WRASSE_PROVIDER_MEMORY_PATH:-}" "${WRASSE_COLD_BUYER_MEMORY_PATH:-}" \
+                "${WRASSE_COLD_PROVIDER_MEMORY_PATH:-}" "${WRASSE_SESSION_ROOT:-}/x"; do
+        [ -n "$path" ] || continue
+        directory=$(dirname "$path")
+        mkdir -p "$directory"
+        chown "$SERVICE_USER:$SERVICE_USER" "$directory"
+    done
+}
+
+if [ "$(id -u)" = "0" ]; then
+    take_volume
+fi
 
 require () {
     eval "value=\${$1:-}"
@@ -64,6 +85,14 @@ if [ -n "${WRASSE_MEMORY_SOURCE_DIR:-}" ] && [ ! -f "${WRASSE_MEMORY_SOURCE_DIR}
     echo "${WRASSE_MEMORY_SOURCE_DIR}/buyer-memory.db is missing." >&2
     echo "Seed the volume before the first boot; see docs/DEPLOY.md." >&2
     exit 1
+fi
+
+# The keystores are written above with umask 077, so they are root-owned and unreadable to the
+# service until this hands them over. Ownership rather than a looser mode: 0600 owned by the
+# user that reads them is the narrowest thing that works.
+if [ "$(id -u)" = "0" ]; then
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$KEYS"
+    exec gosu "$SERVICE_USER" uvicorn wrasse.service:app --host 0.0.0.0 --port "${PORT:-8000}"
 fi
 
 exec uvicorn wrasse.service:app --host 0.0.0.0 --port "${PORT:-8000}"
