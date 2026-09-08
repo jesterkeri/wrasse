@@ -1,0 +1,32 @@
+[
+  {
+    "name": "somewhere to keep the live simulation",
+    "old": "    simStep: 0, simLog: [],",
+    "new": "    simStep: 0, simLog: [], simData: null, simFault: '', simLoading: false,"
+  },
+  {
+    "name": "every change to the history asks the engine again",
+    "old": "  simStart() { this.set({ simStep: 1, simLog: [] }); window.scrollTo(0, 0); }\n  simReset() { this.set({ simStep: 0, simLog: [] }); window.scrollTo(0, 0); }\n  simRecord(entry) {\n    const log = (this.state.simLog || []).concat([entry]);\n    this.set({ simLog: log, simStep: this.state.simStep + 1 });",
+    "new": "  simStart() { this.set({ simStep: 1, simLog: [], simData: null, simFault: '' }); this.simQuote([]); window.scrollTo(0, 0); }\n  simReset() { this.set({ simStep: 0, simLog: [], simData: null, simFault: '' }); this.simQuote([]); window.scrollTo(0, 0); }\n\n  // The tester sets the conditions; the engine answers. Every change to the history asks\n  // again, so what the two agents say is derived rather than scripted. The request carries\n  // the whole history each time, which is what makes clearing it a client deleting a list.\n  async simQuote(log) {\n    const history = (log || []).map(function (e) { return e.event_type; });\n    this.set({ simLoading: true, simFault: '' });\n    try {\n      const res = await fetch(this.base() + '/api/simulate', {\n        method: 'POST', headers: { 'content-type': 'application/json' },\n        body: JSON.stringify({ baseline: this.state.committed, history: history })\n      });\n      const body = await res.json();\n      if (!res.ok) {\n        const detail = body.detail || {};\n        throw new Error(detail.error || ('HTTP ' + res.status));\n      }\n      this.set({ simData: body, simLoading: false });\n    } catch (e) {\n      // Named rather than swallowed. An outcome the memories cannot read yet is a real\n      // answer, and it is the server's sentence that says which one and why.\n      this.set({ simData: null, simLoading: false, simFault: String(e.message || e) });\n    }\n  }\n\n  simRecord(entry) {\n    const log = (this.state.simLog || []).concat([entry]);\n    this.set({ simLog: log, simStep: this.state.simStep + 1 });\n    this.simQuote(log);"
+  },
+  {
+    "name": "the requote is the engine's answer to this history",
+    "old": "        const coldP = pOf(cold, jobId);\n        const warmP = pOf(warm, jobId);",
+    "new": "        // `simmed` is what the engine returned for the history the tester built. It\n        // falls back to the live warm quote only before the first request lands.\n        const simmed = st.simData || warm;\n        const coldP = pOf(cold, jobId);\n        const warmP = pOf(simmed, jobId);"
+  },
+  {
+    "name": "a path is covered unless the engine says why not",
+    "old": "        const covered = has(R1.event_type) && has(R2.event_type);",
+    "new": "        const covered = !st.simFault;"
+  },
+  {
+    "name": "the dead end names the real reason",
+    "old": "            heading: 'That path needs a live engine.',",
+    "new": "            heading: 'These two cannot price that history yet.',"
+  },
+  {
+    "name": "the refusal shown is the one the engine produced",
+    "old": "        const budget = (Array.isArray(warm.profiles) ? warm.profiles : []).filter(function (p) { return !p.agreed; })[0];",
+    "new": "        const budget = (Array.isArray((st.simData || warm).profiles) ? (st.simData || warm).profiles : []).filter(function (p) { return !p.agreed; })[0];"
+  }
+]

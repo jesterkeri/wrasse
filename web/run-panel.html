@@ -6,7 +6,13 @@
      it. `web/apply-overrides.py` puts it back after every export. -->
 <section id="wrasse-run" hidden>
   <style>
-    #wrasse-run{max-width:none;margin:0 auto;padding:0 clamp(14px,3vw,44px) 96px;
+    /* The design's root is a custom element with no CSS rule of its own, so it defaults to
+       `display:inline` and does not contain the block content inside it. Nothing followed it
+       until this panel did, which is why the bug appeared the moment the panel landed rather
+       than being the panel's fault. One line, and it belongs here because it is the panel's
+       arrival that made it matter. */
+    x-dc{display:block}
+    #wrasse-run{position:relative;clear:both;max-width:none;margin:0 auto;padding:0 clamp(14px,3vw,44px) 96px;
       font:14px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif;color:var(--fg,#141412)}
     #wrasse-run .wr-card{border:1px solid var(--line,#C7C0AF);background:var(--surface,transparent);
       padding:clamp(16px,2.5vw,28px)}

@@ -15,6 +15,7 @@ rather than skipping.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -24,6 +25,11 @@ HERE = Path(__file__).resolve().parent
 PAGE = HERE / "index.html"
 PANEL = HERE / "run-panel.html"
 SOURCE = HERE / "src" / "app.html"
+
+#: Edits to the application source, kept as data rather than as Python string literals.
+#: They contain JavaScript with quotes, braces and newlines, and embedding that in source
+#: is how an escaping mistake becomes a corrupted bundle nobody can read back.
+EDITS = HERE / "source-edits.json"
 
 #: The panel is wrapped in these so re-running replaces it rather than appending a second copy.
 #: Editing `run-panel.html` and running this again is the whole update path.
@@ -72,6 +78,22 @@ def inject_panel() -> None:
 
     _bundle("unpack")
     document = SOURCE.read_text(encoding="utf-8")
+
+    # Teach the design's own simulator to ask the engine instead of replaying a fixture.
+    # Each edit is checked for exactly one match, because a silently skipped one would leave a
+    # simulator that looks wired and is not, which is worse than one that is obviously stale.
+    for edit in json.loads(EDITS.read_text(encoding="utf-8")):
+        if edit["new"] in document:
+            print(f"  already applied: {edit['name']}")
+            continue
+        if document.count(edit["old"]) != 1:
+            raise SystemExit(
+                f"  ANCHOR LOST: {edit['name']!r} matched {document.count(edit['old'])} times, "
+                "not once. The export changed; rewrite this edit rather than skipping it."
+            )
+        document = document.replace(edit["old"], edit["new"], 1)
+        print(f"  applied: {edit['name']}")
+
     # The trailing newline is part of what gets removed. Without it every run left one
     # behind and the file grew a byte at a time, which is not idempotent even though it
     # looked like it: the panel count stayed at one and only the whitespace drifted.
