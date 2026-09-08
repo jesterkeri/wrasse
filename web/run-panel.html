@@ -147,12 +147,15 @@
     accept: ['waiting for the stake to be included', 12],
     deliver: ['waiting for delivery to be included', 12],
     release: ['waiting for the release to be included', 14],
-    confirm: ['this is the long one. Base has to treat the outcome as permanent before '
-      + 'either memory is allowed to record it', 150],
-    teach: ['writing the outcome into both memories', 5]
+    confirm: ['the outcome is already known: the agent has read the receipt, the sender, '
+      + 'the logs and the contract\u2019s own state straight from Base. What this waits for is '
+      + 'Base no longer being able to reverse it, which is what makes it safe to remember',
+      150],
+    teach: ['now it may become memory, so both sides are told', 5]
   };
 
   var ticker = null;
+  var known = false;
 
   var root = document.getElementById('wrasse-run');
   var controls = document.getElementById('wr-controls');
@@ -217,6 +220,38 @@
     return made.session_id;
   }
 
+  function drawKnown(run) {
+    // Shown the moment the release is included, roughly ten seconds in, while the memory step
+    // still runs underneath. The agent is not waiting to find out what happened; it found out
+    // immediately and checked it against five things. Presenting the wait as ignorance was
+    // making a guarantee look like a delay.
+    if (known || !run.settled || !run.settled.agreed) return;
+    var release = (run.steps || []).filter(function (s) { return s.name === 'release'; })[0];
+    if (!release || release.status !== 'done') return;
+    known = true;
+
+    var card = document.createElement('div');
+    card.className = 'wr-note';
+    var head = document.createElement('div');
+    head.style.font = '600 14px/1.5 Inter,sans-serif';
+    head.style.color = 'var(--fg-strong, inherit)';
+    text(head, 'Settled on chain. Both sides are paid.');
+    card.appendChild(head);
+
+    var body = document.createElement('div');
+    body.style.marginTop = '4px';
+    var t = run.settled;
+    text(body, 'The buyer paid ' + t.price_wei + ' wei, the seller staked '
+      + (t.provider_bond_bps / 100) + '% and had ' + Math.round(t.service_window / 60)
+      + ' minutes to deliver. The agent has already read this back from Base and checked the '
+      + 'receipt, the sender, the logs and the contract\u2019s own state agree. It is not '
+      + 'waiting to find out what happened. It is waiting until Base cannot undo it, because '
+      + 'a memory that could be withdrawn would make every deal signed in the meantime point '
+      + 'at a history that no longer exists.');
+    card.appendChild(body);
+    outcome.appendChild(card);
+  }
+
   function drawSteps(run) {
     stepList.hidden = false;
     stepList.innerHTML = '';
@@ -263,6 +298,7 @@
       stepList.appendChild(li);
     });
     tick();
+    drawKnown(run);
   }
 
   function tick() {
@@ -364,8 +400,10 @@
 
   async function start() {
     button.disabled = true;
-    text(button, 'Running…');
+    text(button, 'Running\u2026');
     outcome.innerHTML = '';
+    // Once per run, so a second run does not skip its own settled card.
+    known = false;
     try {
       var sessionId = await session();
       var body = { session_id: sessionId, profile: chosen, baseline: baseline() };
