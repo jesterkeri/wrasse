@@ -21,6 +21,18 @@
     #wrasse-sim p{max-width:74ch;margin:0 0 14px;color:var(--fg-muted,inherit)}
     #wrasse-sim .ws-step{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
       text-transform:uppercase;color:var(--fg-subtle,inherit);margin:0 0 8px}
+    #wrasse-sim .ws-info{border:0;background:transparent;cursor:pointer;padding:0 0 4px;
+      color:var(--fg-strong,inherit);font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
+      text-transform:uppercase;border-bottom:2px solid var(--primary,currentColor);
+      margin:0 0 16px}
+    #wrasse-sim .ws-guide{background:var(--surface-2,transparent);border-radius:12px;
+      padding:14px 16px;margin:0 0 18px;max-width:84ch}
+    #wrasse-sim .ws-guide dt{font:600 13px/1.5 Inter,sans-serif;color:var(--fg-strong,inherit);
+      margin-top:10px}
+    #wrasse-sim .ws-guide dt:first-child{margin-top:0}
+    #wrasse-sim .ws-guide dd{margin:2px 0 0;color:var(--fg-muted,inherit);font-size:13px}
+    #wrasse-sim .ws-warn{color:var(--bad,inherit);
+      font:600 12px/1.5 'Geist Mono',ui-monospace,monospace;margin-top:4px}
     #wrasse-sim .ws-fields{display:grid;gap:16px;
       grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin:0 0 4px}
     #wrasse-sim .ws-name{font:600 13px/1.4 Inter,sans-serif;color:var(--fg-strong,inherit)}
@@ -84,6 +96,10 @@
       of them say afterwards is worked out from these four and from what they hold against each
       other.
     </p>
+    <button type="button" class="ws-info" id="ws-info" aria-expanded="false">
+      What each number does, and what makes a deal fail
+    </button>
+    <div class="ws-guide" id="ws-guide" hidden></div>
     <div class="ws-fields" id="ws-fields"></div>
   </div>
 
@@ -199,6 +215,37 @@
     { term: 'payout_delay', by: 'seller' }
   ];
 
+  //: What each starting number does, and what happens at its edge. Written because the
+  //: honest answer to "how do I make it fail from the top?" is that one of these four can and
+  //: three cannot, and the page said neither.
+  var GUIDE = {
+    price_wei: [
+      'Any amount. On its own this never causes a refusal: what a buyer will pay is a '
+        + 'percentage of whatever you set here, so both sides scale with it.',
+      null
+    ],
+    provider_bond_bps: [
+      'The deposit the seller locks up. This is the one starting number that can break a '
+        + 'deal by itself. No seller will ever stake more than 50% of the price, whatever '
+        + 'its history, so ask for more and there is nothing to sign.',
+      function (bps) {
+        return Number(bps) > 5000
+          ? 'Above 50%. Expect no deal on the stake, whatever the history says.'
+          : null;
+      }
+    ],
+    service_window: [
+      'How long the seller has to deliver. Never refuses on its own: the seller needs five '
+        + 'minutes or your figure, whichever is smaller, so your number is always reachable.',
+      null
+    ],
+    payout_delay: [
+      'How long the seller waits to be paid if the buyer does not release early. Never '
+        + 'refuses on its own: the buyer will accept a fraction of whatever you set.',
+      null
+    ]
+  };
+
   var OUTCOMES = [
     { id: 'timeout_claimed_without_delivery', label: 'the seller took the money and never delivered' },
     { id: 'delivered_and_claimed_after_delay', label: 'it was delivered, and the seller was made to wait' },
@@ -215,6 +262,8 @@
   var runButton = document.getElementById('ws-run');
   var clearButton = document.getElementById('ws-clear');
   var profileGroup = document.getElementById('ws-profile');
+  var infoButton = document.getElementById('ws-info');
+  var guideBox = document.getElementById('ws-guide');
 
   var history = [];
   var profile = 'urgent';
@@ -261,8 +310,16 @@
 
       var exact = document.createElement('div');
       exact.className = 'ws-hint';
+      var warn = document.createElement('div');
+      warn.className = 'ws-warn';
 
-      function show() { text(exact, f.field + ' = ' + f.says(baseline[f.key])); }
+      function show() {
+        text(exact, f.field + ' = ' + f.says(baseline[f.key]));
+        // Said before the run rather than discovered after it. A number that guarantees a
+        // refusal is worth knowing while you are still typing it.
+        var check = (GUIDE[f.key] || [])[1];
+        text(warn, check ? (check(baseline[f.key]) || '') : '');
+      }
       input.addEventListener('input', function () {
         var converted = f.toMachine(input.value);
         if (converted === null) { text(exact, f.field + ' = not a number'); return; }
@@ -272,7 +329,7 @@
       show();
 
       wrap.appendChild(name); wrap.appendChild(unit);
-      wrap.appendChild(input); wrap.appendChild(exact);
+      wrap.appendChild(input); wrap.appendChild(exact); wrap.appendChild(warn);
       fieldsBox.appendChild(wrap);
     });
   }
@@ -492,10 +549,43 @@
     });
   }
 
+  function buildGuide() {
+    var list = document.createElement('dl');
+    FIELDS.forEach(function (f) {
+      var term = document.createElement('dt');
+      text(term, f.name + ', ' + f.unit);
+      var body = document.createElement('dd');
+      text(body, (GUIDE[f.key] || ['', null])[0]);
+      list.appendChild(term); list.appendChild(body);
+    });
+    var term = document.createElement('dt');
+    text(term, 'and what history does');
+    var body = document.createElement('dd');
+    text(body, 'A refusal always traces back to the record of the side being refused. A buyer '
+      + 'who was betrayed still gets deals. A buyer who made a seller wait for its money '
+      + 'raises what that seller will take, until a price-sensitive posting cannot reach it.');
+    list.appendChild(term); list.appendChild(body);
+
+    var fixed = document.createElement('dt');
+    text(fixed, 'why the rest are not yours to set');
+    var why = document.createElement('dd');
+    text(why, 'The 50% cap, the premium each posting will pay, and how far the seller '
+      + 'concedes are constants of the engine, not of the job. Their exact values are hashed '
+      + 'into the version string that every deal commits to on chain, so a page that let you '
+      + 'edit them would be quoting under a version it had already broken.');
+    list.appendChild(fixed); list.appendChild(why);
+    guideBox.appendChild(list);
+  }
+
+  buildGuide();
   buildFields();
   drawHistory();
   buildOutcomeButtons();
 
+  infoButton.addEventListener('click', function () {
+    guideBox.hidden = !guideBox.hidden;
+    infoButton.setAttribute('aria-expanded', guideBox.hidden ? 'false' : 'true');
+  });
   runButton.addEventListener('click', negotiate);
   clearButton.addEventListener('click', function () {
     clearTimers();
