@@ -99,10 +99,13 @@
     <div class="wr-eyebrow">Perform it</div>
     <h2>Settle it yourself, on Base Sepolia</h2>
     <p id="wr-intro">
-      Everything above is memory and arithmetic. This performs it: four transactions on a public
-      testnet at the terms settled above, and then both memories record what happened. It takes
-      about two minutes, because the last step waits for Base to consider the outcome permanent
-      rather than merely mined.
+      Everything above is memory and arithmetic. This performs it, on a public testnet, at the
+      terms settled above, and then both memories record what happened. Choose how the deal
+      ends as well as how it is posted: a deal that is never delivered, or one whose payment is
+      made to wait, is produced rather than declared, so the receipt at the end is the outcome.
+      The quickest ending takes about three and a half minutes, and most of that is the last
+      step, because an outcome may only become memory once Base treats it as permanent rather
+      than merely mined.
     </p>
     <div class="wr-controls" id="wr-controls" hidden>
       <span class="wr-legend">Profile</span>
@@ -111,6 +114,12 @@
         <button type="button" data-profile="sensitive" aria-pressed="false">sensitive</button>
         <button type="button" data-profile="budget" aria-pressed="false">budget</button>
       </span>
+      <span class="wr-legend">Ending</span>
+      <span class="wr-segmented" id="wr-outcome" role="group" aria-label="Ending">
+        <button type="button" data-outcome="released" aria-pressed="true">delivered and paid</button>
+        <button type="button" data-outcome="timeout" aria-pressed="false">never delivered</button>
+        <button type="button" data-outcome="delayed" aria-pressed="false">made to wait</button>
+      </span>
       <button class="wr-go" id="wr-go" type="button">Run it on Base</button>
       <button class="wr-go" id="wr-finish" type="button" hidden
         style="background:transparent;color:var(--fg-strong,inherit);min-width:0">Finish and take the deposits back</button>
@@ -118,7 +127,8 @@
       <span id="wr-count" class="wr-detail"></span>
     </div>
     <ol id="wr-steps" hidden></ol>
-    <div id="wr-outcome"></div>
+    <div id="wr-cost" class="wr-note"></div>
+    <div id="wr-result"></div>
   </div>
 </section>
 
@@ -154,6 +164,21 @@
     teach: ['now it may become memory, so both sides are told', 5]
   };
 
+  //: What each ending costs before anyone commits to it. The two failures are slower and
+  //: the contract is why: a timeout is only claimable once the delivery window has actually
+  //: passed, and a delayed payment once the payout delay has. Both are measured in block time,
+  //: so they cannot be hurried and they cannot be faked.
+  var ENDINGS = {
+    released: 'The seller delivers and the buyer pays at once. Four transactions, about three '
+      + 'and a half minutes, and most of that is Base confirming it.',
+    timeout: 'Nothing is delivered and the buyer takes the deal back once the window has run '
+      + 'out. The contract will not allow the claim before then, so this costs the delivery '
+      + 'time you set above on top of the usual three and a half minutes.',
+    delayed: 'The seller delivers, the buyer does not release, and the seller waits out the '
+      + 'agreed delay before the contract will pay it. This costs the payment wait you set '
+      + 'above on top of the usual three and a half minutes.'
+  };
+
   var ticker = null;
   var known = false;
 
@@ -161,10 +186,13 @@
   var controls = document.getElementById('wr-controls');
   var intro = document.getElementById('wr-intro');
   var stepList = document.getElementById('wr-steps');
-  var outcome = document.getElementById('wr-outcome');
+  var outcome = document.getElementById('wr-result');
+  var outcomeGroup = document.getElementById('wr-outcome');
+  var costLine = document.getElementById('wr-cost');
   var button = document.getElementById('wr-go');
   var profileGroup = document.getElementById('wr-profile');
   var chosen = 'urgent';
+  var ending = 'released';
   var queueLabel = document.getElementById('wr-queue');
   var countLabel = document.getElementById('wr-count');
   var finishButton = document.getElementById('wr-finish');
@@ -406,7 +434,8 @@
     known = false;
     try {
       var sessionId = await session();
-      var body = { session_id: sessionId, profile: chosen, baseline: baseline() };
+      var body = { session_id: sessionId, profile: chosen, outcome: ending,
+                   baseline: baseline() };
       var queued = await post('/api/execute', body);
       var runId = queued.run_id;
       note('Four transactions and one confirmation, about three and a half minutes, most of it waiting for Base to treat the result as permanent. You can leave this open and come back; nothing here depends on the tab staying focused.');
@@ -518,6 +547,17 @@
       } finally {
         finishButton.disabled = false;
       }
+    });
+    text(costLine, ENDINGS[ending]);
+    outcomeGroup.addEventListener('click', function (event) {
+      var pressed = event.target.closest('button[data-outcome]');
+      if (!pressed) return;
+      ending = pressed.getAttribute('data-outcome');
+      var all = outcomeGroup.querySelectorAll('button[data-outcome]');
+      for (var i = 0; i < all.length; i++) {
+        all[i].setAttribute('aria-pressed', all[i] === pressed ? 'true' : 'false');
+      }
+      text(costLine, ENDINGS[ending]);
     });
     profileGroup.addEventListener('click', function (event) {
       var pressed = event.target.closest('button[data-profile]');
