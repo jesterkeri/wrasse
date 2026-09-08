@@ -91,7 +91,11 @@ TERMINAL_STATUSES = frozenset(
 #: Whether that block is permanent is a different question, and it belongs to memory rather than
 #: to the wallet.
 #:
-#: Measured on Base Sepolia, the safe head trails the tip by roughly 66 seconds. Holding the
+#: Measured on Base Sepolia. The safe head trailed the tip by roughly 66 seconds when this
+#: was written and by 82 on 2026-09-08, and a real run waited 145 seconds for a receipt to
+#: pass it, so treat the lag as a variable somewhere upward of a minute rather than as a
+#: constant. Nothing here depends on the number; it is the reason the wallet is freed by
+#: inclusion instead. Holding the
 #: wallet until confirmation would mean a provider could not deliver until well after it
 #: accepted, and a short service window would expire while waiting for a fact that only
 #: reconciliation cares about. A reorg puts both transactions back in the mempool in nonce

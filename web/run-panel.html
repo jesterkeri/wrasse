@@ -73,6 +73,14 @@
     #wrasse-run li .wr-detail{color:var(--fg-muted,inherit);
       font:13px/1.5 'Geist Mono',ui-monospace,monospace}
     #wrasse-run li[data-state="running"]{font-weight:600}
+    /* The step list updates every two seconds. Between those, a static dot beside a label is
+       indistinguishable from a page that has died, and the confirmation step holds it for
+       about ninety seconds. The pulse and the counter beside it are the difference between
+       waiting and wondering. */
+    #wrasse-run li[data-state="running"] .wr-mark{animation:wr-pulse 1.1s ease-in-out infinite}
+    @keyframes wr-pulse{0%,100%{opacity:.25}50%{opacity:1}}
+    #wrasse-run .wr-waiting{color:var(--fg-subtle,inherit);
+      font:500 12px/1.5 'Geist Mono',ui-monospace,monospace;margin-top:2px}
     #wrasse-run li[data-state="pending"],#wrasse-run li[data-state="skipped"]{opacity:.42}
     #wrasse-run a{color:inherit}
     #wrasse-run table{border-collapse:separate;border-spacing:0;margin-top:20px;width:100%;
@@ -124,7 +132,27 @@
     ['price_wei', 'price', function (v) { return v + ' wei'; }],
     ['payout_delay', 'payout delay', function (v) { return v + ' s'; }]
   ];
-  var MARK = { pending: '·', running: '…', done: '✓', failed: '✗', skipped: '–' };
+  var MARK = { pending: '·', running: '\u25CF', done: '\u2713', failed: '\u2717', skipped: '\u2013' };
+
+  //: What a visitor is waiting for at each step, and roughly how long it takes. Measured
+  //: rather than guessed: inclusion on Base Sepolia is a block or two, and the safe head
+  //: trails the tip by about sixty-six seconds.
+  //: Timed on a real run rather than estimated. The first version of this table promised 85
+  //: seconds for the confirmation and it took 145, which is the exact failure a progress
+  //: display exists to prevent: a number that runs out while the visitor is still waiting is
+  //: worse than no number. These are the measured times rounded up.
+  var PACE = {
+    quote: ['reading both memories and settling the terms', 4],
+    create: ['waiting for the deal to be included in a block', 14],
+    accept: ['waiting for the stake to be included', 12],
+    deliver: ['waiting for delivery to be included', 12],
+    release: ['waiting for the release to be included', 14],
+    confirm: ['this is the long one. Base has to treat the outcome as permanent before '
+      + 'either memory is allowed to record it', 150],
+    teach: ['writing the outcome into both memories', 5]
+  };
+
+  var ticker = null;
 
   var root = document.getElementById('wrasse-run');
   var controls = document.getElementById('wr-controls');
@@ -222,9 +250,39 @@
         text(link, step.tx_hash.slice(0, 10) + '…' + step.tx_hash.slice(-8));
         body.appendChild(link);
       }
+      if (step.status === 'running') {
+        var waiting = document.createElement('div');
+        waiting.className = 'wr-waiting';
+        waiting.setAttribute('data-since', step.started_at || '');
+        var pace = PACE[step.name] || ['working', 10];
+        waiting.setAttribute('data-says', pace[0]);
+        waiting.setAttribute('data-usual', String(pace[1]));
+        body.appendChild(waiting);
+      }
       li.appendChild(body);
       stepList.appendChild(li);
     });
+    tick();
+  }
+
+  function tick() {
+    // Driven on its own second, not on the two second poll, so the number a visitor is
+    // watching moves at the rate they expect rather than in jumps.
+    if (ticker) clearInterval(ticker);
+    var live = stepList.querySelector('.wr-waiting');
+    if (!live) return;
+    var since = Date.parse(live.getAttribute('data-since') || '');
+    var says = live.getAttribute('data-says');
+    var usual = Number(live.getAttribute('data-usual'));
+    function paint() {
+      var seconds = isFinite(since) ? Math.max(0, Math.round((Date.now() - since) / 1000)) : 0;
+      text(live, says + ' \u2014 ' + seconds + 's so far, usually about ' + usual + 's');
+    }
+    paint();
+    ticker = setInterval(function () {
+      if (!live.isConnected) { clearInterval(ticker); ticker = null; return; }
+      paint();
+    }, 1000);
   }
 
   function note(message) {
@@ -298,6 +356,7 @@
   function finish(message) {
     clearInterval(timer);
     timer = null;
+    if (ticker) { clearInterval(ticker); ticker = null; }
     button.disabled = false;
     text(button, 'Run it again');
     if (message) note(message);
@@ -312,6 +371,7 @@
       var body = { session_id: sessionId, profile: chosen, baseline: baseline() };
       var queued = await post('/api/execute', body);
       var runId = queued.run_id;
+      note('Four transactions and one confirmation, about three and a half minutes, most of it waiting for Base to treat the result as permanent. You can leave this open and come back; nothing here depends on the tab staying focused.');
       text(countLabel, 'run ' + queued.run_number + ' of ' + queued.runs_allowed);
 
       timer = setInterval(async function () {

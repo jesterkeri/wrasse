@@ -153,11 +153,19 @@ bounding a single visitor rather than about the total.
 One worker, one run at a time. Serialising is correct for two shared wallets rather than a
 limitation to engineer around, and the page reports queue position so a wait is legible.
 
-| step | waits for | roughly |
+| step | waits for | measured |
 |---|---|---|
-| create, accept, deliver, release | inclusion | 10s each |
-| confirm at the safe head | Base Sepolia's safe head | 66 to 90s |
-| whole run | | under 2 minutes |
+| quote | both memories and the settlement | 4s |
+| create, accept, deliver, release | inclusion | 10 to 14s each |
+| confirm at the safe head | Base treating the outcome as permanent | 145s |
+| teach | writing it into both memories | 5s |
+| whole run | | about 3.5 minutes |
+
+Timed on a real run on 2026-09-08 rather than estimated. An earlier version of this table said
+the confirmation took 66 to 90 seconds, which was the safe-head lag when the orchestrator was
+written. The lag is not a constant: it read 82 seconds the same afternoon the run waited 145.
+Quote the upper end to anyone, because a progress display whose estimate runs out while the
+visitor is still waiting is worse than one that gives no estimate.
 
 So the third visitor in a queue waits several minutes. The quote surface is unqueued and
 instant, so the memory argument lands even while the chain is busy.
