@@ -808,16 +808,21 @@ def test_the_last_run_of_a_session_refunds_without_being_asked(executing):
     for _ in range(session_module.RUNS_PER_SESSION):
         last = client.post("/api/execute", json=request).json()
 
+    # Waits for the refund to appear, not merely for the run to succeed. The worker queues the
+    # refund from its own thread after the run finishes, so the first poll can legitimately
+    # arrive before it exists. Asserting on the first poll passed on this laptop and failed on
+    # a slower CI runner, which is the difference between a test and a coincidence.
     deadline = time.time() + 5
     body = {}
     while time.time() < deadline:
         body = client.get(f"/api/run/{last['run_id']}").json()
-        if body.get("status") == "succeeded":
+        if body.get("status") == "succeeded" and body.get("refund"):
             break
         time.sleep(0.01)
 
     assert body["status"] == "succeeded"
     assert body["session"]["runs_left"] == 0
+    assert body.get("refund"), "the worker never queued the final refund"
 
     # Queued by the worker, not by this request. The GET only reports it, so a visitor who
     # closed the tab after their last transaction still gets their escrow back.
