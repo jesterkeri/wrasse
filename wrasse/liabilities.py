@@ -59,17 +59,25 @@ def _connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(destination, timeout=30)
     try:
         connection.execute("pragma journal_mode=wal")
-        # Migration is a reset, not a claim of compatibility, which is this project's stated
-        # rule everywhere it stores anything. An index written by an older shape describes
-        # deals whose ids it cannot express, so keeping it would mean serving from a file this
-        # code cannot read correctly. A reset here is safe in a way it would not be for memory:
-        # the chain still holds the deals, and the reclaim's own refusal to serve on an
-        # unreadable index is what stops the reset from hiding one.
+        # Migrated, never dropped. "A reset, not a claim of compatibility" is this project's
+        # rule for memory, and it is the wrong rule here: a memory store can be rebuilt from
+        # receipts and this file cannot be rebuilt from anything. It is the only list of deals
+        # the escrow is still holding value for, so deleting a row deletes the route to that
+        # money. The earlier shape carried the deal id, which is the field recovery needs, so
+        # every old row becomes a new row with a synthetic intent and its id intact.
         existing = {
             row[1] for row in connection.execute("pragma table_info(open_deals)").fetchall()
         }
         if existing and "intent_id" not in existing:
-            connection.execute("drop table open_deals")
+            connection.execute("alter table open_deals rename to open_deals_v1")
+            connection.execute(_SCHEMA)
+            connection.execute(
+                "insert or ignore into open_deals"
+                "(intent_id, session_id, opened_at, tx_hash, deal_id, detail) "
+                "select 'migrated:' || deal_id, session_id, opened_at, null, deal_id, detail "
+                "from open_deals_v1"
+            )
+            connection.execute("drop table open_deals_v1")
         connection.execute(_SCHEMA)
         yield connection
         connection.commit()

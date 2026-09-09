@@ -251,6 +251,11 @@ class Run:
     status: str = QUEUED
     error: str | None = None
     deal_id: int | None = None
+    #: The identity the transaction ledger will file this run's creation under, derived from
+    #: the quote rather than read back from a reply. A liability written before signing has to
+    #: be keyed on something a later process can look up, and the reply is the thing a timeout
+    #: takes away.
+    intent_id: str | None = None
     #: Deals this run is responsible for driving to a terminal state before it collects. Only
     #: a refund run carries any: it is filled from every settlement the session performed, so a
     #: run that failed halfway does not leave its deposit behind a deal nobody will finish.
@@ -726,17 +731,43 @@ class Runner:
             self._liabilities.attach(str(row["intent_id"]), deal_id=deal_id)
             step.detail = f"deal {deal_id} was left unnamed by a previous process"
 
-        blind = [
-            row for row in self._liabilities.rows(None)
-            if not row["tx_hash"] and row["deal_id"] is None
-        ]
-        if blind:
-            raise ExecutionError(
-                "these creations were begun and never recorded as sent or refused: "
-                + ", ".join(str(row["intent_id"]) for row in blind)
-                + ". Whether they moved value is not knowable from here, so no further deal "
-                "will be signed until an operator resolves them."
-            )
+        # A row with no hash is one whose creation reply was lost: a timeout, a killed process,
+        # a reply that would not parse. It used to be treated as unknowable and closed the
+        # queue, which turned one transient subprocess failure into a service no judge could
+        # use. It is knowable, because the row is keyed on the identity the ledger files the
+        # send under, so the ledger can be asked what became of it.
+        for row in [r for r in self._liabilities.rows(None)
+                    if not r["tx_hash"] and r["deal_id"] is None]:
+            intent = str(row["intent_id"])
+            found = self._ledger_row(run, intent)
+            if found is None:
+                # The ledger never took a nonce for it, so nothing was signed and nothing can
+                # be escrowed behind it.
+                self._liabilities.discard(intent)
+                continue
+            if not found.get("tx_hash"):
+                # Signed and never broadcast. The ledger frees that nonce itself; there is no
+                # deal, so there is nothing to recover.
+                self._liabilities.discard(intent)
+                continue
+            self._liabilities.attach(intent, tx_hash=str(found["tx_hash"]))
+            try:
+                deal_id = self._deal_id(str(found["tx_hash"]))
+            except Exception:  # noqa: BLE001 - a send that never made a deal has no receipt
+                # Included and reverted, or still absent. Either way no deal exists yet; the
+                # ledger's own resolution governs the nonce and the row stays for the next boot.
+                continue
+            self._liabilities.attach(intent, deal_id=deal_id)
+            step.detail = f"deal {deal_id} was left unnamed by a previous process"
+
+    def _ledger_row(self, run: Run, intent_id: str) -> dict[str, Any] | None:
+        """What the transaction ledger holds for one intent, or nothing if it holds none."""
+
+        rows = self._cli(run, ["tx-status", "--intent", intent_id])
+        for row in rows if isinstance(rows, list) else []:
+            if str(row.get("intent_id")) == intent_id:
+                return row
+        return None
 
     def _collect(self, run: Run, step: Step) -> list[str]:
         """Empty the escrow into the two wallets, and say which sides it collected for.
@@ -879,6 +910,11 @@ class Runner:
         import json
 
         document = json.loads(document_path.read_text(encoding="utf-8"))
+        # The identity the CLI will use for this creation, computed here rather than read back
+        # from its reply. That is the whole point: a reply is exactly what a timeout loses, and
+        # a liability keyed on something only the reply carries cannot be looked up afterwards.
+        # `intent_id` is `{request_id}:{profile}` and both halves are already in this file.
+        run.intent_id = f"{document['request_id']}:{run.profile}"
         profiles = document["buyer"]["profiles"]
         if run.profile not in profiles:
             raise ExecutionError(f"{run.profile} is not a profile this engine produces")
@@ -981,7 +1017,7 @@ class Runner:
         # in an Offered deal, and the receipt read that turns that into an id is a separate
         # call that can fail or be killed with the process. A crash there left a deposit on
         # chain with nothing durable pointing at it.
-        self._liabilities.open_intent(run.run_id, run.session_id)
+        self._liabilities.open_intent(run.intent_id or run.run_id, run.session_id)
         sent = self._cli(run, [
             "create-deal",
             "--policy", str(run.workdir / "policy.json"),
@@ -996,17 +1032,17 @@ class Runner:
             # Nothing reached a node, so nothing is escrowed and the row would be a liability
             # that does not exist. This is the only case in which a row is dropped without the
             # chain having said what became of it.
-            self._liabilities.discard(run.run_id)
+            self._liabilities.discard(run.intent_id or run.run_id)
             raise ExecutionError(sent.get("error", "the deal was refused before sending"))
 
         step.tx_hash = sent.get("tx_hash")
-        self._liabilities.attach(run.run_id, tx_hash=sent.get("tx_hash"))
+        self._liabilities.attach(run.intent_id or run.run_id, tx_hash=sent.get("tx_hash"))
         self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
 
         # The id exists nowhere until the log does, so every later step waits on this read
         # rather than on the wallet being free.
         run.deal_id = self._deal_id(sent["tx_hash"])
-        self._liabilities.attach(run.run_id, deal_id=run.deal_id)
+        self._liabilities.attach(run.intent_id or run.run_id, deal_id=run.deal_id)
         self._end(step, detail=f"deal {run.deal_id} is open")
         return sent
 

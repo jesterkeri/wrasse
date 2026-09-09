@@ -137,6 +137,9 @@ class Sessions:
         #: the thing that knows a run is in flight and this module must not depend on it.
         self._busy = busy
         self._on_evict = on_evict
+        #: Sessions whose databases are being copied right now. Counted in the admission check
+        #: so concurrent creates cannot all pass it before any of them lands.
+        self._pending = 0
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
         self._order: list[str] = []
@@ -155,8 +158,13 @@ class Sessions:
         # exceeding a disk bound. But a public endpoint could then create sessions faster than
         # the single worker drains them and every one would be busy, so the bound stopped
         # binding at exactly the moment it mattered. Refusing here is the other half.
+        # A reservation, not just a check. The copy is slow and happens outside the lock, on
+        # purpose: holding a registry lock across file I/O is how one visitor's disk stalls
+        # everybody's quote. But that meant several concurrent creates all passed the check
+        # before any of them added a session, so a public burst went straight past the bound.
+        # Counting reservations in the check closes that without holding the lock any longer.
         with self._lock:
-            if len(self._order) >= self._limit and all(
+            if len(self._order) + self._pending >= self._limit and all(
                 self._busy is not None and self._busy(self._sessions[held])
                 for held in self._order
             ):
@@ -165,14 +173,21 @@ class Sessions:
                     "them still has work in flight or a deposit to collect. One worker settles "
                     "one deal at a time, so this clears on its own. Try again shortly."
                 )
+            self._pending += 1
 
         session_id = uuid.uuid4().hex
         directory = self._root / session_id
-        paths = {}
-        for role, origin in self._source.items():
-            destination = directory / f"{role}-memory.db"
-            copy_database(origin, destination)
-            paths[role] = destination
+        try:
+            paths = {}
+            for role, origin in self._source.items():
+                destination = directory / f"{role}-memory.db"
+                copy_database(origin, destination)
+                paths[role] = destination
+        except Exception:
+            with self._lock:
+                self._pending -= 1
+            raise
+
         session = Session(
             session_id=session_id,
             directory=directory,
@@ -180,6 +195,7 @@ class Sessions:
             paths=paths,
         )
         with self._lock:
+            self._pending -= 1
             self._sessions[session_id] = session
             self._order.append(session_id)
             self._evict()
@@ -204,12 +220,31 @@ class Sessions:
             session.finishing = True
             return True
 
-    def abandon_finishing(self, session: Session) -> None:
-        """Give the claim back, for a refund that failed and may be retried."""
+    def settle_refund(self, session: Session, run_id: str, *, succeeded: bool) -> bool:
+        """Record how one refund ended, but only if the session still names that refund.
+
+        A compare and transition rather than a write. Two callers reconciling the same failed
+        refund could otherwise have the first clear a claim the second has already replaced,
+        which leaves a queued withdrawal that nothing tracks: a settlement can be admitted while
+        it is in flight, or a second withdrawal queued behind it. Naming the refund the caller
+        observed is what makes the write safe.
+
+        Returns whether this caller's view was still the current one.
+        """
 
         with self._lock:
-            session.finishing = False
-            session.refund_run_id = None
+            if session.refund_run_id != run_id:
+                return False
+            if succeeded:
+                session.refunded = True
+                session.finishing = False
+            else:
+                # Retryable, and it must be. A withdrawal can revert or time out with credit
+                # still in the escrow, and a session that stayed marked finished would report
+                # success over money nobody could reach.
+                session.finishing = False
+                session.refund_run_id = None
+            return True
 
     def admit(self, session: Session, publish: Callable[[], None]) -> None:
         """Charge a run against a session and publish it, as one transition.

@@ -1076,11 +1076,19 @@ def test_a_creation_left_unnamed_by_a_crash_is_resolved_from_its_receipt(
     assert held.closed == [11]
 
 
-def test_a_creation_that_was_never_recorded_as_sent_closes_the_queue(environment, tmp_path):
-    """Whether value moved is not knowable from here, so nothing more may be signed."""
+def test_a_creation_with_no_ledger_row_is_discarded_rather_than_closing_the_queue(
+    environment, tmp_path
+):
+    """A lost reply is knowable, because the row is keyed on the ledger's own identity.
+
+    This used to be treated as unknowable and closed the queue to every settlement, which
+    turned one transient subprocess timeout into a service no judge could use. The ledger
+    commits its row before broadcasting, so a ledger that has never heard of this intent is
+    proof that nothing was signed and nothing can be escrowed behind it.
+    """
 
     held = FakeLiabilities(extra_rows=[{
-        "intent_id": "blind", "session_id": "s", "tx_hash": None, "deal_id": None,
+        "intent_id": "lost-reply", "session_id": "s", "tx_hash": None, "deal_id": None,
     }])
     run = Run(
         run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
@@ -1092,9 +1100,67 @@ def test_a_creation_that_was_never_recorded_as_sent_closes_the_queue(environment
 
     Runner(command=command, liabilities=held, sleep=lambda _: None).execute(run)
 
-    assert run.status == executor.FAILED
-    assert "blind" in run.error
-    assert "not knowable" in run.error
+    assert run.status == executor.SUCCEEDED, run.error
+    assert held.discarded == ["lost-reply"]
+    assert held.rows() == []
+
+
+def test_a_creation_the_ledger_knows_about_is_resolved_into_a_deal(environment, tmp_path):
+    """The reply was lost; the ledger was not. Its hash is enough to name the deal."""
+
+    chain = _Recovering()
+    held = FakeLiabilities(extra_rows=[{
+        "intent_id": "lost-reply", "session_id": "s", "tx_hash": None, "deal_id": None,
+    }])
+    deals = {21: {"state": "Offered", "accept_by": 1, "deadline": 1, "payout_available_at": 1}}
+
+    class WithLedger(_Recovering):
+        def __call__(self, argv, env, timeout):
+            if argv[0] == "tx-status":
+                return 0, json.dumps([
+                    {"intent_id": "lost-reply", "status": "included_success",
+                     "tx_hash": "0xcreate"}
+                ]), ""
+            return _Recovering.__call__(self, argv, env, timeout)
+
+    chain = WithLedger()
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+
+    Runner(
+        command=chain, deal_id_reader=lambda tx_hash: 21,
+        balance_reader=lambda: {"buyer": 1, "provider": 10**18},
+        credit_reader=lambda: {"buyer": 10**14, "provider": 0},
+        deal_reader=lambda deal_id: deals[deal_id], chain_now=lambda: 10**9,
+        liabilities=held, sleep=lambda _: None, clock=bounded_clock(),
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert chain.closed == [("cancel-unaccepted", "21")]
+    assert held.closed == [21]
+
+
+def test_the_ledger_commits_its_row_before_it_broadcasts(environment):
+    """The ordering the discard rule rests on, asserted rather than assumed.
+
+    "No ledger row means nothing was signed" is only safe because the row is written first. If
+    the broadcast came first, a lost reply could mean a transaction in the mempool with no
+    durable trace, and discarding its liability would throw away the deposit.
+    """
+
+    source = (REPO / "wrasse" / "cli.py").read_text(encoding="utf-8")
+    for anchor in ("record_signed(", "chain.SEND_ATTEMPTED", "chain.broadcast("):
+        assert anchor in source, f"{anchor} is no longer how a send is recorded"
+
+    signed = source.index("row, created = ledger.record_signed(")
+    attempted = source.index("chain.SEND_ATTEMPTED", signed)
+    broadcast = source.index("chain.broadcast(", signed)
+    assert signed < attempted < broadcast, (
+        "the ledger row must be committed before the bytes reach a node, or a lost reply "
+        "cannot be told apart from a transaction nobody recorded"
+    )
 
 
 def test_a_creation_refused_before_broadcast_leaves_no_liability(environment, tmp_path):
@@ -1117,7 +1183,7 @@ def test_a_creation_refused_before_broadcast_leaves_no_liability(environment, tm
 
     assert run.status == executor.FAILED
     assert held.rows() == [], "an unsent creation was left recorded as a live deposit"
-    assert held.discarded == [run.run_id]
+    assert held.discarded == [run.intent_id], "discarded under a key recovery cannot look up"
 
 
 def test_a_run_that_ends_properly_leaves_nothing_in_the_index(environment):

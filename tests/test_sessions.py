@@ -287,3 +287,66 @@ def test_a_finished_session_cannot_start_another_settlement(tmp_path):
     session.refunded = True
     with pytest.raises(PermissionError):
         registry.spend(session)
+
+
+def test_a_session_being_copied_counts_against_the_limit(tmp_path):
+    """The copy is slow and happens outside the lock, which is right and was also the hole.
+
+    Several concurrent creates all passed the admission check before any of them added a
+    session, so a public burst went straight past the stated bound. Driven through the copy
+    itself, so the second create happens exactly inside the window rather than by timing.
+    """
+
+    origin = tmp_path / "buyer-memory.db"
+    sqlite3.connect(origin).close()
+    registry = sessions.Sessions(
+        {"buyer": origin}, root=tmp_path / "sessions", limit=1, busy=lambda session: False,
+    )
+
+    refused: list[str] = []
+    real_copy = sessions.copy_database
+
+    def copying(source, destination):
+        if not refused:
+            try:
+                registry.create()
+                refused.append("allowed")
+            except RuntimeError as error:
+                refused.append(str(error))
+        return real_copy(source, destination)
+
+    sessions.copy_database = copying
+    try:
+        registry.create()
+    finally:
+        sessions.copy_database = real_copy
+
+    assert refused and refused[0] != "allowed", (
+        "two creates both passed the cap before either of them landed"
+    )
+    assert "work in flight" in refused[0]
+
+
+def test_a_copy_that_fails_gives_its_reservation_back(tmp_path):
+    """A reservation that leaked would shrink the deployment's capacity on every failure."""
+
+    origin = tmp_path / "buyer-memory.db"
+    sqlite3.connect(origin).close()
+    registry = sessions.Sessions(
+        {"buyer": origin}, root=tmp_path / "sessions", limit=1, busy=lambda session: False,
+    )
+
+    real_copy = sessions.copy_database
+
+    def refusing(source, destination):
+        raise OSError("no space left on device")
+
+    sessions.copy_database = refusing
+    try:
+        with pytest.raises(OSError):
+            registry.create()
+    finally:
+        sessions.copy_database = real_copy
+
+    assert registry._pending == 0
+    assert registry.create() is not None, "the failed create cost a slot forever"

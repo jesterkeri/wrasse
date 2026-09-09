@@ -438,14 +438,22 @@ def _run_finished(run: executor.Run) -> None:
 
     from . import liabilities
 
-    # Two reasons to collect, and the second is the one a visitor cannot ask for. Either the
-    # session has spent its allowance, or this run ended with a deal still open, which is
-    # exactly the case recovery was built for and exactly the case where the page used to show
-    # an error and nothing else. Waiting for four more runs before returning the first
-    # deposit is not a recovery route.
+    # Three reasons to collect, and only the first is one a visitor can ask for.
+    #
+    # The session has spent its allowance. Or this run ended with a deal still open, which is
+    # the case recovery was built for and the one where the page used to show an error and
+    # nothing else; waiting for four more runs before returning the first deposit is not a
+    # recovery route.
+    #
+    # Or this run failed after it had a deal id. That last one exists because the liability is
+    # struck off at safe-head confirmation, one step before the memories are taught, so a run
+    # whose `reconcile` fails ends with the contract having assigned the credit and no open
+    # deal to notice it by. The chain fact is permanent at that point and the memory write is
+    # allowed to fail; the money must not depend on the write succeeding.
     spent = session.runs >= sessions.RUNS_PER_SESSION
     stranded = bool(liabilities.open_deals(session.session_id))
-    if not (spent or stranded):
+    credited = run.status == executor.FAILED and run.deal_id is not None
+    if not (spent or stranded or credited):
         return
     _refund(session)
 
@@ -686,19 +694,18 @@ def _reconcile_refund(session: sessions.Session) -> None:
     what makes it retryable; only a succeeded one sets `refunded`.
     """
 
-    if session.refund_run_id is None or session.refunded:
+    observed = session.refund_run_id
+    if observed is None or session.refunded:
         return
-    run = _queue().get(session.refund_run_id)
+    run = _queue().get(observed)
     if run is None:
         return
     if run.status == executor.SUCCEEDED:
-        session.refunded = True
-        session.finishing = False
+        _session_registry().settle_refund(session, observed, succeeded=True)
     elif run.status in (executor.FAILED, executor.REFUSED):
-        # Retryable, and it must be. A withdrawal can revert or time out with credit still in
-        # the escrow, and a session that stayed marked finished would report success over money
-        # nobody could reach.
-        _session_registry().abandon_finishing(session)
+        # Named, so a caller holding a stale view of which refund is current cannot clear a
+        # claim that has already moved on to a newer one.
+        _session_registry().settle_refund(session, observed, succeeded=False)
 
 
 def _refund(session: sessions.Session) -> dict:
@@ -726,7 +733,10 @@ def _refund(session: sessions.Session) -> dict:
         session.refund_run_id = run_id
         _queue().submit(run)
     except Exception:
-        _session_registry().abandon_finishing(session)
+        # Names the refund it was about to submit, for the same reason: a compensation that
+        # cleared whatever claim happened to be current could release somebody else's.
+        session.refund_run_id = run_id
+        _session_registry().settle_refund(session, run_id, succeeded=False)
         raise
     return {"run_id": run_id, "already_refunded": False}
 

@@ -1162,3 +1162,97 @@ def test_a_run_that_fails_with_a_deal_open_gets_a_refund_without_being_asked(
     refunds = [r for r in queue._runs.values()
                if r.session_id == session_id and r.kind == executor.REFUND]
     assert refunds, "a failed run left its deposit with no way for the visitor to recover it"
+
+
+def test_a_run_that_failed_after_moving_value_is_collected_even_with_an_empty_index(
+    executing, monkeypatch, tmp_path
+):
+    """The liability is struck off at confirmation, one step before the memories are taught.
+
+    So a run whose `reconcile` fails ends with the contract having assigned the credit, no open
+    deal to notice it by, and nothing scheduled to collect it. The chain fact is permanent at
+    that point and the memory write is allowed to fail; the money must not depend on the write.
+    """
+
+    from wrasse import executor, liabilities
+
+    client, _, queue = executing
+    session_id = client.post("/api/session").json()["session_id"]
+
+    monkeypatch.setattr(liabilities, "open_deals", lambda sid=None, **kw: [])
+
+    failed = executor.Run(
+        run_id="reconcile-failed", session_id=session_id, profile="urgent", baseline={},
+        paths={}, workdir=tmp_path,
+    )
+    failed.status = executor.FAILED
+    failed.deal_id = 31
+    failed.error = "reconcile could not reach the memory service"
+
+    service_module._run_finished(failed)
+
+    refunds = [r for r in queue._runs.values()
+               if r.session_id == session_id and r.kind == executor.REFUND]
+    assert refunds, "a confirmed deal whose memory write failed was left uncollected"
+
+
+def test_a_successful_first_run_still_does_not_trigger_an_early_refund(
+    executing, monkeypatch, tmp_path
+):
+    """The regression this project already shipped once, kept dead.
+
+    Recovery triggers on a settlement that ends with a deal still open, and for a while nothing
+    on the happy path struck its own deal off, so the first successful run finished the session
+    and the second was refused. The new failed-with-a-deal-id trigger must not bring that back
+    through the other door.
+    """
+
+    from wrasse import executor, liabilities
+
+    client, _, queue = executing
+    session_id = client.post("/api/session").json()["session_id"]
+
+    monkeypatch.setattr(liabilities, "open_deals", lambda sid=None, **kw: [])
+
+    done = executor.Run(
+        run_id="clean", session_id=session_id, profile="urgent", baseline={},
+        paths={}, workdir=tmp_path,
+    )
+    done.status = executor.SUCCEEDED
+    done.deal_id = 32
+
+    service_module._run_finished(done)
+
+    refunds = [r for r in queue._runs.values()
+               if r.session_id == session_id and r.kind == executor.REFUND]
+    assert not refunds, "run one finished the session again"
+    session = service_module._session_registry().get(session_id)
+    assert session.finishing is False
+
+
+def test_reconciling_an_older_refund_does_not_disturb_a_newer_one(executing):
+    """Two callers reconciling the same failed refund raced over one session's flags.
+
+    The first could clear a claim the second had already replaced, leaving a queued withdrawal
+    that nothing tracked. Driven by naming the ids directly, because the property is that a
+    stale view cannot write, not that one particular interleaving happens to be safe.
+    """
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    registry = service_module._session_registry()
+    session = registry.get(session_id)
+
+    assert registry.begin_finishing(session) is True
+    session.refund_run_id = "r2"
+
+    # A caller still holding the view that `r1` is current tries to release the claim.
+    moved = registry.settle_refund(session, "r1", succeeded=False)
+
+    assert moved is False
+    assert session.finishing is True, "a stale caller released a newer refund's claim"
+    assert session.refund_run_id == "r2"
+
+    # And the caller that does name the current one still works.
+    assert registry.settle_refund(session, "r2", succeeded=True) is True
+    assert session.refunded is True
