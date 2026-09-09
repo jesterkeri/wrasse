@@ -6,7 +6,12 @@
 # gitignored, correctly, because a committed build output is a claim nobody checked. So the
 # image compiles it, and the check keeps meaning what it says.
 
-FROM ghcr.io/foundry-rs/foundry:stable AS contracts
+# Pinned, not `stable`. The runtime refuses to send value to a contract whose code does not
+# match the artifact this build compiled, and two Foundry releases do not necessarily produce
+# byte-identical output from the same source and the same pinned solc. `stable` moved, this
+# image compiled something with a different hash, and the deployed service quoted perfectly and
+# then refused every settlement. This is the version that produced the reviewed artifact.
+FROM ghcr.io/foundry-rs/foundry:v1.8.1 AS contracts
 # The upstream image drops to an unprivileged user, and `WORKDIR` creates its directory owned
 # by root, so `forge` compiled fine and then could not write `contracts/out`. Root for the
 # length of one compile, in a stage whose only output is copied into the runtime image.
@@ -42,6 +47,23 @@ RUN uv sync --frozen --no-dev --extra service
 
 # The compiled artifact, from the stage that actually compiled it.
 COPY --from=contracts /src/contracts/out/ ./contracts/out/
+
+# And prove it matches the contract on Base, here, where a mismatch is a red build log rather
+# than a deployed service that quotes correctly and refuses every settlement. That is exactly
+# what shipped once: the check that catches this lives on the signing path, so nothing noticed
+# until a real settlement was attempted against the deployment. It uses the project's own
+# hashing rather than a second implementation, so a drift between them cannot hide here.
+RUN python -c "\
+import json; \
+from wrasse import escrow; \
+built = escrow.artifact_runtime_hash(); \
+recorded = json.load(open('deployments/base-sepolia.json'))['runtime_bytecode_hash']; \
+print('artifact', built); \
+print('deployed', recorded); \
+raise SystemExit(0 if built == recorded else \
+  'this image cannot reproduce the reviewed build, so the service it produces would quote ' \
+  'correctly and refuse every settlement. Pin the Foundry version that produced the artifact.')"
+
 
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

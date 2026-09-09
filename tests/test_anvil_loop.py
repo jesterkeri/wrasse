@@ -403,7 +403,10 @@ def test_create_deal_refuses_an_address_that_is_not_the_reviewed_build(
     body["block_hash"] = "0x" + bytes(web3.eth.get_block(0)["hash"]).hex()
     record.write_text(json.dumps(body))
 
-    with pytest.raises(RuntimeError, match="not the artifact this build compiled"):
+    # Both hashes are named now, because a mismatch alone does not say which side moved. A
+    # compiled hash that differs from a deployed hash which still matches the record is a
+    # toolchain that cannot reproduce the reviewed build, and that is what shipped once.
+    with pytest.raises(RuntimeError, match="this build compiled 0x"):
         main(["create-deal", "--policy", str(policy_path), "--profile", "urgent"])
 
 

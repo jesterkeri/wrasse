@@ -1012,10 +1012,15 @@ def _require_deployment_identity(web3: Web3, address: str, record: dict) -> None
         raise RuntimeError(f"the deployment record names {record['address']}, configuration names {address}")
 
     deployed = escrow.deployed_runtime_hash(web3, address)
-    if deployed != escrow.artifact_runtime_hash():
+    compiled = escrow.artifact_runtime_hash()
+    if deployed != compiled:
+        # Both hashes, because one of them alone says a mismatch happened and neither says
+        # which side moved. A deployed hash that matches the record with a compiled hash that
+        # does not is a toolchain that cannot reproduce the reviewed build, which is a
+        # different problem from a contract that is not the one this project deployed.
         raise RuntimeError(
-            f"the code at {address} hashes to {deployed}, which is not the artifact this build "
-            "compiled; refusing to send value to a contract that was not reviewed"
+            f"the code at {address} hashes to {deployed}, and this build compiled {compiled}; "
+            "refusing to send value to a contract that was not reviewed"
         )
     if deployed != record["runtime_bytecode_hash"]:
         raise RuntimeError(f"the code at {address} does not match the recorded deployment")
