@@ -157,6 +157,7 @@ RICH = {"buyer": 10**18, "provider": 10**18}
 
 
 def runner(chain: FakeChain, balances: dict[str, int] | None = None, **kwargs) -> Runner:
+    kwargs.setdefault("liabilities", FakeLiabilities())
     return Runner(
         command=chain, deal_id_reader=lambda tx_hash: 7,
         balance_reader=lambda: balances if balances is not None else RICH,
@@ -688,28 +689,53 @@ class FakeLiabilities:
     """The durable index of open deals, in memory.
 
     Injected rather than pointed at a scratch file because what these tests are about is which
-    deals the procedure asks for and which it writes off, not SQLite.
+    deals the procedure asks for and which it writes off, not SQLite. It keeps the real shape:
+    a row exists before a transaction is signed and gains its hash and then its id, because the
+    ordering is the property under test rather than an implementation detail.
     """
 
-    def __init__(self, open_by_session=None):
-        self.open = dict(open_by_session or {})
+    def __init__(self, open_by_session=None, extra_rows=None):
+        self.entries: list[dict] = list(extra_rows or [])
+        for session_id, ids in (open_by_session or {}).items():
+            for deal_id in ids:
+                self.entries.append({
+                    "intent_id": f"pre-{deal_id}", "session_id": session_id,
+                    "tx_hash": f"0x{deal_id}", "deal_id": int(deal_id),
+                })
         self.closed: list[int] = []
-        self.recorded: list[tuple[int, str]] = []
+        self.discarded: list[str] = []
 
-    def record(self, deal_id, session_id, detail=None):
-        self.recorded.append((int(deal_id), session_id))
-        self.open.setdefault(session_id, []).append(int(deal_id))
+    def open_intent(self, intent_id, session_id, detail=None):
+        self.entries.append({"intent_id": str(intent_id), "session_id": session_id,
+                             "tx_hash": None, "deal_id": None})
+
+    def attach(self, intent_id, *, tx_hash=None, deal_id=None):
+        for row in self.entries:
+            if row["intent_id"] == str(intent_id):
+                if tx_hash is not None:
+                    row["tx_hash"] = tx_hash
+                if deal_id is not None:
+                    row["deal_id"] = int(deal_id)
+
+    def discard(self, intent_id):
+        self.discarded.append(str(intent_id))
+        self.entries = [r for r in self.entries
+                        if not (r["intent_id"] == str(intent_id) and r["deal_id"] is None)]
 
     def close(self, deal_id):
         self.closed.append(int(deal_id))
-        for ids in self.open.values():
-            if int(deal_id) in ids:
-                ids.remove(int(deal_id))
+        self.entries = [r for r in self.entries if r["deal_id"] != int(deal_id)]
+
+    def rows(self, session_id=None):
+        if session_id is None:
+            return list(self.entries)
+        return [r for r in self.entries if r["session_id"] == session_id]
+
+    def unresolved(self, session_id=None):
+        return [r for r in self.rows(session_id) if r["deal_id"] is None and r["tx_hash"]]
 
     def open_deals(self, session_id=None):
-        if session_id is None:
-            return sorted({i for ids in self.open.values() for i in ids})
-        return sorted(self.open.get(session_id, []))
+        return sorted(r["deal_id"] for r in self.rows(session_id) if r["deal_id"] is not None)
 
 
 def _recovery_runner(chain, deals, liabilities=None, **kwargs):
@@ -989,3 +1015,106 @@ def test_a_refund_still_runs_when_the_queue_is_closed_to_settlements(environment
 
     assert refund.status == executor.SUCCEEDED, refund.error
     assert ran == [executor.RECLAIM, executor.REFUND]
+
+
+def test_a_deal_is_written_down_before_the_transaction_that_creates_it_is_signed(
+    environment, tmp_path
+):
+    """The id is knowable only after the value has already moved.
+
+    So writing the row when the id arrives leaves a window in which creation is included, the
+    buyer's ETH is in an Offered deal, and a crash takes the only thing that could find it.
+    The row exists before the send; the hash and the id are attached to it as they become
+    known.
+    """
+
+    chain = FakeChain()
+    held = FakeLiabilities()
+    run = make_run(environment)
+    order: list[str] = []
+
+    class Watching(FakeChain):
+        def __call__(self, argv, env, timeout):
+            if argv[0] == "create-deal":
+                order.append("row before send" if held.rows() else "SEND BEFORE ROW")
+            return FakeChain.__call__(self, argv, env, timeout)
+
+    runner(Watching(), clock=bounded_clock(), liabilities=held).execute(run)
+
+    assert order == ["row before send"], "the deposit could move with nothing pointing at it"
+    del chain
+
+
+def test_a_creation_left_unnamed_by_a_crash_is_resolved_from_its_receipt(
+    environment, tmp_path
+):
+    """A row with a hash and no id is the crash window, and the hash is enough to close it."""
+
+    chain = _Recovering()
+    held = FakeLiabilities(extra_rows=[{
+        "intent_id": "interrupted", "session_id": "a session that died",
+        "tx_hash": "0xcreate", "deal_id": None,
+    }])
+    deals = {11: {"state": "Offered", "accept_by": 1, "deadline": 1, "payout_available_at": 1}}
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+
+    Runner(
+        command=chain, deal_id_reader=lambda tx_hash: 11,
+        balance_reader=lambda: {"buyer": 1, "provider": 10**18},
+        credit_reader=lambda: {"buyer": 10**14, "provider": 0},
+        deal_reader=lambda deal_id: deals[deal_id], chain_now=lambda: 10**9,
+        liabilities=held, sleep=lambda _: None, clock=bounded_clock(),
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert chain.closed == [("cancel-unaccepted", "11")], (
+        "an offered deal nobody had named kept its deposit"
+    )
+    assert held.closed == [11]
+
+
+def test_a_creation_that_was_never_recorded_as_sent_closes_the_queue(environment, tmp_path):
+    """Whether value moved is not knowable from here, so nothing more may be signed."""
+
+    held = FakeLiabilities(extra_rows=[{
+        "intent_id": "blind", "session_id": "s", "tx_hash": None, "deal_id": None,
+    }])
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+
+    def command(argv, env, timeout):
+        return 0, json.dumps([]), ""
+
+    Runner(command=command, liabilities=held, sleep=lambda _: None).execute(run)
+
+    assert run.status == executor.FAILED
+    assert "blind" in run.error
+    assert "not knowable" in run.error
+
+
+def test_a_creation_refused_before_broadcast_leaves_no_liability(environment, tmp_path):
+    """Nothing reached a node, so a row would be a liability that does not exist."""
+
+    class Refusing(FakeChain):
+        def __call__(self, argv, env, timeout):
+            if argv[0] == "create-deal":
+                return 0, json.dumps({
+                    "intent_id": "i-create", "tx_hash": None,
+                    "status": executor.UNBROADCAST_STATUS,
+                    "error": "broadcasting was not opted into",
+                }), ""
+            return FakeChain.__call__(self, argv, env, timeout)
+
+    held = FakeLiabilities()
+    run = make_run(environment)
+
+    runner(Refusing(), clock=bounded_clock(), liabilities=held).execute(run)
+
+    assert run.status == executor.FAILED
+    assert held.rows() == [], "an unsent creation was left recorded as a live deposit"
+    assert held.discarded == [run.run_id]

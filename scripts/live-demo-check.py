@@ -203,6 +203,12 @@ if second:
     check("run 2 recorded a failure",
           any(s["name"] == "claim" and s["status"] == "done" for s in second["steps"]))
 
+# This exercises the manual Finish button, not the automatic collection the worker does when a
+# session spends its last run. Those are different mechanisms and this cannot tell them apart:
+# it presses Finish itself, so removing the worker's own trigger would not make it fail. The
+# automatic path is covered in tests/test_service.py, and covering it here would mean five real
+# settlements and twenty minutes of chain time.
+#
 # Finishing is not finished. The withdrawal has been queued and nothing has been collected
 # yet, and the distinction is what makes a failed refund retryable rather than permanent.
 status, done = call("POST", "/api/finish", {"session_id": SID})

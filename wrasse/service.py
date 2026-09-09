@@ -435,7 +435,17 @@ def _run_finished(run: executor.Run) -> None:
     session = _session_registry().get(run.session_id)
     if session is None:
         return
-    if session.runs < sessions.RUNS_PER_SESSION:
+
+    from . import liabilities
+
+    # Two reasons to collect, and the second is the one a visitor cannot ask for. Either the
+    # session has spent its allowance, or this run ended with a deal still open, which is
+    # exactly the case recovery was built for and exactly the case where the page used to show
+    # an error and nothing else. Waiting for four more runs before returning the first
+    # deposit is not a recovery route.
+    spent = session.runs >= sessions.RUNS_PER_SESSION
+    stranded = bool(liabilities.open_deals(session.session_id))
+    if not (spent or stranded):
         return
     _refund(session)
 
@@ -569,6 +579,8 @@ def open_session() -> dict:
         session = _session_registry().create()
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=429, detail=str(error)) from error
     return {**session.view(), "queue_depth": _queue().depth()}
 
 
@@ -608,25 +620,32 @@ def execute(request: ExecuteRequest) -> dict:
         _STARTED += 1
 
     try:
-        _session_registry().spend(session)
+        run_id = uuid.uuid4().hex
+        workdir = session.directory / "runs" / run_id
+        workdir.mkdir(parents=True, exist_ok=True)
+        run = executor.Run(
+            run_id=run_id,
+            session_id=session.session_id,
+            profile=request.profile,
+            outcome=request.outcome,
+            baseline=request.baseline.model_dump(),
+            paths=session.paths,
+            workdir=workdir,
+        )
+        # Charged and queued as one transition, under the lock a refund has to take to claim
+        # this session. Doing them separately left a window in which a refund ran, found the
+        # index empty, collected nothing and succeeded, and only then did the settlement it had
+        # already been charged for reach the queue and credit value nothing would collect.
+        _session_registry().admit(session, lambda: _queue().submit(run))
     except PermissionError as error:
         with _START_LOCK:
             _STARTED -= 1
         raise HTTPException(status_code=429, detail=str(error)) from error
+    except Exception:
+        with _START_LOCK:
+            _STARTED -= 1
+        raise
 
-    run_id = uuid.uuid4().hex
-    workdir = session.directory / "runs" / run_id
-    workdir.mkdir(parents=True, exist_ok=True)
-    run = executor.Run(
-        run_id=run_id,
-        session_id=session.session_id,
-        profile=request.profile,
-        outcome=request.outcome,
-        baseline=request.baseline.model_dump(),
-        paths=session.paths,
-        workdir=workdir,
-    )
-    _queue().submit(run)
     return {
         "run_id": run_id,
         "queue_position": _queue().position(run_id),
@@ -696,10 +715,24 @@ def _refund(session: sessions.Session) -> dict:
             return {"run_id": session.refund_run_id, "already_refunded": session.refunded}
         return {"run_id": None, "already_refunded": session.refunded}
 
-    run_id = uuid.uuid4().hex
-    workdir = session.directory / "runs" / run_id
-    workdir.mkdir(parents=True, exist_ok=True)
-    run = executor.Run(
+    # Everything from here to the submission is compensated. `finishing` is already claimed,
+    # and a failure between the claim and a queued job would leave a session that can never
+    # refund: no run id to report, no job to retry, and a flag that refuses every later press.
+    try:
+        run_id = uuid.uuid4().hex
+        workdir = session.directory / "runs" / run_id
+        workdir.mkdir(parents=True, exist_ok=True)
+        run = _refund_job(session, run_id, workdir)
+        session.refund_run_id = run_id
+        _queue().submit(run)
+    except Exception:
+        _session_registry().abandon_finishing(session)
+        raise
+    return {"run_id": run_id, "already_refunded": False}
+
+
+def _refund_job(session: sessions.Session, run_id: str, workdir: Path) -> executor.Run:
+    return executor.Run(
         run_id=run_id,
         session_id=session.session_id,
         kind=executor.REFUND,
@@ -707,22 +740,7 @@ def _refund(session: sessions.Session) -> dict:
         baseline={},
         paths=session.paths,
         workdir=workdir,
-        # Every deal this session opened, so the refund closes the ones that never reached an
-        # ending before it collects. A settlement that failed after `createDeal` leaves a live
-        # deal holding the price, and `withdraw` cannot see it: withdrawal collects credits, and
-        # an unfinished deal has assigned none.
-        recover=sorted({
-            other.deal_id
-            for other in _queue().runs_for(session.session_id)
-            if other.deal_id is not None
-        }),
     )
-    # `finishing` was set by the claim above; only the run id is recorded here. `refunded` is
-    # written by `_reconcile_refund` once a withdrawal has actually succeeded, because a flag
-    # set before the work made a failed refund permanent.
-    session.refund_run_id = run_id
-    _queue().submit(run)
-    return {"run_id": run_id, "already_refunded": False}
 
 
 @app.get("/api/run/{run_id}")

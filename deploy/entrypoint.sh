@@ -22,7 +22,7 @@ umask 077
 take () {
     directory=$1
     case "$directory" in
-        ""|"/"|"."|".."|"//") 
+        ""|"/"|"."|".."|"//")
             echo "refusing to take ownership of '$directory'" >&2
             exit 1 ;;
     esac
@@ -109,10 +109,17 @@ fi
 # reason is worth repeating here: an empty store and a missing mount both quote as a cold
 # start, so a service that fell back to creating one would answer "this system remembers
 # nothing" in a voice indistinguishable from the truth.
-if [ -n "${WRASSE_MEMORY_SOURCE_DIR:-}" ] && [ ! -f "${WRASSE_MEMORY_SOURCE_DIR}/buyer-memory.db" ]; then
-    echo "${WRASSE_MEMORY_SOURCE_DIR}/buyer-memory.db is missing." >&2
-    echo "Seed the volume before the first boot; see docs/DEPLOY.md." >&2
-    exit 1
+if [ -n "${WRASSE_MEMORY_SOURCE_DIR:-}" ]; then
+    # Both, not just the buyer's. Checking one let a deployment with half a seed start,
+    # report itself healthy, and fail on the first warm quote a judge asked for. A missing
+    # source is a broken mount and it should stop the boot, not the visitor.
+    for side in buyer provider; do
+        if [ ! -f "${WRASSE_MEMORY_SOURCE_DIR}/${side}-memory.db" ]; then
+            echo "${WRASSE_MEMORY_SOURCE_DIR}/${side}-memory.db is missing." >&2
+            echo "Seed the volume before the first boot; see docs/DEPLOY.md." >&2
+            exit 1
+        fi
+    done
 fi
 
 # The keystores are written above with umask 077, so they are root-owned and unreadable to the

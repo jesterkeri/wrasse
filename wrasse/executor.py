@@ -577,6 +577,7 @@ class Runner:
             # A restart inherits deals whose runs no longer exist. This is the only place that
             # can find them, and finding them is what makes the recovery claim true rather
             # than aspirational.
+            self._name_unresolved(run, step)
             inherited = self._open_liabilities(None)
             if inherited:
                 self._recover_deals(run, inherited)
@@ -691,6 +692,45 @@ class Runner:
                 f"deal {deal_id} was {deal['state']} and holding a deposit; it is now closed "
                 "and what it held has been credited"
             ))
+
+    def _name_unresolved(self, run: Run, step: Step) -> None:
+        """Turn every intent that reached a node into a deal id, or refuse to serve.
+
+        A row carrying a transaction hash and no deal id is the crash window made visible: the
+        creation may have been included and the deposit may be sitting in an Offered deal that
+        nothing in this process has ever named. The hash is enough to find out, so this reads
+        the receipt and writes the id down.
+
+        A row with neither a hash nor an id is different and worse. It means this deployment
+        was about to sign and nobody recorded what happened next, so there is no way to tell
+        from here whether value moved. That fails the reclaim, which closes the queue: a
+        service that might be holding somebody's deposit somewhere it cannot see should not be
+        opening new deals on top of it.
+        """
+
+        for row in self._liabilities.unresolved(None):
+            try:
+                deal_id = self._deal_id(str(row["tx_hash"]))
+            except Exception as error:  # noqa: BLE001
+                raise ExecutionError(
+                    f"a deal was created by {row['tx_hash']} and its id cannot be read back "
+                    f"({error}). Until it can, this service cannot tell whether that deposit "
+                    "is still in escrow, so it will not open more deals."
+                ) from error
+            self._liabilities.attach(str(row["intent_id"]), deal_id=deal_id)
+            step.detail = f"deal {deal_id} was left unnamed by a previous process"
+
+        blind = [
+            row for row in self._liabilities.rows(None)
+            if not row["tx_hash"] and row["deal_id"] is None
+        ]
+        if blind:
+            raise ExecutionError(
+                "these creations were begun and never recorded as sent or refused: "
+                + ", ".join(str(row["intent_id"]) for row in blind)
+                + ". Whether they moved value is not knowable from here, so no further deal "
+                "will be signed until an operator resolves them."
+            )
 
     def _collect(self, run: Run, step: Step) -> list[str]:
         """Empty the escrow into the two wallets, and say which sides it collected for.
@@ -929,6 +969,13 @@ class Runner:
 
     def _create(self, run: Run) -> dict[str, Any]:
         step = self._begin(run, "create")
+        # Written before the transaction is signed, not after the deal id is known. Writing it
+        # after looks safe, because the id is what recovery needs, but the id only becomes
+        # knowable once the value has already moved: creation is included, the buyer's ETH is
+        # in an Offered deal, and the receipt read that turns that into an id is a separate
+        # call that can fail or be killed with the process. A crash there left a deposit on
+        # chain with nothing durable pointing at it.
+        self._liabilities.open_intent(run.run_id, run.session_id)
         sent = self._cli(run, [
             "create-deal",
             "--policy", str(run.workdir / "policy.json"),
@@ -939,16 +986,21 @@ class Runner:
             "--service-window", str(run.baseline["service_window"]),
             "--payout-delay", str(run.baseline["payout_delay"]),
         ])
+        if sent.get("status") == UNBROADCAST_STATUS:
+            # Nothing reached a node, so nothing is escrowed and the row would be a liability
+            # that does not exist. This is the only case in which a row is dropped without the
+            # chain having said what became of it.
+            self._liabilities.discard(run.run_id)
+            raise ExecutionError(sent.get("error", "the deal was refused before sending"))
+
         step.tx_hash = sent.get("tx_hash")
+        self._liabilities.attach(run.run_id, tx_hash=sent.get("tx_hash"))
         self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
 
         # The id exists nowhere until the log does, so every later step waits on this read
         # rather than on the wallet being free.
         run.deal_id = self._deal_id(sent["tx_hash"])
-        # Written down before anything else happens to it. Everything that knows this deal
-        # exists is in process memory and dies with the process; this file is what lets a
-        # restarted service find a deposit whose run it can no longer remember.
-        self._record_liability(run.deal_id, run.session_id, sent.get("tx_hash"))
+        self._liabilities.attach(run.run_id, deal_id=run.deal_id)
         self._end(step, detail=f"deal {run.deal_id} is open")
         return sent
 
@@ -987,9 +1039,6 @@ class Runner:
         step.tx_hash = release.get("tx_hash")
         self._cli(run, ["reconcile", "--tx", release["tx_hash"]])
         self._end(step, detail="both memories now hold this outcome")
-
-    def _record_liability(self, deal_id: int, session_id: str, tx_hash: str | None) -> None:
-        self._liabilities.record(deal_id, session_id, detail={"create_tx": tx_hash})
 
     def _forget_liability(self, deal_id: int) -> None:
         self._liabilities.close(deal_id)

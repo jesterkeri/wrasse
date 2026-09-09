@@ -292,10 +292,10 @@
   }
 
   function drawKnown(run) {
-    // Shown the moment the release is included, roughly ten seconds in, while the memory step
-    // still runs underneath. The agent is not waiting to find out what happened; it found out
-    // immediately and checked it against five things. Presenting the wait as ignorance was
-    // making a guarantee look like a delay.
+    // Shown the moment the ending is included, while the confirmation step still runs
+    // underneath. What is known at this point is that the transaction is in a block and the
+    // contract has assigned the money; the five-way evidence check happens later, after the
+    // safe head, and the visible copy says so.
     if (known || !run.settled || !run.settled.agreed) return;
     //: Whichever step ends this deal, not `release` alone. Two of the three endings never send
     //: a release at all, so keying on it meant the settled card never appeared for them.
@@ -535,6 +535,14 @@
               + 'nothing was signed.');
           } else if (run.status === 'failed') {
             finish(run.error || 'the run stopped');
+            // A run that failed after opening a deal has left a deposit in the escrow, and
+            // this is the visitor's route to getting it back. It used to be hidden here, so
+            // the only way out was to perform four more settlements or to wait for an
+            // operator. The server queues the recovery itself when a run ends with a deal
+            // still open; this shows it happening, and leaves the button for anyone who
+            // reloads before it lands.
+            finishButton.hidden = !!(run.session || {}).refunded;
+            if (run.refund) watchRefund(run.refund.run_id);
           }
         } catch (error) {
           finish(String(error.message || error));

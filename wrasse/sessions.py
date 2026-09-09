@@ -150,6 +150,22 @@ class Sessions:
         succeed for something already issued has no such shape.
         """
 
+        # Capacity is an admission rule, not only a deletion rule. Eviction skips busy
+        # sessions, correctly, since deleting the files under a running worker is worse than
+        # exceeding a disk bound. But a public endpoint could then create sessions faster than
+        # the single worker drains them and every one would be busy, so the bound stopped
+        # binding at exactly the moment it mattered. Refusing here is the other half.
+        with self._lock:
+            if len(self._order) >= self._limit and all(
+                self._busy is not None and self._busy(self._sessions[held])
+                for held in self._order
+            ):
+                raise RuntimeError(
+                    f"this deployment is holding its {self._limit} sessions and every one of "
+                    "them still has work in flight or a deposit to collect. One worker settles "
+                    "one deal at a time, so this clears on its own. Try again shortly."
+                )
+
         session_id = uuid.uuid4().hex
         directory = self._root / session_id
         paths = {}
@@ -195,27 +211,50 @@ class Sessions:
             session.finishing = False
             session.refund_run_id = None
 
+    def admit(self, session: Session, publish: Callable[[], None]) -> None:
+        """Charge a run against a session and publish it, as one transition.
+
+        `publish` queues the work, and it runs under the same lock that `begin_finishing`
+        takes. Charging and publishing separately left a window between them: a refund could
+        claim the session, run, find the index empty, collect nothing and succeed, and only
+        then would the already-charged settlement be queued, create a deal and credit value
+        that no refund was scheduled to collect.
+
+        The lock ordering is one way, always. This takes the registry's lock and then the
+        queue's; nothing takes them the other way round.
+        """
+
+        with self._lock:
+            self._check(session)
+            session.runs += 1
+            try:
+                publish()
+            except Exception:
+                session.runs -= 1
+                raise
+
+    def _check(self, session: Session) -> None:
+        """Whether a settlement may start. Called with the lock held."""
+
+        # The allowance first, because spending it is what triggers the refund, so a visitor
+        # who used all five would otherwise be told they had finished the session when what
+        # they did was reach its limit. Both are refusals; only one is the reason.
+        if session.runs >= self._runs:
+            raise PermissionError(
+                f"this session has run {session.runs} settlements, which is its limit. "
+                "Both wallets are shared and faucet-funded. Start a new session to run more."
+            )
+        if session.finishing or session.refunded:
+            raise PermissionError(
+                "this session has been finished and its escrow collected. A settlement "
+                "started now would leave its deposit behind. Start a new session."
+            )
+
     def spend(self, session: Session) -> None:
         """Record a run against a session, or refuse when it has used its allowance."""
 
         with self._lock:
-            # The allowance first, because spending it is what triggers the refund, so a
-            # visitor who used all five would otherwise be told they had finished the session
-            # when what they did was reach its limit. Both are refusals; only one is the
-            # reason.
-            if session.runs >= self._runs:
-                raise PermissionError(
-                    f"this session has run {session.runs} settlements, which is its limit. "
-                    "Both wallets are shared and faucet-funded. Start a new session to run more."
-                )
-            # A finished session cannot start another settlement. Its refund has already
-            # collected, or is collecting, whatever the escrow was holding, so a later run
-            # would credit the escrow again with nothing scheduled to empty it.
-            if session.finishing or session.refunded:
-                raise PermissionError(
-                    "this session has been finished and its escrow collected. A settlement "
-                    "started now would leave its deposit behind. Start a new session."
-                )
+            self._check(session)
             session.runs += 1
 
     def _evict(self) -> None:
@@ -234,15 +273,17 @@ class Sessions:
         """
 
         keep: list[str] = []
-        while len(self._order) > self._limit:
+        # The condition counts everything still held, not just what is left to examine. An
+        # earlier version tested `self._order` alone, so moving a busy session aside shrank the
+        # thing the loop was measuring and it stopped one short: at a limit of two, three
+        # sessions with the oldest busy kept all three.
+        while self._order and len(keep) + len(self._order) > self._limit:
             oldest = self._order.pop(0)
             session = self._sessions.get(oldest)
             if session is None:
                 continue
             if self._busy is not None and self._busy(session):
                 keep.append(oldest)
-                if len(keep) + len(self._order) <= self._limit:
-                    break
                 continue
             self._sessions.pop(oldest, None)
             if self._on_evict is not None:

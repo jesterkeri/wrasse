@@ -205,7 +205,7 @@ def test_eviction_leaves_a_session_that_is_still_running(tmp_path):
     sqlite3.connect(origin).close()
     busy_ids: set[str] = set()
     registry = sessions.Sessions(
-        {"buyer": origin}, root=tmp_path / "sessions", limit=1,
+        {"buyer": origin}, root=tmp_path / "sessions", limit=2,
         busy=lambda session: session.session_id in busy_ids,
     )
 
@@ -219,6 +219,35 @@ def test_eviction_leaves_a_session_that_is_still_running(tmp_path):
     assert registry.get(idle.session_id) is None
 
 
+def test_creation_is_refused_when_every_retained_session_is_still_busy(tmp_path):
+    """Capacity is an admission rule, not only a deletion rule.
+
+    Eviction skips busy sessions, which is right: deleting files under a running worker is
+    worse than exceeding a disk bound. But a public endpoint could then create sessions faster
+    than the single worker drains them, every one would be busy, and the bound stopped binding
+    at the moment it mattered. Refusing is the other half of it.
+    """
+
+    origin = tmp_path / "buyer-memory.db"
+    sqlite3.connect(origin).close()
+    busy_ids: set[str] = set()
+    registry = sessions.Sessions(
+        {"buyer": origin}, root=tmp_path / "sessions", limit=2,
+        busy=lambda session: session.session_id in busy_ids,
+    )
+
+    for _ in range(2):
+        busy_ids.add(registry.create().session_id)
+
+    with pytest.raises(RuntimeError) as raised:
+        registry.create()
+    assert "work in flight" in str(raised.value)
+
+    # And it clears on its own, which is the whole reason it is a refusal rather than an error.
+    busy_ids.clear()
+    assert registry.create() is not None
+
+
 def test_an_idle_session_is_evicted_once_it_stops_being_busy(tmp_path):
     """Kept, not exempt. A busy session that stayed forever would defeat the limit entirely."""
 
@@ -226,7 +255,7 @@ def test_an_idle_session_is_evicted_once_it_stops_being_busy(tmp_path):
     sqlite3.connect(origin).close()
     busy_ids: set[str] = set()
     registry = sessions.Sessions(
-        {"buyer": origin}, root=tmp_path / "sessions", limit=1,
+        {"buyer": origin}, root=tmp_path / "sessions", limit=2,
         busy=lambda session: session.session_id in busy_ids,
     )
 

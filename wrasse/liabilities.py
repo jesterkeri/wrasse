@@ -5,11 +5,18 @@ discards every one of them. The transaction ledger survives, but it records tran
 than deals: it can say that a `createDeal` was included and cannot say which deal id that
 produced, because the id exists only in a log the ledger does not parse.
 
-So a deal opened by a run that was interrupted had no index that could find it again. The refund
-assembled its recovery list from whatever `Run` objects the current process happened to hold,
-which after a restart is none, and the money stayed in a deal nobody would ever close. This file
-is that index: one line per deal, written the moment the id is known, removed when the deal is
-closed.
+So a deal opened by a run that was interrupted had no index that could find it again. This file
+is that index.
+
+**The row is written before the transaction is signed, not after the deal id is known.** That
+ordering is the whole point and it was wrong once. Writing after the id looks safe, because the
+id is what the recovery needs, but the id only becomes knowable after the value has already
+moved: `createDeal` is included, the buyer's ETH is in an Offered deal, and the receipt read
+that turns that into an id is a separate call that can fail, or be interrupted, or be killed
+with the process. A crash in that window left a deposit on chain with nothing durable pointing
+at it. So a row is created when the intent is, carries the transaction hash as soon as there is
+one, and gains the deal id when the receipt gives it up. A row with a hash and no id is exactly
+what boot recovery has to resolve, and it can, because a hash is enough to re-read the receipt.
 
 It is deliberately not the ledger and deliberately not a memory store. The ledger's job is
 nonces and it must not grow a second responsibility. A memory store holds what an agent believes
@@ -24,6 +31,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 #: Beside the transaction ledger by default, because the two answer the same kind of question
@@ -32,9 +40,11 @@ LIABILITY_DB = Path(os.getenv("WRASSE_LIABILITY_DB", ".wrasse/liabilities.db"))
 
 _SCHEMA = """
 create table if not exists open_deals (
-    deal_id     integer primary key,
+    intent_id   text primary key,
     session_id  text not null,
     opened_at   text not null,
+    tx_hash     text,
+    deal_id     integer,
     detail      text not null default '{}'
 )
 """
@@ -49,6 +59,17 @@ def _connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(destination, timeout=30)
     try:
         connection.execute("pragma journal_mode=wal")
+        # Migration is a reset, not a claim of compatibility, which is this project's stated
+        # rule everywhere it stores anything. An index written by an older shape describes
+        # deals whose ids it cannot express, so keeping it would mean serving from a file this
+        # code cannot read correctly. A reset here is safe in a way it would not be for memory:
+        # the chain still holds the deals, and the reclaim's own refusal to serve on an
+        # unreadable index is what stops the reset from hiding one.
+        existing = {
+            row[1] for row in connection.execute("pragma table_info(open_deals)").fetchall()
+        }
+        if existing and "intent_id" not in existing:
+            connection.execute("drop table open_deals")
         connection.execute(_SCHEMA)
         yield connection
         connection.commit()
@@ -56,22 +77,51 @@ def _connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
-def record(deal_id: int, session_id: str, *, detail: dict | None = None,
-           path: Path | None = None) -> None:
-    """Write a deal down as open. Called as soon as the id is known, before anything else.
+def open_intent(intent_id: str, session_id: str, *, detail: dict | None = None,
+                path: Path | None = None) -> None:
+    """Write down that this deployment is about to try to open a deal.
 
-    Idempotent by deal id, because a retry that re-reads the same receipt must not produce a
-    second row and a row that already exists is the truth this is trying to preserve.
+    Called before the transaction is signed. A row here with nothing else on it costs one
+    delete if the send is refused, and is the only thing that can find a deposit if the send
+    succeeds and everything after it does not.
     """
-
-    from datetime import UTC, datetime
 
     with _lock, _connect(path) as connection:
         connection.execute(
-            "insert or ignore into open_deals(deal_id, session_id, opened_at, detail) "
+            "insert or ignore into open_deals(intent_id, session_id, opened_at, detail) "
             "values (?, ?, ?, ?)",
-            (int(deal_id), session_id, datetime.now(UTC).isoformat(),
+            (str(intent_id), session_id, datetime.now(UTC).isoformat(),
              json.dumps(detail or {}, sort_keys=True)),
+        )
+
+
+def attach(intent_id: str, *, tx_hash: str | None = None, deal_id: int | None = None,
+           path: Path | None = None) -> None:
+    """Record what has become known about an intent, without ever clearing what already is."""
+
+    with _lock, _connect(path) as connection:
+        if tx_hash is not None:
+            connection.execute(
+                "update open_deals set tx_hash = ? where intent_id = ?",
+                (str(tx_hash), str(intent_id)),
+            )
+        if deal_id is not None:
+            connection.execute(
+                "update open_deals set deal_id = ? where intent_id = ?",
+                (int(deal_id), str(intent_id)),
+            )
+
+
+def discard(intent_id: str, *, path: Path | None = None) -> None:
+    """Forget an intent that never reached a node, so nothing is escrowed behind it.
+
+    Only safe for a send the ledger recorded as unbroadcast. Anything that reached a mempool
+    keeps its row until the chain says what became of it.
+    """
+
+    with _lock, _connect(path) as connection:
+        connection.execute(
+            "delete from open_deals where intent_id = ? and deal_id is null", (str(intent_id),)
         )
 
 
@@ -83,20 +133,39 @@ def close(deal_id: int, *, path: Path | None = None) -> None:
 
 
 def open_deals(session_id: str | None = None, *, path: Path | None = None) -> list[int]:
-    """Every deal still recorded as open, oldest first.
+    """Every deal whose id is known and which is still recorded as open, oldest first."""
+
+    return [int(row["deal_id"]) for row in rows(session_id, path=path)
+            if row["deal_id"] is not None]
+
+
+def unresolved(session_id: str | None = None, *, path: Path | None = None) -> list[dict]:
+    """Intents that reached a node and whose deal id was never learned.
+
+    This is the crash window made visible. A row here means a transaction may have created a
+    deal that nothing in this process has ever named, and its hash is enough to find out.
+    """
+
+    return [row for row in rows(session_id, path=path)
+            if row["deal_id"] is None and row["tx_hash"]]
+
+
+def rows(session_id: str | None = None, *, path: Path | None = None) -> list[dict]:
+    """Every recorded intent, oldest first.
 
     Without a session id this is the whole deployment, which is what a restart needs: the
     sessions that opened these deals no longer exist, and the money does.
     """
 
     with _lock, _connect(path) as connection:
+        connection.row_factory = sqlite3.Row
         if session_id is None:
-            rows = connection.execute(
-                "select deal_id from open_deals order by deal_id"
+            found = connection.execute(
+                "select * from open_deals order by opened_at, intent_id"
             ).fetchall()
         else:
-            rows = connection.execute(
-                "select deal_id from open_deals where session_id = ? order by deal_id",
+            found = connection.execute(
+                "select * from open_deals where session_id = ? order by opened_at, intent_id",
                 (session_id,),
             ).fetchall()
-    return [int(row[0]) for row in rows]
+    return [dict(row) for row in found]

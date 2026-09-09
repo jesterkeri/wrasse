@@ -1039,3 +1039,121 @@ def test_the_worker_reclaims_before_it_settles_anything(executing, monkeypatch):
     assert [run.kind for run in submitted] == [executor.RECLAIM], (
         "the worker will settle for a visitor before freeing the nonces a restart left held"
     )
+
+
+def test_a_settlement_is_published_while_the_session_is_still_locked(executing):
+    """Charging a run and publishing it used to be two steps with a gap between them.
+
+    A refund arriving in that gap claimed the session, ran, found nothing to collect and
+    succeeded. Only then did the already-charged settlement reach the queue, create a deal and
+    credit value that no refund was scheduled to collect.
+
+    The assertion is that publication happens under the lock a refund must take, which is the
+    property; a second thread would only demonstrate one interleaving of it, and the lock is
+    not reentrant so the two calls cannot be nested in one.
+    """
+
+    client, _, queue = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    registry = service_module._session_registry()
+    session = registry.get(session_id)
+    held: list[bool] = []
+
+    def publish():
+        held.append(registry._lock.locked())
+
+    registry.admit(session, publish)
+
+    assert held == [True], "a refund could claim this session between charging and queueing"
+    assert session.runs == 1
+
+
+def test_a_settlement_that_cannot_be_queued_is_not_charged(executing):
+    """The allowance is spent by a run that exists, not by one that failed to start."""
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    registry = service_module._session_registry()
+    session = registry.get(session_id)
+
+    def refuses():
+        raise OSError("no space left on device")
+
+    with pytest.raises(OSError):
+        registry.admit(session, refuses)
+
+    assert session.runs == 0, "a run that never queued still cost the visitor one of five"
+
+
+def _a_run(session):
+    from wrasse import executor
+
+    workdir = session.directory / "runs" / "probe"
+    workdir.mkdir(parents=True, exist_ok=True)
+    return executor.Run(
+        run_id="probe", session_id=session.session_id, profile="urgent",
+        baseline={"price_wei": 10**14, "provider_bond_bps": 500,
+                  "service_window": 600, "payout_delay": 1800},
+        paths=session.paths, workdir=workdir,
+    )
+
+
+def test_a_refund_that_cannot_be_queued_gives_the_session_back(executing, monkeypatch):
+    """A claim without a job is a session that can never refund.
+
+    `finishing` is set before the run directory exists and before anything is submitted. A
+    full volume between those left the flag standing with no run id to report and no job to
+    retry, so every later press returned nothing and the credits could not be collected.
+    """
+
+    client, _, queue = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    session = service_module._session_registry().get(session_id)
+
+    def refuses(run):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(queue, "submit", refuses)
+
+    with pytest.raises(OSError):
+        service_module._refund(session)
+
+    assert session.finishing is False, "the session was left claimed with nothing to retry"
+    assert session.refund_run_id is None
+
+    # And it can be asked again, which is the whole point of giving the claim back.
+    monkeypatch.undo()
+    again = service_module._refund(session)
+    assert again["run_id"] is not None
+
+
+def test_a_run_that_fails_with_a_deal_open_gets_a_refund_without_being_asked(
+    executing, monkeypatch, tmp_path
+):
+    """This is the case recovery was built for, and the page used to show only an error.
+
+    A visitor whose first run failed after creating a deal could not reach recovery at all:
+    the automatic refund waited for the fifth run, and the button was hidden on failure. The
+    deposit sat there until they performed four more settlements or an operator intervened.
+    """
+
+    from wrasse import executor, liabilities
+
+    client, _, queue = executing
+    session_id = client.post("/api/session").json()["session_id"]
+
+    monkeypatch.setattr(
+        liabilities, "open_deals",
+        lambda sid=None, **kw: [4] if sid == session_id else [],
+    )
+
+    failed = executor.Run(
+        run_id="failed", session_id=session_id, profile="urgent", baseline={},
+        paths={}, workdir=tmp_path,
+    )
+    failed.status = executor.FAILED
+    service_module._run_finished(failed)
+
+    refunds = [r for r in queue._runs.values()
+               if r.session_id == session_id and r.kind == executor.REFUND]
+    assert refunds, "a failed run left its deposit with no way for the visitor to recover it"
