@@ -242,3 +242,30 @@ def test_a_current_table_is_never_renamed_even_when_an_old_one_is_present(tmp_pa
     assert set(held) == {"live:1", "migrated:7"}
     assert held["live:1"]["deal_id"] is None
     assert held["live:1"]["tx_hash"] == "0xsigned"
+
+
+def test_a_stale_preflight_decision_is_overruled_inside_the_lock(older_database, monkeypatch):
+    """The interleaving itself, forced rather than approximated.
+
+    The two tests above reach the right outcome from a database that looks like the aftermath.
+    Neither makes a caller arrive at the lock still believing a migration is needed, which is
+    the actual race: the cheap look happens outside the lock and can be stale by the time the
+    lock is held. Codex made that point about them and it is correct, so this holds the belief
+    fixed at "yes" and checks the locked re-read overrules it.
+    """
+
+    # One opener migrates and writes a signed creation whose deal id is not known yet.
+    assert liabilities.open_deals(path=older_database) == [41]
+    liabilities.open_intent("quote-9:urgent", "a live session", path=older_database)
+    liabilities.attach("quote-9:urgent", tx_hash="0xsigned", path=older_database)
+
+    # The next one arrives at the lock still convinced there is work to do. There is not, and
+    # acting on that belief is what renamed a current table and dropped the row above.
+    monkeypatch.setattr(liabilities, "_needs_attention", lambda connection: True)
+    liabilities.rows(path=older_database)
+    monkeypatch.undo()
+
+    held = {row["intent_id"]: row for row in liabilities.rows(path=older_database)}
+    assert set(held) == {"migrated:41", "quote-9:urgent"}
+    assert held["quote-9:urgent"]["tx_hash"] == "0xsigned"
+    assert held["quote-9:urgent"]["deal_id"] is None
