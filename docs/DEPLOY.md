@@ -50,6 +50,13 @@ looks like a working system. `prepare_working_copies` refuses to serve an empty 
 source for exactly this reason, so the failure is loud rather than quiet, but the fix is to
 copy the logs.
 
+**The open-deal index must be on the volume, and it is not optional.** `liabilities.db` records
+every deal the moment its id exists and forgets it when the deal is closed. It is the only
+durable answer to "which deals are still holding a deposit": the ledger records transactions,
+and a deal id lives in a log the ledger does not parse. On boot the service closes every deal
+this file still lists and collects what they release. Put it on the volume, or a restart loses
+the money it claims to recover.
+
 **Do not copy `keystores/`, `keystore.password` or `transactions.db`.** The first two are
 secrets and belong in Railway's secret store, not on a volume that gets backed up. The third is
 the live ledger for the two wallets and must be created fresh by the deployment; carrying a
@@ -70,6 +77,7 @@ Required by both deployments:
 | `WRASSE_BUYER_MEMORY_PATH` | `/data/work/buyer-memory.db` |
 | `WRASSE_PROVIDER_MEMORY_PATH` | `/data/work/provider-memory.db` |
 | `WRASSE_TX_DB` | `/data/transactions.db`, the ledger, on the volume |
+| `WRASSE_LIABILITY_DB` | `/data/liabilities.db`, the open-deal index, on the volume |
 | `WRASSE_SESSION_ROOT` | `/data/sessions` |
 
 Only the executing deployment sets these:

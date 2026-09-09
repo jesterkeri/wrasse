@@ -31,7 +31,7 @@ take () {
 }
 
 take_volume () {
-    for path in "${WRASSE_TX_DB:-}" "${WRASSE_BUYER_MEMORY_PATH:-}" \
+    for path in "${WRASSE_TX_DB:-}" "${WRASSE_LIABILITY_DB:-}" "${WRASSE_BUYER_MEMORY_PATH:-}" \
                 "${WRASSE_PROVIDER_MEMORY_PATH:-}" "${WRASSE_COLD_BUYER_MEMORY_PATH:-}" \
                 "${WRASSE_COLD_PROVIDER_MEMORY_PATH:-}"; do
         [ -n "$path" ] || continue
