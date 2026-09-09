@@ -413,9 +413,6 @@ _START_LOCK = threading.Lock()
 #: rather than to a process, so the second would block on the first instead of excluding
 #: another process. That is a deadlock, not a mutual exclusion.
 _session_stores: dict[str, dict[str, Any]] = {}
-#: Held across the whole of the first open, which writes rather than reads. Two requests on a
-#: cold process both used to reach the writes at once.
-_open_lock = threading.Lock()
 
 
 def _queue() -> executor.Queue:

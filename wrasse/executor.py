@@ -342,6 +342,35 @@ def _default_balance_reader() -> dict[str, int]:
     }
 
 
+def _eth(wei: int) -> str:
+    """Wei to an exact ETH string, by moving the decimal point rather than dividing.
+
+    The same reasoning as on the page: a float cannot hold eighteen significant figures, so
+    0.1 ETH becomes 99999999999999998 wei and the line would be quoting a number nobody sent.
+    """
+
+    digits = str(int(wei)).rjust(19, "0")
+    whole, frac = digits[:-18], digits[-18:].rstrip("0")
+    return f"{whole}.{frac}" if frac else whole
+
+
+def _percent(bps: int) -> str:
+    """Basis points as a percentage, without a trailing zero nobody asked for."""
+
+    value = int(bps) / 100
+    return f"{value:g}%"
+
+
+def _minutes(seconds: int) -> str:
+    """Minutes once there are whole minutes to show, seconds below that."""
+
+    seconds = int(seconds)
+    if seconds < 120:
+        return f"{seconds} seconds"
+    minutes = seconds / 60
+    return f"{minutes:g} minutes"
+
+
 def _default_credit_reader() -> dict[str, int]:
     """What the escrow is holding for each wallet, as opposed to what each wallet holds.
 
@@ -943,8 +972,10 @@ class Runner:
         self._require_waitable(run, terms)
         run.settled = {"agreed": True, **terms}
         self._end(step, detail=(
-            f"bond {terms['provider_bond_bps']} bps, window {terms['service_window']}s, "
-            f"price {terms['price_wei']} wei, payout delay {terms['payout_delay']}s"
+            f"stake {_percent(terms['provider_bond_bps'])} of the price, "
+            f"deliver within {_minutes(terms['service_window'])}, "
+            f"price {_eth(terms['price_wei'])} ETH, "
+            f"paid {_minutes(terms['payout_delay'])} after delivery"
         ))
 
     #: Which settled term each ending has to outlast, and which baseline number moves it. An

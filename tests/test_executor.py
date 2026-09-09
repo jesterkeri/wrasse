@@ -1329,3 +1329,44 @@ def test_a_creation_still_in_flight_keeps_its_row_for_the_next_boot(environment,
     assert run.status == executor.SUCCEEDED, run.error
     assert held.discarded == [], "a transaction still in flight was written off"
     assert len(held.rows()) == 1
+
+
+@pytest.mark.parametrize(
+    ("wei", "expected"),
+    [
+        (118000000000000, "0.000118"),
+        (100000000000000, "0.0001"),
+        (10**18, "1"),
+        (1, "0.000000000000000001"),
+        (0, "0"),
+    ],
+)
+def test_wei_reaches_the_page_as_an_exact_eth_string(wei, expected):
+    """By moving the decimal point, never by dividing.
+
+    A float cannot hold eighteen significant figures, so 0.1 ETH becomes 99999999999999998 wei
+    and a step would be quoting a number nobody sent.
+    """
+
+    assert executor._eth(wei) == expected
+
+
+def test_the_settled_terms_are_reported_in_the_units_the_form_asked_in(environment):
+    """The visitor typed ETH, per cent and minutes, so the run says so back.
+
+    This line was the last place raw wei survived after the page was converted, and a reader
+    checking the panel against the step list found the same number written two ways.
+    """
+
+    chain = FakeChain()
+    run = make_run(environment)
+
+    runner(chain, clock=bounded_clock()).execute(run)
+
+    detail = run.step("quote").detail
+    assert "wei" not in detail, detail
+    assert "bps" not in detail, detail
+    assert "0.000118 ETH" in detail
+    assert "24.8%" in detail
+    assert "5 minutes" in detail
+    assert "15 minutes" in detail
