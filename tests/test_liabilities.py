@@ -171,9 +171,10 @@ def test_the_migration_is_one_transaction(older_database, monkeypatch):
             unfillable  text not null
         )
     """)
-    # `insert or ignore` swallows the constraint, which is why the migration counts what
-    # survived instead of trusting the insert. That count is what fails here.
-    with pytest.raises(RuntimeError, match="did not survive"):
+    # The copy refuses directly now. It used to be `insert or ignore`, which swallowed the
+    # constraint and left the row count as the only thing that could notice; a null deal id
+    # defeated that count too, which is how a live row could be dropped.
+    with pytest.raises(sqlite3.IntegrityError):
         liabilities.rows(path=older_database)
     monkeypatch.undo()
 
@@ -182,3 +183,62 @@ def test_the_migration_is_one_transaction(older_database, monkeypatch):
         columns = {row[1] for row in check.execute("pragma table_info(open_deals)")}
         assert "intent_id" not in columns, "a rolled-back migration left the new shape behind"
     assert liabilities.open_deals(path=older_database) == [41]
+
+
+def test_a_second_opener_does_not_migrate_a_table_that_is_already_current(older_database):
+    """The race that could delete a live row, driven across the decision boundary.
+
+    Two processes opening a v1 index together could both decide a migration was needed. The
+    first would do it and start serving; the second would then rename the first's *current*
+    table as though it were old, and a liability written for a signed creation but not yet
+    given its deal id would go with it. The deposit would be on chain with nothing pointing at
+    it. The decision is made under the lock now, so the second opener re-reads and finds
+    nothing to do.
+    """
+
+    # The first process migrates and then writes exactly the row that used to be lost: an
+    # intent that has been signed and whose deal id is not known yet.
+    assert liabilities.open_deals(path=older_database) == [41]
+    liabilities.open_intent("quote-9:urgent", "a live session", path=older_database)
+    liabilities.attach("quote-9:urgent", tx_hash="0xsigned", path=older_database)
+
+    # The second process, still holding the view that a migration is required, opens the file.
+    liabilities.rows(path=older_database)
+
+    held = {row["intent_id"]: row for row in liabilities.rows(path=older_database)}
+    assert "quote-9:urgent" in held, "a signed creation with no deal id yet was deleted"
+    assert held["quote-9:urgent"]["tx_hash"] == "0xsigned"
+    assert held["migrated:41"]["deal_id"] == 41
+
+
+def test_a_current_table_is_never_renamed_even_when_an_old_one_is_present(tmp_path):
+    """A leftover old table must not make the current one look old.
+
+    This is the same race seen from the other side: the recovery path for a half-finished
+    migration must copy out of the old table without touching the rows the new one already
+    holds.
+    """
+
+    path = tmp_path / "liabilities.db"
+    connection = sqlite3.connect(path)
+    connection.execute(V1_SCHEMA.replace("open_deals", "open_deals_v1"))
+    connection.execute(
+        "insert into open_deals_v1 values (7, 'gone', '2026-09-09T00:00:00+00:00', '{}')"
+    )
+    connection.execute(
+        """create table open_deals (intent_id text primary key, session_id text not null,
+           opened_at text not null, tx_hash text, deal_id integer,
+           detail text not null default '{}')"""
+    )
+    connection.execute(
+        "insert into open_deals values ('live:1', 's', '2026-09-09T00:00:00+00:00',"
+        " '0xsigned', null, '{}')"
+    )
+    connection.commit()
+    connection.close()
+
+    held = {row["intent_id"]: row for row in liabilities.rows(path=path)}
+
+    assert set(held) == {"live:1", "migrated:7"}
+    assert held["live:1"]["deal_id"] is None
+    assert held["live:1"]["tx_hash"] == "0xsigned"

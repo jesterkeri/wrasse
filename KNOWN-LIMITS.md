@@ -74,6 +74,12 @@ The private history that session had built is gone; the two receipts everything 
 not. Persisting the run procedure itself would keep the link too and was not built, because
 losing a link is an inconvenience and losing a deposit is not.
 
+**A session directory that cannot be deleted is not reported.** When copying a session's
+memories fails, the half-copied directory is removed with errors ignored, so a deletion that
+itself fails leaves a directory nothing will open and nothing will evict. It costs disk on a
+volume with five gigabytes and no path to a wrong answer, which is why it is written down here
+rather than fixed on the last day.
+
 **A refund is complete at inclusion, not at the safe head.** Every other place in this build
 that turns a transaction into a durable fact waits for confirmation first, and a withdrawal
 does not: the run reports success once the collection is in a block. A reorg of that block

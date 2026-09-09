@@ -63,45 +63,107 @@ def _tables(connection: sqlite3.Connection) -> set[str]:
     }
 
 
-def _migrate(connection: sqlite3.Connection) -> None:
-    """Bring an older index up to this shape, all of it or none of it.
+@contextmanager
+def _connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
+    # `isolation_level=None` hands transaction control to this code. Python's default mode
+    # commits DDL independently of the statements around it, which turned the migration below
+    # into four separate commits: a process killed after the rename left the rows in a table
+    # nothing reads and the new table empty, which is the same lost deposit the migration was
+    # written to prevent, reached by interruption instead of by design.
+    destination = Path(path or LIABILITY_DB)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(destination, timeout=30, isolation_level=None)
+    try:
+        connection.execute("pragma journal_mode=wal")
+        _migrate(connection)
+        connection.execute(_SCHEMA)
+        yield connection
+    finally:
+        connection.close()
 
-    One transaction covering detection, rename, create, copy and drop. SQLite makes DDL
-    transactional, so a process killed anywhere inside this leaves the database exactly as it
-    was, with the old table still under its own name and still the thing the next open finds.
 
-    It also finishes a migration a previous version left half-done, because that version
-    committed each statement separately and a database in that state is out there by
-    construction rather than by accident.
+def _needs_attention(connection: sqlite3.Connection) -> bool:
+    """A cheap unlocked look, used only to decide whether the locked look is worth taking.
+
+    Safe to be wrong in one direction and only one. A false "yes" costs a lock and a re-read. A
+    false "no" would be a missed migration, and cannot happen: this answers no only when the
+    current shape is present and no old table exists, and the only thing that creates an old
+    table is a migration, which only runs when the shape is not current.
     """
 
     tables = _tables(connection)
+    if _OLD_TABLE in tables:
+        return True
     columns = {
         row[1] for row in connection.execute("pragma table_info(open_deals)").fetchall()
     }
-    stale = _OLD_TABLE in tables
-    older = bool(columns) and "intent_id" not in columns
-    if not (stale or older):
+    return bool(columns) and "intent_id" not in columns
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Bring an older index up to this shape, all of it or none of it.
+
+    **The decision is made inside the transaction, not before it.** Deciding first and locking
+    second was a race with a real cost: two processes could both conclude a migration was
+    needed, the first would do it and start serving, and the second would then rename the
+    first's *current* table as though it were old. A liability the first process had just
+    written for a signed creation, still carrying no deal id because the receipt had not come
+    back yet, would be dropped with it, and the deposit on chain would have nothing pointing at
+    it. Codex reproduced that interleaving; this is the fix for it.
+
+    The copy is an exact mapping and its proof is a count of rows, not of deal ids. The previous
+    version used `insert or ignore` and compared deal ids, and both halves failed silently on a
+    null id: the insert ignored it because the computed key was null, and `null not in (...)` is
+    unknown rather than true, so the check passed over the row it was meant to catch.
+    """
+
+    if not _needs_attention(connection):
         return
 
     connection.execute("begin immediate")
     try:
+        # Re-read under the lock. Another process may have finished the whole migration between
+        # the cheap look above and this line, in which case there is nothing to do and doing it
+        # anyway is what destroyed a row.
+        tables = _tables(connection)
+        columns = {
+            row[1] for row in connection.execute("pragma table_info(open_deals)").fetchall()
+        }
+        stale = _OLD_TABLE in tables
+        older = bool(columns) and "intent_id" not in columns
+        if not (stale or older):
+            connection.execute("rollback")
+            return
+
         if older:
             connection.execute(f"alter table open_deals rename to {_OLD_TABLE}")
         connection.execute(_SCHEMA)
-        connection.execute(
-            f"insert or ignore into open_deals"
-            "(intent_id, session_id, opened_at, tx_hash, deal_id, detail) "
-            "select 'migrated:' || deal_id, session_id, opened_at, null, deal_id, detail "
-            f"from {_OLD_TABLE}"
-        )
+
+        source = connection.execute(
+            f"select deal_id, session_id, opened_at, detail from {_OLD_TABLE}"
+        ).fetchall()
+        for deal_id, session_id, opened_at, detail in source:
+            if deal_id is None:
+                # Unnameable, and the only way one gets here is the race above. Refusing keeps
+                # the table, and the next open migrates it once the shape is settled.
+                raise RuntimeError(
+                    f"{_OLD_TABLE} holds a row with no deal id, which this shape cannot name. "
+                    "Refusing to drop the only record of whatever it points at."
+                )
+            connection.execute(
+                "insert or replace into open_deals"
+                "(intent_id, session_id, opened_at, tx_hash, deal_id, detail) "
+                "values (?, ?, ?, null, ?, ?)",
+                (f"migrated:{int(deal_id)}", session_id, opened_at, int(deal_id),
+                 detail if detail is not None else "{}"),
+            )
+
         moved = connection.execute(
-            f"select count(*) from {_OLD_TABLE} where deal_id not in "
-            "(select deal_id from open_deals where deal_id is not null)"
+            "select count(*) from open_deals where intent_id like 'migrated:%'"
         ).fetchone()[0]
-        if moved:
+        if moved != len(source):
             raise RuntimeError(
-                f"{moved} rows of {_OLD_TABLE} did not survive the migration; refusing to "
+                f"{len(source)} rows were in {_OLD_TABLE} and {moved} arrived; refusing to "
                 "drop the only record of the deals they name"
             )
         connection.execute(f"drop table {_OLD_TABLE}")
@@ -109,32 +171,6 @@ def _migrate(connection: sqlite3.Connection) -> None:
     except Exception:
         connection.execute("rollback")
         raise
-
-
-@contextmanager
-def _connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
-    destination = Path(path or LIABILITY_DB)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    # `isolation_level=None` hands transaction control to this code. Python's default mode
-    # commits DDL independently of the statements around it, which turned the migration below
-    # into four separate commits: a process killed after the rename left the rows in a table
-    # nothing reads and the new table empty, which is the same lost deposit the migration was
-    # written to prevent, reached by interruption instead of by design.
-    connection = sqlite3.connect(destination, timeout=30, isolation_level=None)
-    try:
-        connection.execute("pragma journal_mode=wal")
-        # Migrated, never dropped. "A reset, not a claim of compatibility" is this project's
-        # rule for memory, and it is the wrong rule here: a memory store can be rebuilt from
-        # receipts and this file cannot be rebuilt from anything. It is the only list of deals
-        # the escrow is still holding value for, so deleting a row deletes the route to that
-        # money. The earlier shape carried the deal id, which is the field recovery needs, so
-        # every old row becomes a new row with a synthetic intent and its id intact.
-        _migrate(connection)
-        connection.execute(_SCHEMA)
-        yield connection
-        connection.commit()
-    finally:
-        connection.close()
 
 
 def open_intent(intent_id: str, session_id: str, *, detail: dict | None = None,
