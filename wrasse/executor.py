@@ -964,9 +964,10 @@ class Runner:
         terms = profiles[run.profile]["terms"]
         if terms["price_wei"] > MAX_PRICE_WEI:
             raise ExecutionError(
-                f"the settled price of {terms['price_wei']} wei is above this deployment's "
-                f"{MAX_PRICE_WEI} wei ceiling. Both wallets are faucet-funded and shared, so a "
-                "single run is bounded. Quote a smaller baseline price and run it again."
+                f"the settled price of {_eth(terms['price_wei'])} ETH is above this "
+                f"deployment's ceiling of {_eth(MAX_PRICE_WEI)} ETH. Both wallets are "
+                "faucet-funded and shared, so a single run is bounded. Quote a smaller "
+                "starting price and run it again."
             )
         self._require_funded(terms)
         self._require_waitable(run, terms)
@@ -1035,9 +1036,10 @@ class Runner:
         ):
             if balances.get(role, 0) < needs:
                 raise ExecutionError(
-                    f"the {role} wallet holds {balances.get(role, 0)} wei and this run needs "
-                    f"about {needs}. Both wallets are faucet-funded and shared; the demo needs "
-                    "topping up before it can settle another deal. Quoting is unaffected."
+                    f"the {role} wallet holds {_eth(balances.get(role, 0))} ETH and this run "
+                    f"needs about {_eth(needs)} ETH. Both wallets are faucet-funded and "
+                    "shared; the demo needs topping up before it can settle another deal. "
+                    "Quoting is unaffected."
                 )
 
     def _create(self, run: Run) -> dict[str, Any]:

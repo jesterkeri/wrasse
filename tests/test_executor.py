@@ -1370,3 +1370,35 @@ def test_the_settled_terms_are_reported_in_the_units_the_form_asked_in(environme
     assert "24.8%" in detail
     assert "5 minutes" in detail
     assert "15 minutes" in detail
+
+
+def test_every_error_a_visitor_can_read_is_in_the_units_they_typed(environment, monkeypatch):
+    """These two are the ones a visitor is most likely to meet, so they have to be actionable.
+
+    Both surface as `run.error`, which the page prints. "the settled price of 118000000000000
+    wei is above this deployment's 5000000000000 wei ceiling" tells somebody who typed 0.0001
+    nothing they can act on; the same sentence in ETH tells them exactly what to change.
+    """
+
+    monkeypatch.setattr(executor, "MAX_PRICE_WEI", 5 * 10**12)
+    chain = FakeChain()
+    run = make_run(environment)
+    runner(chain, clock=bounded_clock()).execute(run)
+
+    assert run.status == executor.FAILED
+    assert "wei" not in run.error, run.error
+    assert "0.000118 ETH" in run.error
+    assert "0.000005 ETH" in run.error
+
+
+def test_a_wallet_too_empty_to_finish_says_so_in_ether(environment):
+    """The other one. A balance in wei is a number nobody can compare to a faucet."""
+
+    chain = FakeChain()
+    run = make_run(environment)
+    runner(chain, balances={"buyer": 1, "provider": 10**18}, clock=bounded_clock()).execute(run)
+
+    assert run.status == executor.FAILED
+    assert "wei" not in run.error, run.error
+    assert "ETH" in run.error
+    assert "buyer wallet holds 0.000000000000000001 ETH" in run.error
