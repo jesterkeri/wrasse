@@ -217,7 +217,17 @@ def test_the_service_writes_nothing_to_the_memory_it_reads(service):
 
 
 def test_two_requests_at_once_both_succeed_with_no_queue(service):
-    """Two readers, which the stores already permit. If this ever needs a lock, a write crept in."""
+    """Two quotes at once on a cold process, which is not two readers.
+
+    This used to say that if it ever needed a lock, a write had crept in. The write was there
+    all along and the docstring was wrong: the first open copies the source into the working
+    paths, writes an identity record and commits a persona. Two requests arriving together both
+    passed the check that decides to do that and both started writing, and SQLite answered the
+    way it always does, with "database is locked".
+
+    It surfaced as a CI failure on one branch and a pass on another from the same commit, which
+    is what a race looks like from the outside. Serving is read-only; opening is not.
+    """
 
     from concurrent.futures import ThreadPoolExecutor
 
@@ -229,6 +239,35 @@ def test_two_requests_at_once_both_succeed_with_no_queue(service):
         ]
         codes = [future.result().status_code for future in results]
     assert codes == [200, 200]
+
+    # One pair per memory, not one per request. Two objects on one file would each hold their
+    # own `fcntl` description, and those exclude each other rather than the caller.
+    assert sorted(service_module._stores) == [service_module.COLD, service_module.WARM]
+
+
+def test_the_first_open_does_its_writing_under_a_lock(service, monkeypatch):
+    """Asserted directly, because two threads cannot prove it on a machine this fast.
+
+    The race needs the loser to be slow enough to arrive during the winner's writes, which a
+    CI runner managed and this laptop does not. Timing it here would pass whether the lock
+    existed or not, which is the same as not testing it. What the lock has to guarantee is
+    that the copy, the identity record and the persona commit happen with it held, so that is
+    what this checks.
+    """
+
+    client, _ = service
+    service_module._stores.clear()
+    held: list[bool] = []
+
+    real = service_module.prepare_working_copies
+    monkeypatch.setattr(
+        service_module, "prepare_working_copies",
+        lambda: (held.append(service_module._open_lock.locked()), real())[1],
+    )
+
+    assert client.get("/api/quote", params={"memory": "on"}).status_code == 200
+
+    assert held == [True], "the first open wrote without holding the lock that serialises it"
 
 
 def test_the_document_is_returned_as_produced(service):

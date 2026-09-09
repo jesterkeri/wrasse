@@ -179,24 +179,36 @@ app = FastAPI(
 )
 
 _stores: dict[str, dict[str, Any]] = {}
+#: Held across the whole of the first open, which writes rather than reads. Two requests on a
+#: cold process both used to reach the writes at once.
+_open_lock = threading.Lock()
 
 
 def _open(memory: str) -> dict[str, Any]:
     """Open one pair once and keep it. Opening per request would reread the identity record on
     every call and, worse, would make the store objects short-lived enough that two requests
     could hold two objects for one file. The file lock is per open description, so that
-    deadlocks rather than excluding."""
+    deadlocks rather than excluding.
 
-    if memory not in _stores:
-        if not _stores:
-            prepare_working_copies()
-            _initialise_metadata()
-        _stores[memory] = cli._open_stores(
-            buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
-            provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
-            paths=_PATHS[memory],
-        )
-    return _stores[memory]
+    Under a lock, because the first open is not a read. It copies the source into the working
+    paths, writes an identity record and commits a persona, and the check that decided to do
+    that work is separated from the work itself by every one of those writes. Two requests
+    arriving together on a cold process both passed it and both started writing, and SQLite
+    said what it always says to that: database is locked. Once at a time, and the second caller
+    finds the pair already there.
+    """
+
+    with _open_lock:
+        if memory not in _stores:
+            if not _stores:
+                prepare_working_copies()
+                _initialise_metadata()
+            _stores[memory] = cli._open_stores(
+                buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
+                provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
+                paths=_PATHS[memory],
+            )
+        return _stores[memory]
 
 
 #: The page, served from the same origin as the API so it needs no CORS and a share link
@@ -401,6 +413,9 @@ _START_LOCK = threading.Lock()
 #: rather than to a process, so the second would block on the first instead of excluding
 #: another process. That is a deadlock, not a mutual exclusion.
 _session_stores: dict[str, dict[str, Any]] = {}
+#: Held across the whole of the first open, which writes rather than reads. Two requests on a
+#: cold process both used to reach the writes at once.
+_open_lock = threading.Lock()
 
 
 def _queue() -> executor.Queue:
