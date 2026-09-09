@@ -984,3 +984,33 @@ def test_a_session_is_not_opened_before_the_memories_it_copies(executing):
             "select count(*) from entities where category='chain_event'"
         ).fetchone()[0]
         assert held > 0, "a session copied from an empty source is a cold start in disguise"
+
+
+def test_the_worker_reclaims_before_it_settles_anything(executing, monkeypatch):
+    """A restart leaves the ledger holding nonces for transactions nobody remembers.
+
+    The queue is serialised, so submitting the reclaim when the queue is created puts it ahead
+    of every visitor's settlement rather than merely near the front.
+    """
+
+    from wrasse import executor
+
+    # Built through `_queue` rather than through the fixture, which injects a queue directly
+    # and so never reaches the line under test. A queue that starts no thread, because what is
+    # being asserted is what was submitted and in what order, not that a worker ran it.
+    executing  # the service is configured; this test drives the constructor itself
+    submitted: list[executor.Run] = []
+
+    class Recording:
+        def submit(self, run):
+            submitted.append(run)
+
+    monkeypatch.setattr(service_module, "_QUEUE", None)
+    monkeypatch.setattr(service_module, "EXECUTION", True)
+    monkeypatch.setattr(service_module.executor, "Queue", lambda *a, **k: Recording())
+
+    service_module._queue()
+
+    assert [run.kind for run in submitted] == [executor.RECLAIM], (
+        "the worker will settle for a visitor before freeing the nonces a restart left held"
+    )

@@ -652,3 +652,180 @@ def test_an_empty_escrow_is_not_a_failed_refund(environment, tmp_path):
     assert run.status == executor.SUCCEEDED, run.error
     assert withdrawals.roles == []
     assert run.refund_wei == 0
+
+
+# ------------------------------------------------------------------------------------------
+# Closing the deals a failed run left open, which `withdraw` cannot see.
+# ------------------------------------------------------------------------------------------
+
+
+class _Recovering(_Withdrawals):
+    """A chain that accepts the three closing commands as well as a withdrawal."""
+
+    CLOSERS = ("cancel-unaccepted", "claim-timeout", "release-deal")
+
+    def __init__(self):
+        super().__init__()
+        self.closed = []
+
+    def __call__(self, argv, env, timeout):
+        if argv[0] in self.CLOSERS:
+            self.closed.append((argv[0], argv[argv.index("--deal-id") + 1]))
+            return 0, json.dumps(
+                {"intent_id": f"c-{len(self.closed)}", "tx_hash": "0xc", "status": "pending"}
+            ), ""
+        if argv[0] == "tx-resolve":
+            rows = [{"intent_id": f"c-{n}", "status": "included_success"}
+                    for n in range(1, len(self.closed) + 1)]
+            rows += [{"intent_id": f"i-{n}", "status": "included_success"}
+                     for n in range(1, len(self.roles) + 1)]
+            return 0, json.dumps(rows), ""
+        return super().__call__(argv, env, timeout)
+
+
+def _recovery_runner(chain, deals, **kwargs):
+    return Runner(
+        command=chain,
+        balance_reader=lambda: {"buyer": 1, "provider": 10**18},
+        credit_reader=lambda: {"buyer": 0, "provider": 10**14},
+        deal_reader=lambda deal_id: deals[deal_id],
+        chain_now=lambda: 10**9,
+        sleep=lambda _: None, clock=bounded_clock(), **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "command"),
+    [
+        ("Offered", "cancel-unaccepted"),
+        ("Accepted", "claim-timeout"),
+        ("Delivered", "release-deal"),
+    ],
+)
+def test_a_deal_a_failed_run_left_open_is_closed_before_the_escrow_is_collected(
+    environment, tmp_path, state, command
+):
+    """`withdraw` collects credits, and an unfinished deal has assigned none.
+
+    So a settlement that failed after `createDeal` left the price sitting inside a live deal
+    that no endpoint could reach, and the money stayed there until somebody ran a lifecycle
+    command by hand. Every state the contract can leave a deal in has exactly one action that
+    ends it, and the refund takes it.
+    """
+
+    chain = _Recovering()
+    deals = {4: {"state": state, "accept_by": 1, "deadline": 1, "payout_available_at": 1}}
+    run = _refund_run(tmp_path)
+    run.recover = [4]
+
+    _recovery_runner(chain, deals).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert chain.closed == [(command, "4")], "the open deal was left holding its deposit"
+    assert chain.roles == ["provider"], "and the collection still happened afterwards"
+
+
+@pytest.mark.parametrize("state", ["Released", "TimedOut", "Cancelled"])
+def test_a_deal_that_already_ended_is_not_touched(environment, tmp_path, state):
+    """It has assigned its credits already, and a second closing action would only revert."""
+
+    chain = _Recovering()
+    deals = {4: {"state": state, "accept_by": 1, "deadline": 1, "payout_available_at": 1}}
+    run = _refund_run(tmp_path)
+    run.recover = [4]
+
+    _recovery_runner(chain, deals).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert chain.closed == []
+
+
+def test_closing_a_deal_waits_for_the_deadline_the_contract_will_check(environment, tmp_path):
+    """`claimTimeout` reverts before the deadline, so the recovery has to sit it out too."""
+
+    chain = _Recovering()
+    deals = {4: {"state": "Accepted", "accept_by": 1, "deadline": 500,
+                 "payout_available_at": 1}}
+    run = _refund_run(tmp_path)
+    run.recover = [4]
+    seen = []
+    times = iter([100, 200, 600, 600, 600, 600])
+
+    Runner(
+        command=chain,
+        balance_reader=lambda: {"buyer": 1, "provider": 10**18},
+        credit_reader=lambda: {"buyer": 0, "provider": 10**14},
+        deal_reader=lambda deal_id: deals[deal_id],
+        chain_now=lambda: seen.append(next(times)) or seen[-1],
+        sleep=lambda _: None, clock=bounded_clock(),
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert chain.closed == [("claim-timeout", "4")]
+    assert len([t for t in seen if t < 504]) >= 2, "it did not wait for the deadline"
+
+
+def test_every_deal_the_session_opened_is_closed_not_just_the_last(environment, tmp_path):
+    """A visitor gets five runs, and any of them can be the one that failed."""
+
+    chain = _Recovering()
+    deals = {
+        1: {"state": "Released", "accept_by": 1, "deadline": 1, "payout_available_at": 1},
+        2: {"state": "Offered", "accept_by": 1, "deadline": 1, "payout_available_at": 1},
+        3: {"state": "Delivered", "accept_by": 1, "deadline": 1, "payout_available_at": 1},
+    }
+    run = _refund_run(tmp_path)
+    run.recover = [1, 2, 3]
+
+    _recovery_runner(chain, deals).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert chain.closed == [("cancel-unaccepted", "2"), ("release-deal", "3")]
+
+
+def test_a_reclaim_resolves_what_the_previous_process_left_open(environment, tmp_path):
+    """The ledger survives a restart; the queue, the sessions and the runs do not.
+
+    A row left holding a nonce makes the first visitor after a restart meet a wallet that
+    refuses to sign for a transaction they know nothing about. Resolving by query is all this
+    does: it asks the chain what happened and records the answer.
+    """
+
+    calls = []
+
+    def command(argv, env, timeout):
+        calls.append(argv[0])
+        if argv[0] == "tx-resolve":
+            return 0, json.dumps([
+                {"intent_id": "i-1", "status": "confirmed_success", "action": "resolved"},
+                {"intent_id": "i-2", "status": "confirmed_success", "action": "none"},
+            ]), ""
+        raise AssertionError(argv[0])
+
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+    Runner(command=command, sleep=lambda _: None).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert calls == ["tx-resolve"], "a reclaim must not send anything"
+    assert "1 of 2" in run.steps[0].detail
+
+
+def test_a_reclaim_that_cannot_reach_the_chain_fails_rather_than_reporting_success(
+    environment, tmp_path
+):
+    """Reporting a clean ledger it never read would let the next run take a held nonce."""
+
+    def command(argv, env, timeout):
+        return 1, "", "the rpc is unreachable"
+
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+    Runner(command=command, sleep=lambda _: None).execute(run)
+
+    assert run.status == executor.FAILED
+    assert "unreachable" in run.error

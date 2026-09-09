@@ -126,8 +126,13 @@ REFUND_STEPS: tuple[tuple[str, str], ...] = (
     ("refund", "Return what the escrow is holding to the emptier wallet"),
 )
 
-#: The two kinds of work the queue carries.
-SETTLEMENT, REFUND = "settlement", "refund"
+#: What a reclaim does, which is one thing.
+RECLAIM_STEPS: tuple[tuple[str, str], ...] = (
+    ("reclaim", "Resolve every transaction left unresolved by the previous process"),
+)
+
+#: The three kinds of work the queue carries.
+SETTLEMENT, REFUND, RECLAIM = "settlement", "refund", "reclaim"
 
 #: Statuses that free a wallet. Inclusion consumes the nonce, which is the only question the
 #: next step is asking; permanence is a different question and only the teach step asks it.
@@ -237,6 +242,10 @@ class Run:
     status: str = QUEUED
     error: str | None = None
     deal_id: int | None = None
+    #: Deals this run is responsible for driving to a terminal state before it collects. Only
+    #: a refund run carries any: it is filled from every settlement the session performed, so a
+    #: run that failed halfway does not leave its deposit behind a deal nobody will finish.
+    recover: list[int] = field(default_factory=list)
     refund_to: str | None = None
     refund_wei: int | None = None
     settled: dict[str, Any] | None = None
@@ -246,7 +255,9 @@ class Run:
 
     def __post_init__(self) -> None:
         if not self.steps:
-            shape = REFUND_STEPS if self.kind == REFUND else SHAPES[self.outcome]
+            shape = {REFUND: REFUND_STEPS, RECLAIM: RECLAIM_STEPS}.get(
+                self.kind, SHAPES.get(self.outcome, ())
+            ) or SHAPES[self.outcome]
             self.steps = [Step(name, label) for name, label in shape]
 
     def step(self, name: str) -> Step:
@@ -460,6 +471,9 @@ class Runner:
         """Quote, settle on chain, and teach both memories what happened."""
 
         run.status = RUNNING
+        if run.kind == RECLAIM:
+            self._run_reclaim(run)
+            return
         if run.kind == REFUND:
             self._run_refund(run)
             return
@@ -499,6 +513,39 @@ class Runner:
         run.status = SUCCEEDED
         run.finished_at = _now()
 
+    def _run_reclaim(self, run: Run) -> None:
+        """Free both wallets before this process serves anybody.
+
+        The ledger is the only durable thing here, and it survives a restart while the queue,
+        the sessions and the runs do not. A process that died with a transaction sent leaves a
+        row holding a nonce, and the ledger permits one unresolved transaction per wallet, so
+        the first visitor after a restart would meet a wallet that refuses to sign for a
+        transaction they know nothing about.
+
+        Resolving by query rather than resending: the chain is asked what happened to each row
+        and the answer is recorded. A row that genuinely mined frees its nonce here. A row
+        whose bytes never reached a node is a different problem and stays where it is, which is
+        what the operator escape exists for.
+
+        This does not restore the runs themselves. A visitor whose settlement was in flight
+        across a restart loses their run id and starts again; what they must not lose is the
+        deposit, and the refund's own recovery closes any deal that run left open.
+        """
+
+        step = self._begin(run, "reclaim")
+        try:
+            rows = self._cli(run, ["tx-resolve"])
+        except ExecutionError as error:
+            self._fail(run, str(error))
+            return
+        moved = [row for row in rows if row.get("action") not in (None, "none")]
+        self._end(step, detail=(
+            f"{len(moved)} of {len(rows)} transactions were still open and have been resolved"
+            if moved else "nothing was left unresolved"
+        ))
+        run.status = SUCCEEDED
+        run.finished_at = _now()
+
     def _run_refund(self, run: Run) -> None:
         """Collect what the escrow is holding and send it to whichever wallet holds less.
 
@@ -520,6 +567,7 @@ class Runner:
 
         step = self._begin(run, "refund")
         try:
+            self._recover_deals(run)
             before = self._balances()
             credits = self._credits()
             # Both sides, because which side is holding a credit depends on how the session's
@@ -570,6 +618,54 @@ class Runner:
         run.status = SUCCEEDED
         run.finished_at = _now()
 
+    #: How a deal that never reached an ending is driven to one, by the state the contract has
+    #: it in. Each is the only action that state permits, and each ends by crediting somebody.
+    #: A terminal state is absent, because there is nothing left to do to it.
+    _RECOVERY: dict[str, tuple[str, str | None]] = {
+        "Offered": ("cancel-unaccepted", "accept_by"),
+        "Accepted": ("claim-timeout", "deadline"),
+        # The buyer may release at any time, so nothing has to expire first. Releasing rather
+        # than waiting out the payout delay also ends it in the state the seller would prefer,
+        # which is the fair reading of a run this service abandoned rather than the visitor.
+        "Delivered": ("release-deal", None),
+    }
+
+    def _recover_deals(self, run: Run) -> None:
+        """Drive every deal this session opened to a terminal state, before collecting.
+
+        A settlement can fail after `createDeal` has already escrowed the price: the acceptance
+        reverts, an RPC times out, the worker is restarted. The deal is then a live liability
+        holding a deposit, and `withdraw` cannot see it, because `withdraw` collects credits and
+        an unfinished deal has assigned none. Nothing in the service used to close that gap, so
+        the money sat there until a human ran a lifecycle command by hand.
+
+        Recovery belongs here rather than in the failing run because the same procedure covers
+        the run that failed, the run that was interrupted, and the visitor who simply left. A
+        deal already terminal is skipped, so this costs one read per deal in the ordinary case.
+        """
+
+        for deal_id in run.recover:
+            deal = self._deal(deal_id)
+            action = self._RECOVERY.get(str(deal["state"]))
+            if action is None:
+                continue
+            command, expires = action
+            step = Step("recover", f"Close deal {deal_id}, which is still holding a deposit")
+            step.status = RUNNING
+            step.started_at = _now()
+            run.steps.insert(len(run.steps) - 1, step)
+            if expires is not None:
+                self._hold_until(
+                    step, int(deal[expires]) + 4, f"the deadline on deal {deal_id}"
+                )
+            sent = self._cli(run, [command, "--deal-id", str(deal_id)])
+            step.tx_hash = sent.get("tx_hash")
+            self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
+            self._end(step, detail=(
+                f"deal {deal_id} was {deal['state']} and holding a deposit; it is now closed "
+                "and what it held has been credited"
+            ))
+
     def _address(self, role: str) -> str:
         from . import cli
 
@@ -589,12 +685,21 @@ class Runner:
 
         step = self._begin(run, "wait")
         deal = self._deal(run.deal_id)
-        until = int(deal[field]) + 4
+        self._hold_until(step, int(deal[field]) + 4, what)
+        self._end(step, detail=f"{what} has passed; the claim is now allowed")
+
+    def _hold_until(self, step: Step, until: int, what: str) -> None:
+        """Poll chain time until it passes `until`, reporting what is left as it goes.
+
+        Split out of `_wait_for` because recovery waits on a deadline read from a deal it was
+        handed rather than from the run's own, and two copies of a polling loop is two places
+        for the budget to drift apart.
+        """
+
         deadline = self._clock() + WAIT_TIMEOUT
         while True:
             now = self._chain_now()
             if now is not None and now >= until:
-                self._end(step, detail=f"{what} has passed; the claim is now allowed")
                 return
             if self._clock() >= deadline:
                 raise ExecutionError(f"gave up waiting for {what} to pass")

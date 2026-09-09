@@ -58,6 +58,21 @@ third visitor in a queue waits for the two ahead of them. The bounds are
 `WRASSE_RUNS_PER_SESSION` and `WRASSE_TOTAL_RUN_CEILING`, and neither makes an empty wallet
 safe.
 
+**A restart loses every run and session, and recovers only the money.** The queue, the run
+objects and the session registry are held in process memory; the transaction ledger and the
+session databases are not. So a restart frees both wallets, because the worker resolves every
+unresolved ledger row before it will settle anything, and the escrow is recoverable, because a
+refund closes any deal a run left open. What a visitor loses is their run id and their session:
+`/api/run/{id}` returns 404 and they start again. Persisting the run procedure itself would fix
+that and was not built, because losing a link is an inconvenience and losing a deposit is not.
+
+**A refund collects the shared escrow credit, not this session's share of it.** The escrow
+aggregates credits per wallet across every deal and has no notion of a session, so one visitor
+pressing finish collects whatever the two wallets are owed at that moment, including another
+visitor's. No value leaves the pair, and the pair is the demo's own two wallets, so this is an
+accounting artefact rather than a loss. It does mean the refund figure a visitor is shown can
+include a settlement that was not theirs.
+
 **An ending that waits is bounded by `WRASSE_WAIT_TIMEOUT`, not by the contract.** Two of the
 three endings are produced by letting a deadline actually pass, so the run has to stay alive
 for the whole of it. A settled duration longer than that budget is refused at the quote, before

@@ -413,7 +413,32 @@ def _queue() -> executor.Queue:
     global _QUEUE
     if _QUEUE is None:
         _QUEUE = executor.Queue()
+        if EXECUTION:
+            _QUEUE.submit(_reclaim_run())
     return _QUEUE
+
+
+def _reclaim_run() -> executor.Run:
+    """The first thing the worker does, before it will settle anything for anybody.
+
+    A restart loses the queue, the sessions and every run, but not the ledger, and the ledger
+    permits one unresolved transaction per wallet. A row left open by the process that died
+    holds a nonce, so the first visitor after a restart would meet a wallet refusing to sign for
+    a transaction that is nothing to do with them. Submitting this at queue creation puts it
+    ahead of every settlement, because the queue is serialised.
+    """
+
+    workdir = sessions.SESSION_ROOT / "reclaim"
+    workdir.mkdir(parents=True, exist_ok=True)
+    return executor.Run(
+        run_id=uuid.uuid4().hex,
+        session_id="",
+        kind=executor.RECLAIM,
+        profile="",
+        baseline={},
+        paths=dict(_PATHS[WARM]),
+        workdir=workdir,
+    )
 
 
 def _session_registry() -> sessions.Sessions:
@@ -629,6 +654,15 @@ def _refund(session: sessions.Session) -> dict:
         baseline={},
         paths=session.paths,
         workdir=workdir,
+        # Every deal this session opened, so the refund closes the ones that never reached an
+        # ending before it collects. A settlement that failed after `createDeal` leaves a live
+        # deal holding the price, and `withdraw` cannot see it: withdrawal collects credits, and
+        # an unfinished deal has assigned none.
+        recover=sorted({
+            other.deal_id
+            for other in _queue().runs_for(session.session_id)
+            if other.deal_id is not None
+        }),
     )
     # `finishing`, not `refunded`. This stops a second press queueing a second withdrawal while
     # the first is in flight, which is all it was ever meant to do. `refunded` is written by
