@@ -110,8 +110,8 @@
     "new": "remembering half from docs/examples/policy.schema3.json at 01eaa90 / no history half from"
   },
   {
-    "name": "the comparison names what it is comparing against",
+    "name": "the comparison carries its own numbers",
     "old": "'Both sides get something, and both sides give something. The buyer gets a deposit ' + cmpRows[0].prose + ' and delivery ' + cmpRows[2].prose + ', because it paid once and got nothing. The seller gets ' + cmpRows[1].prose + ' money and its payment ' + cmpRows[3].prose + ', because it delivered once and was made to wait. Two gains each. Nobody is being punished; the terms have simply moved to match the risk each side has already proved it carries.'",
-    "new": "'Every number here is measured against the same job when the two of them have no record of each other, which is the left-hand column below. The buyer gets a deposit ' + cmpRows[0].prose + ' and delivery ' + cmpRows[2].prose + ', because it paid once and got nothing. The seller gets ' + cmpRows[1].prose + ' money and its payment ' + cmpRows[3].prose + ', because it delivered once and was made to wait. Two gains each. Nobody is being punished; the terms have simply moved to match the risk each side has already proved it carries.'"
+    "new": "'Both sides get something, and both sides give something. The buyer gets a deposit ' + cmpRows[0].prose + ', ' + cmpRows[0].warm + ' and not ' + cmpRows[0].cold + ', and delivery ' + cmpRows[2].prose + ', ' + cmpRows[2].warm + ' and not ' + cmpRows[2].cold + ', because it paid once and got nothing. The seller gets ' + cmpRows[1].prose + ' money, ' + cmpRows[1].warm + ' and not ' + cmpRows[1].cold + ', and its payment ' + cmpRows[3].prose + ', ' + cmpRows[3].warm + ' and not ' + cmpRows[3].cold + ', because it delivered once and was made to wait. Two gains each. Nobody is being punished; the terms have simply moved to match the risk each side has already proved it carries.'"
   }
 ]
