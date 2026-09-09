@@ -7,6 +7,26 @@ accepted terms on Base, and write the verified outcome back to Sibyl Memory.
 > Memory changes real economic behaviour across sessions, and the outcome comes
 > back as verified evidence.
 
+## Try it, and check it
+
+| | |
+|---|---|
+| Live demo | **https://wrasse.vercel.app** |
+| Escrow contract | [`0x5525653f05990DA1479578893b5a624183AFa22E`](https://sepolia.basescan.org/address/0x5525653f05990DA1479578893b5a624183AFa22E) on Base Sepolia, chain 84532 |
+| Deployed from | commit `7e37c8e`, solc 0.8.30, optimizer on at 200 runs, recorded in `deployments/base-sepolia.json` |
+| Settled through it so far | 25 deals: 16 delivered and paid, 8 never delivered, 1 cancelled |
+
+Nothing on that page is a recording. The quote is computed when you ask for it, the simulator
+runs the same engine over a history you choose, and the settle button performs a real deal on
+Base Sepolia and shows you its transactions while they are being mined. Every number it prints
+appears in a transaction you can open on the explorer above.
+
+Two things are worth knowing before you press anything. Both wallets are shared and funded from
+a faucet, so one worker settles one deal at a time and the page tells you your place in the
+queue. And the endings that fail take longer on purpose: a deal that is never delivered cannot
+be claimed until the delivery window has actually run out, which the contract enforces in block
+time, so it is produced rather than declared.
+
 ## Why memory is load-bearing
 
 The pricing path reads verified counterparty evidence through
