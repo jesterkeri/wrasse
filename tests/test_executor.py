@@ -1118,3 +1118,44 @@ def test_a_creation_refused_before_broadcast_leaves_no_liability(environment, tm
     assert run.status == executor.FAILED
     assert held.rows() == [], "an unsent creation was left recorded as a live deposit"
     assert held.discarded == [run.run_id]
+
+
+def test_a_run_that_ends_properly_leaves_nothing_in_the_index(environment):
+    """A finished deal that stays listed reads exactly like a stranded one.
+
+    The worker offers recovery whenever a settlement ends with a deal still open, so a happy
+    path that never struck its own deal off made the first successful run look like a failure
+    with money left behind: the session was finished on the spot and the second run refused.
+    Found by running the whole visitor path against the deployed service, not by the suite.
+    """
+
+    chain = FakeChain()
+    held = FakeLiabilities()
+    run = make_run(environment)
+
+    runner(chain, clock=bounded_clock(), liabilities=held).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert held.open_deals() == [], "a settled deal was left looking like a stranded one"
+    assert held.closed == [7]
+
+
+@pytest.mark.parametrize("outcome", [executor.TIMEOUT, executor.DELAYED])
+def test_the_endings_that_wait_also_strike_their_deal_off(environment, outcome):
+    """All three endings reach a terminal state, so all three must forget their deal."""
+
+    chain = FakeChain()
+    held = FakeLiabilities()
+    run = make_run(environment)
+    run.outcome = outcome
+    run.steps = [executor.Step(*step) for step in executor.SHAPES[outcome]]
+
+    Runner(
+        command=chain, deal_id_reader=lambda tx_hash: 7, balance_reader=lambda: RICH,
+        deal_reader=lambda deal_id: {"deadline": 1, "payout_available_at": 1},
+        chain_now=lambda: 10**9, liabilities=held,
+        sleep=lambda _: None, clock=bounded_clock(),
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert held.open_deals() == []

@@ -514,6 +514,12 @@ class Runner:
                 self._deliver(run)
                 ending = self._release(run)
             self._confirm(run, ending)
+            # Terminal on chain and permanent, so the escrow has assigned its value and
+            # `withdraw` can see it. Forgetting it here is what stops a finished deal reading
+            # as a stranded one: the worker offers recovery whenever a run ends with a deal
+            # still listed, and a happy path that never struck its own deal off made every
+            # first run look like a failure with money left behind.
+            self._forget_liability(run.deal_id)
             self._teach(run, ending)
         except _Refused:
             # Every later step is marked skipped rather than pending, so the page does not
