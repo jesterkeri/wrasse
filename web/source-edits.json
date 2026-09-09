@@ -113,5 +113,20 @@
     "name": "the comparison carries its own numbers",
     "old": "'Both sides get something, and both sides give something. The buyer gets a deposit ' + cmpRows[0].prose + ' and delivery ' + cmpRows[2].prose + ', because it paid once and got nothing. The seller gets ' + cmpRows[1].prose + ' money and its payment ' + cmpRows[3].prose + ', because it delivered once and was made to wait. Two gains each. Nobody is being punished; the terms have simply moved to match the risk each side has already proved it carries.'",
     "new": "'Both sides get something, and both sides give something. The buyer gets a deposit ' + cmpRows[0].prose + ', ' + cmpRows[0].warm + ' and not ' + cmpRows[0].cold + ', and delivery ' + cmpRows[2].prose + ', ' + cmpRows[2].warm + ' and not ' + cmpRows[2].cold + ', because it paid once and got nothing. The seller gets ' + cmpRows[1].prose + ' money, ' + cmpRows[1].warm + ' and not ' + cmpRows[1].cold + ', and its payment ' + cmpRows[3].prose + ', ' + cmpRows[3].warm + ' and not ' + cmpRows[3].cold + ', because it delivered once and was made to wait. Two gains each. Nobody is being punished; the terms have simply moved to match the risk each side has already proved it carries.'"
+  },
+  {
+    "name": "the inline quote box reads ETH like the rest of the form",
+    "old": "const raw = String(pick(st.baseline.price_wei, String(DEFAULT_BASELINE.price_wei))).trim().replace(/[_,\\s]/g, '');\n        const ok = /^\\d+$/.test(raw) && Number(raw) >= 1;\n        const changed = ok && Number(raw) !== st.committed.price_wei;",
+    "new": "// Reads ETH, like every other box on this page. It was still validating whole wei\n        // after the form was converted, so the default value failed its own check and\n        // the box sat under a red error with a perfectly valid number in it.\n        const raw = String(pick(st.baseline.price_wei, String(DEFAULT_BASELINE.price_wei))).trim().replace(/[_,\\s]/g, '');\n        const asWei = ethToWei(raw);\n        const ok = asWei !== null && asWei !== '0';\n        const changed = ok && asWei !== String(st.committed.price_wei);"
+  },
+  {
+    "name": "and its hint says what will be sent rather than what it wanted",
+    "old": "readout: ok ? 'that is ' + eth(raw) : 'whole numbers of wei, 1 upward',",
+    "new": "readout: ok ? 'that is ' + asWei + ' wei' : 'an amount of ETH, above zero',"
+  },
+  {
+    "name": "and its box says which unit it wants",
+    "old": "<span style=\"display:block;font:500 11px/1.5 'Geist Mono',ui-monospace,monospace;color:var(--fg-muted)\">price_wei</span>\n            <input type=\"text\" inputmode=\"numeric\" value=\"{{ glimpse.value }}\"",
+    "new": "<span style=\"display:block;font:500 11px/1.5 'Geist Mono',ui-monospace,monospace;color:var(--fg-muted)\">in ETH</span>\n            <input type=\"text\" inputmode=\"decimal\" value=\"{{ glimpse.value }}\""
   }
 ]
