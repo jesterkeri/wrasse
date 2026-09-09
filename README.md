@@ -51,6 +51,49 @@ every document under `baseline`. And the stored dimensions, which carry the seve
 confidence a receipt is scored with. Receipts alone are not enough, and saying they were left
 a judge following the recipe unable to reproduce the numbers.
 
+## The hosted demo, and what a visitor can actually do
+
+Everything below this section is the command line, which is where the work happens. This
+section is what somebody with a link gets, because a settlement nobody can perform is a claim
+rather than a demonstration.
+
+The page has three surfaces and they answer different questions.
+
+**The quote** is memory and arithmetic, and it is instant. It shows what the two sides settle
+on today, what each one proposed, the limits each published, and which receipt, counterparty
+limit or named rule moved every number that moved. A switch turns memory off, and the point of
+it is the profile that changes answer: with the two receipts in memory the cost-sensitive buyer
+is refused, because this buyer's own payment record raised the seller's price floor above what
+that profile will pay. Turn memory off and the same buyer is quoted a deal.
+
+**The simulator** runs the real engine over a history you choose rather than one that happened.
+Nothing is written to any store and no wallet is touched. It exists because the live memories
+hold two receipts and always will, and the argument this project is making is about what
+happens across ten. Set two failures and watch the terms move; add kept promises and watch them
+come back. They come back to a different place than they started, because nothing is rewritten
+and the failures are still in the history at the end of it. An outcome the ontology has never
+learned is refused by name rather than scored as zero.
+
+**The settlement** is the one that signs. A visitor picks the four starting numbers, which of
+the three profiles negotiates, and how the deal ends, then performs it on Base Sepolia. The
+ending is produced rather than declared: a deal that is never delivered has to sit out the
+delivery window before the contract will allow the claim, and one whose payment is made to wait
+has to sit out the payment delay. That is why two of the three endings take longer, and it is
+why the receipt at the end is evidence rather than a label. Each run teaches both memories, so
+five runs build a history and the terms move underneath the visitor as they go. At the end the
+escrow is emptied back into the two wallets.
+
+Two wallets are shared by everyone, both funded from a faucet, and one worker runs one
+settlement at a time. That is not a limitation to engineer around: the transaction ledger
+permits one unresolved transaction per wallet, which is what stops two sends taking the same
+nonce, and a pool of workers would spend its life contending for the same two nonces. What it
+costs is that the third visitor in a queue waits, and the page says so. The quote and the
+simulator are unqueued, so the memory argument lands even while the chain is busy.
+
+`/api/health` reports whether the deployment you are talking to signs at all, because the same
+code runs read-only without keys and there should be no need to take a document's word for it.
+`docs/DEPLOY.md` is the runbook, and `KNOWN-LIMITS.md` is what this build does not do.
+
 ## Setup and tests
 
 ```bash

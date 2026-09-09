@@ -203,11 +203,33 @@ if second:
     check("run 2 recorded a failure",
           any(s["name"] == "claim" and s["status"] == "done" for s in second["steps"]))
 
+# Finishing is not finished. The withdrawal has been queued and nothing has been collected
+# yet, and the distinction is what makes a failed refund retryable rather than permanent.
 status, done = call("POST", "/api/finish", {"session_id": SID})
-check("the session refunds", status == 200 and done.get("refunded") is True, str(done)[:300])
+check("the session starts finishing",
+      status == 200 and done.get("finishing") is True and done.get("refunded") is False,
+      str(done)[:200])
+
 status, again = call("POST", "/api/finish", {"session_id": SID})
-check("a second finish refunds nothing new",
-      status == 200 and again.get("already_refunded") is True, str(again)[:200])
+check("a second press is the same refund, not a second withdrawal",
+      status == 200 and again.get("run_id") == done.get("run_id"), str(again)[:200])
+
+collected = None
+began = time.time()
+while time.time() - began < 600:
+    time.sleep(5)
+    s, body = call("GET", f"/api/run/{done['run_id']}")
+    if s == 200 and body["status"] in ("succeeded", "failed"):
+        collected = body
+        break
+check("the escrow is emptied back into the wallets",
+      collected and collected["status"] == "succeeded",
+      collected and (collected.get("error") or
+                     f"{collected.get('refund_wei')} wei to the {collected.get('refund_to')}"))
+if collected:
+    check("and the session is only marked refunded once it has been",
+          collected["session"]["refunded"] is True
+          and collected["session"]["finishing"] is False)
 
 status, gone = call("POST", "/api/execute",
                     {"session_id": "0" * 32, "profile": "urgent"})
