@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from wrasse import sessions
 from wrasse.sessions import Sessions, copy_database
 
 
@@ -152,3 +153,108 @@ def test_an_identifier_this_process_never_issued_does_not_resolve(registry):
 
     assert registry.get("../../etc") is None
     assert registry.get("0" * 32) is None
+
+
+# ------------------------------------------------------------------------------------------
+# What a session must refuse to do, rather than do quietly.
+# ------------------------------------------------------------------------------------------
+
+
+def test_a_session_refuses_to_copy_a_source_that_is_not_there(tmp_path):
+    """Silently skipping produced the exact failure every other check here exists to prevent.
+
+    A missing source used to `continue`, and `create` still returned a session, so the visitor
+    got two empty stores presented as the seeded history. That is a cold start wearing the
+    clothes of a warm one, and nothing downstream can tell them apart. It is reachable on a
+    fresh deployment, where the working copies do not exist until something has opened them.
+    """
+
+    source = {"buyer": tmp_path / "absent" / "buyer-memory.db"}
+    registry = sessions.Sessions(source, root=tmp_path / "sessions")
+
+    with pytest.raises(FileNotFoundError) as raised:
+        registry.create()
+
+    assert "nothing to copy" in str(raised.value)
+
+
+def test_a_sidecar_the_source_lacks_does_not_survive_at_the_destination(tmp_path):
+    """A write-ahead log belonging to a different database is worse than none at all."""
+
+    origin = tmp_path / "origin.db"
+    sqlite3.connect(origin).close()
+    destination = tmp_path / "copy" / "origin.db"
+    destination.parent.mkdir(parents=True)
+    stale = destination.with_name(destination.name + "-wal")
+    stale.write_bytes(b"a log from some other database")
+
+    sessions.copy_database(origin, destination)
+
+    assert not stale.exists()
+
+
+def test_eviction_leaves_a_session_that_is_still_running(tmp_path):
+    """A public endpoint reaches this with session creation alone.
+
+    One stranger past the limit deletes the oldest directory, and if that session has a run in
+    flight the worker loses the databases it is halfway through teaching. The escrow keeps the
+    deposit and no refund can ever name the paths again.
+    """
+
+    origin = tmp_path / "buyer-memory.db"
+    sqlite3.connect(origin).close()
+    busy_ids: set[str] = set()
+    registry = sessions.Sessions(
+        {"buyer": origin}, root=tmp_path / "sessions", limit=1,
+        busy=lambda session: session.session_id in busy_ids,
+    )
+
+    working = registry.create()
+    busy_ids.add(working.session_id)
+    idle = registry.create()          # over the limit; the busy one must survive
+    registry.create()                 # and so must the survivor's directory
+
+    assert registry.get(working.session_id) is not None
+    assert working.directory.is_dir()
+    assert registry.get(idle.session_id) is None
+
+
+def test_an_idle_session_is_evicted_once_it_stops_being_busy(tmp_path):
+    """Kept, not exempt. A busy session that stayed forever would defeat the limit entirely."""
+
+    origin = tmp_path / "buyer-memory.db"
+    sqlite3.connect(origin).close()
+    busy_ids: set[str] = set()
+    registry = sessions.Sessions(
+        {"buyer": origin}, root=tmp_path / "sessions", limit=1,
+        busy=lambda session: session.session_id in busy_ids,
+    )
+
+    first = registry.create()
+    busy_ids.add(first.session_id)
+    registry.create()
+    assert registry.get(first.session_id) is not None
+
+    busy_ids.clear()
+    registry.create()
+
+    assert registry.get(first.session_id) is None
+
+
+def test_a_finished_session_cannot_start_another_settlement(tmp_path):
+    """Its escrow has been collected, so a later run would leave its deposit behind."""
+
+    origin = tmp_path / "buyer-memory.db"
+    sqlite3.connect(origin).close()
+    registry = sessions.Sessions({"buyer": origin}, root=tmp_path / "sessions")
+    session = registry.create()
+
+    session.finishing = True
+    with pytest.raises(PermissionError) as raised:
+        registry.spend(session)
+    assert "finished" in str(raised.value)
+
+    session.finishing = False
+    session.refunded = True
+    with pytest.raises(PermissionError):
+        registry.spend(session)

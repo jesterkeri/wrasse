@@ -910,6 +910,20 @@ class Queue:
         with self._condition:
             return [run for run in self._runs.values() if run.session_id == session_id]
 
+    def busy_with(self, session_id: str) -> bool:
+        """Whether this session has a run that has not finished.
+
+        Asked before a session's files may be deleted. Queued counts as well as running: a run
+        waiting its turn still holds the paths it was built with, and deleting them first turns
+        a wait into a failure the visitor cannot explain.
+        """
+
+        with self._condition:
+            return any(
+                run.session_id == session_id and run.status in (QUEUED, RUNNING)
+                for run in self._runs.values()
+            )
+
     def _trim(self) -> None:
         """Forget the oldest finished runs. Called with the lock held."""
 

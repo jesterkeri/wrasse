@@ -136,12 +136,23 @@
 (function () {
   'use strict';
 
+  //: The units the form asks in, not the units the contract stores. A judge who typed
+  //: 0.0001 ETH and ten minutes should not have to convert basis points and wei to check
+  //: whether the number that came back is the number they asked for.
   var TERMS = [
-    ['provider_bond_bps', 'provider bond', function (v) { return v + ' bps'; }],
-    ['service_window', 'service window', function (v) { return v + ' s'; }],
-    ['price_wei', 'price', function (v) { return v + ' wei'; }],
-    ['payout_delay', 'payout delay', function (v) { return v + ' s'; }]
+    ['provider_bond_bps', 'seller stake', function (v) { return (v / 100) + '% of the price'; }],
+    ['service_window', 'time to deliver', function (v) { return duration(v); }],
+    ['price_wei', 'price', function (v) { return eth(v) + ' ETH'; }],
+    ['payout_delay', 'payment delay', function (v) { return duration(v); }]
   ];
+
+  //: Minutes once there are whole minutes to show, seconds below that. A settled window of
+  //: 150 seconds reads worse as "2.5 minutes" than as what it is.
+  function duration(seconds) {
+    if (seconds < 120) { return seconds + ' seconds'; }
+    var minutes = seconds / 60;
+    return (minutes % 1 === 0 ? minutes : minutes.toFixed(1)) + ' minutes';
+  }
   var MARK = { pending: '·', running: '\u25CF', done: '\u2713', failed: '\u2717', skipped: '\u2013' };
 
   //: What a visitor is waiting for at each step, and roughly how long it takes. Measured
@@ -258,8 +269,12 @@
     // immediately and checked it against five things. Presenting the wait as ignorance was
     // making a guarantee look like a delay.
     if (known || !run.settled || !run.settled.agreed) return;
-    var release = (run.steps || []).filter(function (s) { return s.name === 'release'; })[0];
-    if (!release || release.status !== 'done') return;
+    //: Whichever step ends this deal, not `release` alone. Two of the three endings never send
+    //: a release at all, so keying on it meant the settled card never appeared for them.
+    var ended = (run.steps || []).filter(function (s) {
+      return (s.name === 'release' || s.name === 'claim') && s.status === 'done';
+    })[0];
+    if (!ended) return;
     known = true;
 
     var card = document.createElement('div');
@@ -267,21 +282,36 @@
     var head = document.createElement('div');
     head.style.font = '600 14px/1.5 Inter,sans-serif';
     head.style.color = 'var(--fg-strong, inherit)';
-    text(head, 'Settled on chain. Both sides are paid.');
+    //: Credited, not paid. Inclusion moves the deal to a terminal state and assigns the money
+    //: inside the contract; no ETH reaches either wallet until a withdrawal, which happens
+    //: once at the end of the session. Saying "paid" here was a claim about a wallet balance
+    //: that had not changed.
+    text(head, 'Settled on chain. The contract has assigned the money to both sides.');
     card.appendChild(head);
 
     var body = document.createElement('div');
     body.style.marginTop = '4px';
     var t = run.settled;
-    text(body, 'The buyer paid ' + t.price_wei + ' wei, the seller staked '
-      + (t.provider_bond_bps / 100) + '% and had ' + Math.round(t.service_window / 60)
-      + ' minutes to deliver. The agent has already read this back from Base and checked the '
-      + 'receipt, the sender, the logs and the contract\u2019s own state agree. It is not '
-      + 'waiting to find out what happened. It is waiting until Base cannot undo it, because '
-      + 'a memory that could be withdrawn would make every deal signed in the meantime point '
-      + 'at a history that no longer exists.');
+    text(body, 'The price was ' + eth(t.price_wei) + ' ETH, the seller staked '
+      + (t.provider_bond_bps / 100) + '% of it and had ' + Math.round(t.service_window / 60)
+      + ' minutes to deliver. Nothing has left either wallet yet: settlement credits each side '
+      + 'inside the escrow, and the credits are collected in one transaction when you finish '
+      + 'the session. What the run is still waiting for is Base treating this as permanent, '
+      + 'because a memory that could be withdrawn would make every deal signed in the meantime '
+      + 'point at a history that no longer exists.');
     card.appendChild(body);
     outcome.appendChild(card);
+  }
+
+  //: Wei to an exact ETH string, by moving the decimal point rather than dividing. Floating
+  //: point gets 0.1 ETH wrong at the eighteenth digit, and a page that displays a different
+  //: number from the one that was signed is worse than one that shows no number.
+  function eth(wei) {
+    var digits = String(wei);
+    while (digits.length < 19) { digits = '0' + digits; }
+    var whole = digits.slice(0, digits.length - 18);
+    var frac = digits.slice(digits.length - 18).replace(/0+$/, '');
+    return frac ? whole + '.' + frac : whole;
   }
 
   function drawSteps(run) {
@@ -442,7 +472,12 @@
                    baseline: baseline() };
       var queued = await post('/api/execute', body);
       var runId = queued.run_id;
-      note('Four transactions and one confirmation, about three and a half minutes, most of it waiting for Base to treat the result as permanent. You can leave this open and come back; nothing here depends on the tab staying focused.');
+      //: Counted from the ending rather than fixed. A timeout sends three transactions, not
+      //: four, and a number a judge can check against the receipt links has to be right.
+      var sends = ending === 'timeout' ? 'Three transactions' : 'Four transactions';
+      note(sends + ' and one confirmation, then a wait for Base to treat the result as '
+        + 'permanent. You can leave this open and come back; nothing here depends on the tab '
+        + 'staying focused.');
       text(countLabel, 'run ' + queued.run_number + ' of ' + queued.runs_allowed);
 
       timer = setInterval(async function () {

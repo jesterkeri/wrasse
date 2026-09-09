@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 from web3 import Web3
 
+from wrasse import service as service_module
 from wrasse.dimensions import DIMENSION_CATEGORY, DimensionDefinition
 from wrasse.evidence import ChainEvent
 from wrasse.store import WrasseStore, persona_digest
@@ -814,8 +816,26 @@ def test_the_last_run_of_a_session_refunds_without_being_asked(executing):
 
     assert body["status"] == "succeeded"
     assert body["refund"]["already_refunded"] is False
-    assert body["session"]["refunded"] is True
     assert body["session"]["runs_left"] == 0
+
+    # Finishing, not finished. The refund has been queued and nothing has been collected yet,
+    # and the distinction is the whole repair: a session marked refunded before its withdrawal
+    # succeeded could never retry the one that failed.
+    assert body["session"]["finishing"] is True
+    assert body["session"]["refunded"] is False
+
+    refund_id = body["refund"]["run_id"]
+    deadline = time.time() + 5
+    refund = {}
+    while time.time() < deadline:
+        refund = client.get(f"/api/run/{refund_id}").json()
+        if refund.get("status") == "succeeded":
+            break
+        time.sleep(0.01)
+
+    assert refund["status"] == "succeeded", refund.get("error")
+    assert refund["session"]["refunded"] is True
+    assert refund["session"]["finishing"] is False
 
 
 def test_a_run_reports_which_number_it_is(executing):
@@ -880,3 +900,87 @@ def test_a_refund_goes_to_whichever_wallet_is_emptier(tmp_path):
         assert seen["to"].lower() == os.environ[
             "WRASSE_BUYER_ADDRESS" if poorer == "buyer" else "WRASSE_PROVIDER_A_ADDRESS"
         ].lower()
+
+
+def test_a_refund_that_failed_can_be_asked_for_again(executing, monkeypatch):
+    """The flag used to be set before the work, which made a failed refund permanent.
+
+    A withdrawal can revert or time out with credit still in the escrow. The session stayed
+    marked refunded, a later press handed back the same failed run id, and the page reported
+    success over money nobody could reach. Refunding is now two states: `finishing` while a
+    withdrawal is in flight, and `refunded` only once one has succeeded.
+    """
+
+    from wrasse import executor
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+
+    first = client.post("/api/finish", json={"session_id": session_id}).json()
+    assert first["already_refunded"] is False
+    assert first["finishing"] is True
+    assert first["refunded"] is False
+
+    run = None
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        run = service_module._queue().get(first["run_id"])
+        if run is not None and run.status in (executor.SUCCEEDED, executor.FAILED):
+            break
+        time.sleep(0.01)
+    assert run is not None
+
+    # Pinned rather than raced. The worker here is instant, so waiting for the in-flight window
+    # would test the scheduler's timing instead of the branch.
+    run.status = executor.RUNNING
+    inflight = client.post("/api/finish", json={"session_id": session_id}).json()
+    assert inflight["run_id"] == first["run_id"], "a second press must not queue a second one"
+    assert inflight["already_refunded"] is False
+
+    # Whatever it did, make it a failure and ask again. A retry must mint a new run.
+    run.status = executor.FAILED
+    run.error = "the withdrawal reverted"
+
+    retry = client.post("/api/finish", json={"session_id": session_id}).json()
+    assert retry["already_refunded"] is False
+    assert retry["run_id"] != first["run_id"], (
+        "a failed refund must be retryable, or the escrow keeps what it could not collect"
+    )
+
+
+def test_a_finished_session_is_refused_another_settlement(executing):
+    """Its escrow is being collected, so a later run would leave its own deposit behind."""
+
+    client, _, _ = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    client.post("/api/finish", json={"session_id": session_id})
+
+    refused = client.post(
+        "/api/execute", json={"session_id": session_id, "profile": "urgent"}
+    )
+
+    assert refused.status_code == 429
+    assert "finished" in refused.json()["detail"]
+
+
+def test_a_session_is_not_opened_before_the_memories_it_copies(executing):
+    """`/api/session` copies the working pair, which nothing had created on a fresh boot.
+
+    The quote path was the only caller of `prepare_working_copies`, so a visitor who pressed
+    the run button before quoting got a session copied from files that did not exist. It
+    returned two empty stores and the page presented them as the seeded history.
+    """
+
+    client, _, _ = executing
+    service_module._stores.clear()
+
+    body = client.post("/api/session").json()
+    session = service_module._session_registry().get(body["session_id"])
+
+    assert session is not None
+    for path in session.paths.values():
+        assert path.is_file(), f"{path} was not copied"
+        held = sqlite3.connect(path).execute(
+            "select count(*) from entities where category='chain_event'"
+        ).fetchone()[0]
+        assert held > 0, "a session copied from an empty source is a cold start in disguise"

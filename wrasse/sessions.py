@@ -23,6 +23,7 @@ import os
 import shutil
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,12 +55,28 @@ def copy_database(origin: Path, destination: Path) -> None:
     source's mode, and a source mounted read-only produces a copy that cannot be opened at all.
     """
 
+    if not origin.is_file():
+        # Refused rather than skipped. A missing source used to `continue` here and the copy
+        # still returned a session, so the visitor got two empty stores presented as the
+        # seeded history: a cold start wearing the clothes of a warm one, which is the failure
+        # every other check in this file exists to prevent. It happens on a fresh deployment,
+        # where the working copies do not exist until the first quote has created them.
+        raise FileNotFoundError(
+            f"{origin} does not exist, so there is nothing to copy. A session copied from a "
+            "source that is not there would answer as a memory holding nothing, which is "
+            "indistinguishable from a genuine cold start and is the more dangerous of the two."
+        )
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     for suffix in ("", "-wal", "-shm"):
         sidecar = origin.with_name(origin.name + suffix)
-        if not sidecar.is_file():
-            continue
         target = destination.with_name(destination.name + suffix)
+        if not sidecar.is_file():
+            # A sidecar the source does not have must not survive at the destination. Nothing
+            # reaches this on a fresh directory, but a session root reused across a reseed
+            # would otherwise keep a write-ahead log belonging to a different database.
+            target.unlink(missing_ok=True)
+            continue
         shutil.copy(sidecar, target)
         target.chmod(0o600)
 
@@ -73,11 +90,17 @@ class Session:
     created_at: str
     runs: int = 0
     paths: dict[str, Path] = field(default_factory=dict)
-    #: Set once, when the escrow has been emptied back into the wallets. A session refunds at
-    #: the end rather than after each run, because the credits sitting in the escrow are the
-    #: least interesting thing about a run and collecting them between runs would put two
-    #: transactions nobody asked for in the middle of the story.
+    #: Set when the escrow has actually been emptied back into the wallets, never before. A
+    #: session refunds at the end rather than after each run, because the credits sitting in
+    #: the escrow are the least interesting thing about a run and collecting them between runs
+    #: would put two transactions nobody asked for in the middle of the story.
+    #:
+    #: `finishing` is the separate flag that stops a second press queueing a second withdrawal
+    #: while the first is still in flight. Collapsing the two into one was the defect: a refund
+    #: that failed left the session marked refunded, so it could never be retried and the money
+    #: it did not collect stayed in the escrow behind a page reporting success.
     refunded: bool = False
+    finishing: bool = False
     refund_run_id: str | None = None
 
     def view(self) -> dict[str, object]:
@@ -88,6 +111,7 @@ class Session:
             "runs_allowed": RUNS_PER_SESSION,
             "runs_left": max(0, RUNS_PER_SESSION - self.runs),
             "refunded": self.refunded,
+            "finishing": self.finishing,
             "refund_run_id": self.refund_run_id,
         }
 
@@ -102,11 +126,15 @@ class Sessions:
         root: Path | None = None,
         limit: int | None = None,
         runs_per_session: int | None = None,
+        busy: Callable[["Session"], bool] | None = None,
     ) -> None:
         self._source = source
         self._root = root or SESSION_ROOT
         self._limit = limit if limit is not None else SESSION_LIMIT
         self._runs = runs_per_session if runs_per_session is not None else RUNS_PER_SESSION
+        #: Asked before deleting anything. Injected rather than imported, because the queue is
+        #: the thing that knows a run is in flight and this module must not depend on it.
+        self._busy = busy
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
         self._order: list[str] = []
@@ -147,6 +175,14 @@ class Sessions:
         """Record a run against a session, or refuse when it has used its allowance."""
 
         with self._lock:
+            # A finished session cannot start another settlement. Its refund has already
+            # collected, or is collecting, whatever the escrow was holding, so a later run
+            # would credit the escrow again with nothing scheduled to empty it.
+            if session.finishing or session.refunded:
+                raise PermissionError(
+                    "this session has been finished and its escrow collected. A settlement "
+                    "started now would leave its deposit behind. Start a new session."
+                )
             if session.runs >= self._runs:
                 raise PermissionError(
                     f"this session has run {session.runs} settlements, which is its limit. "
@@ -155,11 +191,31 @@ class Sessions:
             session.runs += 1
 
     def _evict(self) -> None:
-        """Delete the oldest sessions past the limit. Called with the lock held."""
+        """Delete the oldest sessions past the limit, skipping any that are still busy.
 
+        Called with the lock held.
+
+        A session is busy while a run of its own is queued or executing, and while it is owed a
+        refund it has not collected. Deleting one of those takes the memory databases out from
+        under a worker mid-run and leaves the escrow holding a deposit whose session paths no
+        longer exist. A public endpoint reaches this with session creation alone, so it is not
+        a rare interleaving: it is one stranger past the limit.
+
+        A busy session keeps its place at the front of the queue rather than being skipped
+        permanently, so it is reconsidered on the next creation and evicted once it is idle.
+        """
+
+        keep: list[str] = []
         while len(self._order) > self._limit:
             oldest = self._order.pop(0)
-            session = self._sessions.pop(oldest, None)
+            session = self._sessions.get(oldest)
             if session is None:
                 continue
+            if self._busy is not None and self._busy(session):
+                keep.append(oldest)
+                if len(keep) + len(self._order) <= self._limit:
+                    break
+                continue
+            self._sessions.pop(oldest, None)
             shutil.rmtree(session.directory, ignore_errors=True)
+        self._order = keep + self._order

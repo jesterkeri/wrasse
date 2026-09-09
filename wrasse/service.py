@@ -419,8 +419,21 @@ def _queue() -> executor.Queue:
 def _session_registry() -> sessions.Sessions:
     global _SESSIONS
     if _SESSIONS is None:
-        _SESSIONS = sessions.Sessions(_PATHS[WARM])
+        _SESSIONS = sessions.Sessions(_PATHS[WARM], busy=_session_is_busy)
     return _SESSIONS
+
+
+def _session_is_busy(session: sessions.Session) -> bool:
+    """Whether this session's files may not be deleted yet.
+
+    Two reasons, and the second is the easier one to forget. A run of its own is queued or
+    executing, so the paths are in use. Or it has settled at least one deal and never collected,
+    so the escrow is still holding a deposit that only a refund against these paths can return.
+    """
+
+    if _queue().busy_with(session.session_id):
+        return True
+    return session.runs > 0 and not session.refunded
 
 
 def _require_execution() -> None:
@@ -469,7 +482,17 @@ def open_session() -> dict:
     """A private copy of both memories, so this visitor's run is theirs alone."""
 
     _require_execution()
-    session = _session_registry().create()
+    # The warm pair first, and the order is the whole point. A session copies the working
+    # copies, and on a fresh deployment those do not exist until something has opened them:
+    # `prepare_working_copies` runs inside `_open`, which until now only the quote path
+    # reached. A visitor who pressed the run button before quoting got a session copied from
+    # nothing. `_open` is idempotent and holds its pair, so this costs one dictionary lookup
+    # on every later request.
+    _open(WARM)
+    try:
+        session = _session_registry().create()
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     return {**session.view(), "queue_depth": _queue().depth()}
 
 
@@ -560,11 +583,40 @@ def finish(request: FinishRequest) -> dict:
     return {**_refund(session), **session.view()}
 
 
-def _refund(session: sessions.Session) -> dict:
-    """Queue this session's one refund, or hand back the one it already has."""
+def _reconcile_refund(session: sessions.Session) -> None:
+    """Read the outcome of this session's refund and write it back onto the session.
 
+    Called before every decision about refunding, so the session's flags describe what the
+    chain did rather than what was intended. A refund that failed clears `finishing`, which is
+    what makes it retryable; only a succeeded one sets `refunded`.
+    """
+
+    if session.refund_run_id is None or session.refunded:
+        return
+    run = _queue().get(session.refund_run_id)
+    if run is None:
+        return
+    if run.status == executor.SUCCEEDED:
+        session.refunded = True
+        session.finishing = False
+    elif run.status in (executor.FAILED, executor.REFUSED):
+        # Retryable, and it must be. A withdrawal can revert or time out with credit still in
+        # the escrow, and a session that stayed marked finished would report success over money
+        # nobody could reach.
+        session.finishing = False
+        session.refund_run_id = None
+
+
+def _refund(session: sessions.Session) -> dict:
+    """Queue this session's one refund, hand back the one in flight, or retry a failed one."""
+
+    _reconcile_refund(session)
     if session.refunded and session.refund_run_id:
         return {"run_id": session.refund_run_id, "already_refunded": True}
+    if session.finishing and session.refund_run_id:
+        # Still in flight. A second press must not queue a second withdrawal: the ledger would
+        # be right to refuse it and the page would show two refunds for one collection.
+        return {"run_id": session.refund_run_id, "already_refunded": False}
 
     run_id = uuid.uuid4().hex
     workdir = session.directory / "runs" / run_id
@@ -578,10 +630,11 @@ def _refund(session: sessions.Session) -> dict:
         paths=session.paths,
         workdir=workdir,
     )
-    # Marked before the worker starts rather than after it finishes. A second press arriving
-    # while the first is still in flight would otherwise queue a second withdrawal, and the
-    # ledger would be right to refuse it while the page showed two refunds.
-    session.refunded = True
+    # `finishing`, not `refunded`. This stops a second press queueing a second withdrawal while
+    # the first is in flight, which is all it was ever meant to do. `refunded` is written by
+    # `_reconcile_refund` once the withdrawal has actually succeeded, because a flag set before
+    # the work made a failed refund permanent.
+    session.finishing = True
     session.refund_run_id = run_id
     _queue().submit(run)
     return {"run_id": run_id, "already_refunded": False}
@@ -601,15 +654,18 @@ def run_status(run_id: str) -> dict:
     # their deposits until someone remembers is how a demo runs out of money.
     body = run.view(position=_queue().position(run_id))
     session = _session_registry().get(run.session_id)
-    if (
-        session is not None
-        and run.kind == executor.SETTLEMENT
-        and run.status == executor.SUCCEEDED
-        and session.runs >= sessions.RUNS_PER_SESSION
-        and not session.refunded
-    ):
-        body["refund"] = _refund(session)
     if session is not None:
+        # Every poll reconciles, so a refund that succeeded or failed while nobody was asking
+        # is recorded the next time anybody asks.
+        _reconcile_refund(session)
+        if (
+            run.kind == executor.SETTLEMENT
+            and run.status == executor.SUCCEEDED
+            and session.runs >= sessions.RUNS_PER_SESSION
+            and not session.refunded
+            and not session.finishing
+        ):
+            body["refund"] = _refund(session)
         body["session"] = session.view()
     return body
 
