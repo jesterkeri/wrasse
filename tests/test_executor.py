@@ -1050,7 +1050,15 @@ def test_a_creation_left_unnamed_by_a_crash_is_resolved_from_its_receipt(
 ):
     """A row with a hash and no id is the crash window, and the hash is enough to close it."""
 
-    chain = _Recovering()
+    class WithLedger(_Recovering):
+        def __call__(self, argv, env, timeout):
+            if argv[0] == "tx-status":
+                return 0, json.dumps([{"intent_id": "interrupted",
+                                       "status": "confirmed_success",
+                                       "tx_hash": "0xcreate"}]), ""
+            return _Recovering.__call__(self, argv, env, timeout)
+
+    chain = WithLedger()
     held = FakeLiabilities(extra_rows=[{
         "intent_id": "interrupted", "session_id": "a session that died",
         "tx_hash": "0xcreate", "deal_id": None,
@@ -1225,3 +1233,99 @@ def test_the_endings_that_wait_also_strike_their_deal_off(environment, outcome):
 
     assert run.status == executor.SUCCEEDED, run.error
     assert held.open_deals() == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["unbroadcast", "included_reverted", "confirmed_reverted", "nonce_consumed_or_replaced"],
+)
+def test_a_creation_that_made_no_deal_is_discarded_however_it_ended(
+    environment, tmp_path, status
+):
+    """A transaction hash is written when the bytes are signed, not when they are sent.
+
+    So a creation the node refused before the mempool keeps its hash, and so does one that
+    mined and reverted. Reading a hash as a probable deal turned both into a row that could
+    never be resolved, and the boot after that refused to serve because of it: one ordinary
+    rejected creation would have closed the demo until an operator repaired a record for a
+    deal that never existed.
+    """
+
+    held = FakeLiabilities(extra_rows=[{
+        "intent_id": "signed-only", "session_id": "s", "tx_hash": None, "deal_id": None,
+    }])
+
+    def command(argv, env, timeout):
+        if argv[0] == "tx-status":
+            return 0, json.dumps([
+                {"intent_id": "signed-only", "status": status, "tx_hash": "0xsigned"}
+            ]), ""
+        return 0, json.dumps([]), ""
+
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+    Runner(command=command, liabilities=held, sleep=lambda _: None).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert held.discarded == ["signed-only"]
+    assert held.rows() == []
+
+
+@pytest.mark.parametrize("status", ["unbroadcast", "confirmed_reverted"])
+def test_the_boot_after_that_one_still_serves(environment, tmp_path, status):
+    """The second boot is where the old behaviour bricked, so the test runs two.
+
+    The first boot attached the hash and left the row; the second met a row with a hash and no
+    deal, asked for a deal id that does not exist, and closed the settlement queue for good.
+    """
+
+    held = FakeLiabilities(extra_rows=[{
+        "intent_id": "signed-only", "session_id": "s", "tx_hash": None, "deal_id": None,
+    }])
+
+    def command(argv, env, timeout):
+        if argv[0] == "tx-status":
+            return 0, json.dumps([
+                {"intent_id": "signed-only", "status": status, "tx_hash": "0xsigned"}
+            ]), ""
+        return 0, json.dumps([]), ""
+
+    def boot():
+        run = Run(
+            run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+            paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"},
+            workdir=tmp_path,
+        )
+        Runner(command=command, liabilities=held, sleep=lambda _: None).execute(run)
+        return run
+
+    assert boot().status == executor.SUCCEEDED
+    second = boot()
+    assert second.status == executor.SUCCEEDED, second.error
+
+
+def test_a_creation_still_in_flight_keeps_its_row_for_the_next_boot(environment, tmp_path):
+    """Not every status is actionable, and an unactionable one must not be fatal either."""
+
+    held = FakeLiabilities(extra_rows=[{
+        "intent_id": "in-flight", "session_id": "s", "tx_hash": None, "deal_id": None,
+    }])
+
+    def command(argv, env, timeout):
+        if argv[0] == "tx-status":
+            return 0, json.dumps([
+                {"intent_id": "in-flight", "status": "send_attempted", "tx_hash": "0xsent"}
+            ]), ""
+        return 0, json.dumps([]), ""
+
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+    Runner(command=command, liabilities=held, sleep=lambda _: None).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert held.discarded == [], "a transaction still in flight was written off"
+    assert len(held.rows()) == 1

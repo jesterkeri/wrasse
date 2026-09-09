@@ -184,6 +184,10 @@ class Sessions:
                 copy_database(origin, destination)
                 paths[role] = destination
         except Exception:
+            # The directory and any store already copied into it go with the reservation. A
+            # half-copied session left behind is a pair of databases nothing will ever open and
+            # nothing will ever evict, because eviction only knows about sessions that exist.
+            shutil.rmtree(directory, ignore_errors=True)
             with self._lock:
                 self._pending -= 1
             raise

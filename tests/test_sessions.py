@@ -350,3 +350,35 @@ def test_a_copy_that_fails_gives_its_reservation_back(tmp_path):
 
     assert registry._pending == 0
     assert registry.create() is not None, "the failed create cost a slot forever"
+
+
+def test_a_failed_copy_leaves_no_directory_behind(tmp_path):
+    """Half a session is a pair of databases nothing opens and nothing evicts."""
+
+    origin = tmp_path / "buyer-memory.db"
+    other = tmp_path / "provider-memory.db"
+    sqlite3.connect(origin).close()
+    sqlite3.connect(other).close()
+    root = tmp_path / "sessions"
+    registry = sessions.Sessions(
+        {"buyer": origin, "provider": other}, root=root, limit=4, busy=lambda s: False,
+    )
+
+    real_copy = sessions.copy_database
+    calls = []
+
+    def half(source, destination):
+        calls.append(destination)
+        if len(calls) > 1:
+            raise OSError("no space left on device")
+        return real_copy(source, destination)
+
+    sessions.copy_database = half
+    try:
+        with pytest.raises(OSError):
+            registry.create()
+    finally:
+        sessions.copy_database = real_copy
+
+    assert len(calls) == 2, "the test did not reach the second store"
+    assert list(root.glob("*")) == [], "a half-copied session was left on disk"

@@ -51,12 +51,76 @@ create table if not exists open_deals (
 
 _lock = threading.Lock()
 
+#: The table an interrupted migration leaves behind. Recognised on every open, because a
+#: half-finished upgrade must be finishable rather than merely unlikely.
+_OLD_TABLE = "open_deals_v1"
+
+
+def _tables(connection: sqlite3.Connection) -> set[str]:
+    return {
+        row[0] for row in
+        connection.execute("select name from sqlite_master where type='table'").fetchall()
+    }
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Bring an older index up to this shape, all of it or none of it.
+
+    One transaction covering detection, rename, create, copy and drop. SQLite makes DDL
+    transactional, so a process killed anywhere inside this leaves the database exactly as it
+    was, with the old table still under its own name and still the thing the next open finds.
+
+    It also finishes a migration a previous version left half-done, because that version
+    committed each statement separately and a database in that state is out there by
+    construction rather than by accident.
+    """
+
+    tables = _tables(connection)
+    columns = {
+        row[1] for row in connection.execute("pragma table_info(open_deals)").fetchall()
+    }
+    stale = _OLD_TABLE in tables
+    older = bool(columns) and "intent_id" not in columns
+    if not (stale or older):
+        return
+
+    connection.execute("begin immediate")
+    try:
+        if older:
+            connection.execute(f"alter table open_deals rename to {_OLD_TABLE}")
+        connection.execute(_SCHEMA)
+        connection.execute(
+            f"insert or ignore into open_deals"
+            "(intent_id, session_id, opened_at, tx_hash, deal_id, detail) "
+            "select 'migrated:' || deal_id, session_id, opened_at, null, deal_id, detail "
+            f"from {_OLD_TABLE}"
+        )
+        moved = connection.execute(
+            f"select count(*) from {_OLD_TABLE} where deal_id not in "
+            "(select deal_id from open_deals where deal_id is not null)"
+        ).fetchone()[0]
+        if moved:
+            raise RuntimeError(
+                f"{moved} rows of {_OLD_TABLE} did not survive the migration; refusing to "
+                "drop the only record of the deals they name"
+            )
+        connection.execute(f"drop table {_OLD_TABLE}")
+        connection.execute("commit")
+    except Exception:
+        connection.execute("rollback")
+        raise
+
 
 @contextmanager
 def _connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
     destination = Path(path or LIABILITY_DB)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(destination, timeout=30)
+    # `isolation_level=None` hands transaction control to this code. Python's default mode
+    # commits DDL independently of the statements around it, which turned the migration below
+    # into four separate commits: a process killed after the rename left the rows in a table
+    # nothing reads and the new table empty, which is the same lost deposit the migration was
+    # written to prevent, reached by interruption instead of by design.
+    connection = sqlite3.connect(destination, timeout=30, isolation_level=None)
     try:
         connection.execute("pragma journal_mode=wal")
         # Migrated, never dropped. "A reset, not a claim of compatibility" is this project's
@@ -65,19 +129,7 @@ def _connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
         # the escrow is still holding value for, so deleting a row deletes the route to that
         # money. The earlier shape carried the deal id, which is the field recovery needs, so
         # every old row becomes a new row with a synthetic intent and its id intact.
-        existing = {
-            row[1] for row in connection.execute("pragma table_info(open_deals)").fetchall()
-        }
-        if existing and "intent_id" not in existing:
-            connection.execute("alter table open_deals rename to open_deals_v1")
-            connection.execute(_SCHEMA)
-            connection.execute(
-                "insert or ignore into open_deals"
-                "(intent_id, session_id, opened_at, tx_hash, deal_id, detail) "
-                "select 'migrated:' || deal_id, session_id, opened_at, null, deal_id, detail "
-                "from open_deals_v1"
-            )
-            connection.execute("drop table open_deals_v1")
+        _migrate(connection)
         connection.execute(_SCHEMA)
         yield connection
         connection.commit()

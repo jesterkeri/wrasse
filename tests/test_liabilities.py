@@ -117,3 +117,68 @@ def test_a_row_that_has_a_deal_cannot_be_discarded(tmp_path):
     liabilities.discard("i", path=path)
 
     assert liabilities.open_deals(path=path) == [5], "a live deposit was discarded"
+
+
+def test_a_migration_interrupted_halfway_is_finished_on_the_next_open(tmp_path):
+    """The exact state a killed process used to leave, and it used to be invisible.
+
+    The previous version committed each statement separately, so a process killed after the
+    rename left the rows in a table nothing reads and a new empty table that looked migrated.
+    Recovery returned nothing while the escrow still held the deal. Both halves are fixed: the
+    migration is one transaction, and a leftover old table is finished rather than ignored.
+    """
+
+    path = tmp_path / "liabilities.db"
+    connection = sqlite3.connect(path)
+    connection.execute(V1_SCHEMA.replace("open_deals", "open_deals_v1"))
+    connection.execute(
+        "insert into open_deals_v1(deal_id, session_id, opened_at, detail) values (?,?,?,?)",
+        (41, "a session that died", "2026-09-09T00:00:00+00:00", "{}"),
+    )
+    connection.execute(
+        """create table open_deals (intent_id text primary key, session_id text not null,
+           opened_at text not null, tx_hash text, deal_id integer,
+           detail text not null default '{}')"""
+    )
+    connection.commit()
+    connection.close()
+
+    assert liabilities.open_deals(path=path) == [41]
+    with sqlite3.connect(path) as check:
+        tables = {row[0] for row in
+                  check.execute("select name from sqlite_master where type='table'")}
+    assert "open_deals_v1" not in tables
+
+
+def test_the_migration_is_one_transaction(older_database, monkeypatch):
+    """A failure anywhere inside it must leave the database exactly as it was.
+
+    Python's sqlite3 commits DDL independently by default, which is what made the four
+    statements four commits. The connection now owns its own transaction.
+    """
+
+    # The copy is made to fail from inside SQLite rather than by patching its driver, which
+    # refuses to be patched: a destination column that is `not null` with no default and is
+    # not one of the columns the copy names.
+    monkeypatch.setattr(liabilities, "_SCHEMA", """
+        create table if not exists open_deals (
+            intent_id   text primary key,
+            session_id  text not null,
+            opened_at   text not null,
+            tx_hash     text,
+            deal_id     integer,
+            detail      text not null default '{}',
+            unfillable  text not null
+        )
+    """)
+    # `insert or ignore` swallows the constraint, which is why the migration counts what
+    # survived instead of trusting the insert. That count is what fails here.
+    with pytest.raises(RuntimeError, match="did not survive"):
+        liabilities.rows(path=older_database)
+    monkeypatch.undo()
+
+    # The old table is still the one the next open finds, with its row intact.
+    with sqlite3.connect(older_database) as check:
+        columns = {row[1] for row in check.execute("pragma table_info(open_deals)")}
+        assert "intent_id" not in columns, "a rolled-back migration left the new shape behind"
+    assert liabilities.open_deals(path=older_database) == [41]

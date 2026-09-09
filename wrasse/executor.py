@@ -145,6 +145,15 @@ UNBROADCAST_STATUS = "unbroadcast"
 #: Statuses in which a row is no longer holding its wallet's nonce. Terminal ones have finished
 #: and `included_*` have consumed the nonce, which is the only question the next send asks. Any
 #: other status means the wallet is still blocked, whatever the resolver's exit code said.
+#: Statuses in which a creation produced no deal, whatever its transaction hash says. The hash
+#: is written when the bytes are signed, so it is present long before anything is sent and stays
+#: present when nothing ever was.
+_NO_DEAL_STATUSES = frozenset({
+    "unbroadcast", "included_reverted", "confirmed_reverted", "nonce_consumed_or_replaced",
+})
+#: And the only two in which one did.
+_MADE_DEAL_STATUSES = frozenset({"included_success", "confirmed_success"})
+
 _FREED_STATUSES = frozenset({
     "included_success", "included_reverted",
     "confirmed_success", "confirmed_reverted",
@@ -705,57 +714,48 @@ class Runner:
             ))
 
     def _name_unresolved(self, run: Run, step: Step) -> None:
-        """Turn every intent that reached a node into a deal id, or refuse to serve.
+        """Decide what became of every creation whose deal id was never learned.
 
-        A row carrying a transaction hash and no deal id is the crash window made visible: the
-        creation may have been included and the deposit may be sitting in an Offered deal that
-        nothing in this process has ever named. The hash is enough to find out, so this reads
-        the receipt and writes the id down.
+        One loop, and it branches on what the ledger says rather than on whether a hash is
+        present. A hash is present from the moment the bytes are signed, so it is not evidence
+        that anything was sent: a creation the node rejected before the mempool is marked
+        `unbroadcast` and keeps its hash, and one that mined and reverted has a hash and a
+        receipt and no deal. Treating a hash as a probable deal made both of those into a row
+        that could never be resolved, and the next boot refused to serve because of it. One
+        ordinary rejected creation would have closed the demo until an operator repaired a
+        record for a deal that never existed.
 
-        A row with neither a hash nor an id is different and worse. It means this deployment
-        was about to sign and nobody recorded what happened next, so there is no way to tell
-        from here whether value moved. That fails the reclaim, which closes the queue: a
-        service that might be holding somebody's deposit somewhere it cannot see should not be
-        opening new deals on top of it.
+        Nothing here raises. A status this cannot act on yet leaves its row for the next boot,
+        which is the safe direction: the row is the thing that remembers. The reclaim still
+        fails closed when the ledger itself cannot be read, because that is `_cli` raising.
         """
 
-        for row in self._liabilities.unresolved(None):
-            try:
-                deal_id = self._deal_id(str(row["tx_hash"]))
-            except Exception as error:  # noqa: BLE001
-                raise ExecutionError(
-                    f"a deal was created by {row['tx_hash']} and its id cannot be read back "
-                    f"({error}). Until it can, this service cannot tell whether that deposit "
-                    "is still in escrow, so it will not open more deals."
-                ) from error
-            self._liabilities.attach(str(row["intent_id"]), deal_id=deal_id)
-            step.detail = f"deal {deal_id} was left unnamed by a previous process"
-
-        # A row with no hash is one whose creation reply was lost: a timeout, a killed process,
-        # a reply that would not parse. It used to be treated as unknowable and closed the
-        # queue, which turned one transient subprocess failure into a service no judge could
-        # use. It is knowable, because the row is keyed on the identity the ledger files the
-        # send under, so the ledger can be asked what became of it.
-        for row in [r for r in self._liabilities.rows(None)
-                    if not r["tx_hash"] and r["deal_id"] is None]:
+        for row in [r for r in self._liabilities.rows(None) if r["deal_id"] is None]:
             intent = str(row["intent_id"])
             found = self._ledger_row(run, intent)
             if found is None:
-                # The ledger never took a nonce for it, so nothing was signed and nothing can
-                # be escrowed behind it.
+                # The ledger never took a nonce for it. The row is written before signing and
+                # the ledger row is committed before broadcast, so this is proof that nothing
+                # was signed and nothing can be escrowed behind it.
                 self._liabilities.discard(intent)
                 continue
-            if not found.get("tx_hash"):
-                # Signed and never broadcast. The ledger frees that nonce itself; there is no
-                # deal, so there is nothing to recover.
+
+            status = str(found.get("status") or "")
+            if status in _NO_DEAL_STATUSES:
+                # Signed and refused, or mined and reverted. Either way the escrow holds
+                # nothing for it and the ledger governs its nonce.
                 self._liabilities.discard(intent)
                 continue
+            if status not in _MADE_DEAL_STATUSES or not found.get("tx_hash"):
+                # Still in flight, or signed and not yet sent. Nothing to resolve today.
+                continue
+
             self._liabilities.attach(intent, tx_hash=str(found["tx_hash"]))
             try:
                 deal_id = self._deal_id(str(found["tx_hash"]))
-            except Exception:  # noqa: BLE001 - a send that never made a deal has no receipt
-                # Included and reverted, or still absent. Either way no deal exists yet; the
-                # ledger's own resolution governs the nonce and the row stays for the next boot.
+            except Exception:  # noqa: BLE001 - a receipt that cannot be read right now
+                # It succeeded, so a deal exists; this run simply could not read it back. The
+                # row keeps its hash and the next boot tries again.
                 continue
             self._liabilities.attach(intent, deal_id=deal_id)
             step.detail = f"deal {deal_id} was left unnamed by a previous process"
