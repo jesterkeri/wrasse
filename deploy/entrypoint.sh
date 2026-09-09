@@ -15,15 +15,32 @@ umask 077
 # The mount replaces whatever the image had at this path, so nothing in the Dockerfile can
 # prepare it and the ownership has to be taken here, while this script is still root. Only the
 # directories the service writes; the seeded source is left exactly as it was uploaded.
+# Directories are taken directly. An earlier version derived them by appending a sentinel to
+# each variable and taking `dirname`, which turned an unset `WRASSE_SESSION_ROOT` into `/x`,
+# whose dirname is `/`, and so an omitted setting became `chown wrasse:wrasse /`. A variable
+# that is not set must mean "nothing to take", never "take the filesystem root".
+take () {
+    directory=$1
+    case "$directory" in
+        ""|"/"|"."|".."|"//") 
+            echo "refusing to take ownership of '$directory'" >&2
+            exit 1 ;;
+    esac
+    mkdir -p "$directory"
+    chown "$SERVICE_USER:$SERVICE_USER" "$directory"
+}
+
 take_volume () {
     for path in "${WRASSE_TX_DB:-}" "${WRASSE_BUYER_MEMORY_PATH:-}" \
                 "${WRASSE_PROVIDER_MEMORY_PATH:-}" "${WRASSE_COLD_BUYER_MEMORY_PATH:-}" \
-                "${WRASSE_COLD_PROVIDER_MEMORY_PATH:-}" "${WRASSE_SESSION_ROOT:-}/x"; do
+                "${WRASSE_COLD_PROVIDER_MEMORY_PATH:-}"; do
         [ -n "$path" ] || continue
-        directory=$(dirname "$path")
-        mkdir -p "$directory"
-        chown "$SERVICE_USER:$SERVICE_USER" "$directory"
+        take "$(dirname "$path")"
     done
+    # The session root is a directory already, so it is taken as one rather than having a
+    # sentinel appended to make it look like a file path.
+    [ -n "${WRASSE_SESSION_ROOT:-}" ] && take "$WRASSE_SESSION_ROOT"
+    return 0
 }
 
 if [ "$(id -u)" = "0" ]; then
@@ -44,6 +61,17 @@ require () {
 # an environment variable it reads directly would put the decrypted material one `os.environ`
 # dump away from every subprocess. These three files are 0600, live outside the volume, and
 # die with the container.
+# --- secrets, only when this deployment is the one that signs -----------------------------
+#
+# Guarded on the execution flag rather than on the variables being present. `/api/health`
+# derives `holds_keys` from that flag alone, so materialising a keystore on a read-only
+# deployment that still carries the secret variables would make that answer false: nothing
+# would sign, which is right, and the file would be on disk, which the health answer denies.
+if [ "${WRASSE_ENABLE_EXECUTION:-}" != "1" ]; then
+    unset WRASSE_BUYER_KEYSTORE_JSON WRASSE_PROVIDER_KEYSTORE_JSON WRASSE_KEYSTORE_PASSWORD \
+        2>/dev/null || true
+fi
+
 if [ -n "${WRASSE_BUYER_KEYSTORE_JSON:-}" ]; then
     printf '%s' "$WRASSE_BUYER_KEYSTORE_JSON" > "$KEYS/buyer-keystore.json"
     WRASSE_KEYSTORE="$KEYS/buyer-keystore.json"

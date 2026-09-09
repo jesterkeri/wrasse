@@ -536,7 +536,9 @@ def executing(service, tmp_path, monkeypatch):
             executed.append(run)
             run.status = executor.SUCCEEDED
 
-    queue = executor.Queue(Recording())
+    # With the completion hook the production queue carries. Without it the fixture would be
+    # testing a worker that cannot do the one thing the review moved into it.
+    queue = executor.Queue(Recording(), after=module._run_finished)
     monkeypatch.setattr(module, "_QUEUE", queue)
     monkeypatch.setattr(
         module, "_SESSIONS",
@@ -815,15 +817,10 @@ def test_the_last_run_of_a_session_refunds_without_being_asked(executing):
         time.sleep(0.01)
 
     assert body["status"] == "succeeded"
-    assert body["refund"]["already_refunded"] is False
     assert body["session"]["runs_left"] == 0
 
-    # Finishing, not finished. The refund has been queued and nothing has been collected yet,
-    # and the distinction is the whole repair: a session marked refunded before its withdrawal
-    # succeeded could never retry the one that failed.
-    assert body["session"]["finishing"] is True
-    assert body["session"]["refunded"] is False
-
+    # Queued by the worker, not by this request. The GET only reports it, so a visitor who
+    # closed the tab after their last transaction still gets their escrow back.
     refund_id = body["refund"]["run_id"]
     deadline = time.time() + 5
     refund = {}
@@ -834,8 +831,36 @@ def test_the_last_run_of_a_session_refunds_without_being_asked(executing):
         time.sleep(0.01)
 
     assert refund["status"] == "succeeded", refund.get("error")
+    assert refund["kind"] == "refund"
     assert refund["session"]["refunded"] is True
     assert refund["session"]["finishing"] is False
+
+
+def test_the_final_refund_does_not_need_anybody_to_be_watching(executing):
+    """A browser is not a durable job worker.
+
+    The trigger used to live in the GET that reports progress, so a visitor who watched their
+    last transaction land and closed the tab left the escrow holding their deposits. Nothing
+    polls in this test at all.
+    """
+
+    from wrasse import executor, sessions as session_module
+
+    client, _, queue = executing
+    session_id = client.post("/api/session").json()["session_id"]
+    request = {"session_id": session_id, "profile": "urgent"}
+    for _ in range(session_module.RUNS_PER_SESSION):
+        client.post("/api/execute", json=request)
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        refunds = [r for r in queue._runs.values()
+                   if r.session_id == session_id and r.kind == executor.REFUND]
+        if refunds:
+            break
+        time.sleep(0.01)
+
+    assert refunds, "the escrow was left full because nobody happened to poll"
 
 
 def test_a_run_reports_which_number_it_is(executing):

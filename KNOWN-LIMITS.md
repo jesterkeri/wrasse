@@ -58,13 +58,29 @@ third visitor in a queue waits for the two ahead of them. The bounds are
 `WRASSE_RUNS_PER_SESSION` and `WRASSE_TOTAL_RUN_CEILING`, and neither makes an empty wallet
 safe.
 
-**A restart loses every run and session, and recovers only the money.** The queue, the run
-objects and the session registry are held in process memory; the transaction ledger and the
-session databases are not. So a restart frees both wallets, because the worker resolves every
-unresolved ledger row before it will settle anything, and the escrow is recoverable, because a
-refund closes any deal a run left open. What a visitor loses is their run id and their session:
-`/api/run/{id}` returns 404 and they start again. Persisting the run procedure itself would fix
-that and was not built, because losing a link is an inconvenience and losing a deposit is not.
+**A restart loses every run and session; the money is recovered from a separate index.** The
+queue, the run objects and the session registry are held in process memory. Three things are
+not: the transaction ledger, the session databases, and `liabilities.db`, which records every
+deal the moment its id exists and forgets it when it is closed. On boot the worker resolves the
+ledger, refuses to sign at all if any row still holds a wallet, then closes every deal the
+index still lists and collects what they released. That is why the money claim is checkable
+rather than aspirational: the index is the durable answer to "which deals are open", and the
+ledger cannot give it, because a ledger row records a transaction and the deal id lives in a
+log it does not parse.
+
+What a visitor loses is their run id and their session. `/api/run/{id}` returns 404, the page
+notices, discards the dead identifier and starts a new session rather than reusing it forever.
+The private history that session had built is gone; the two receipts everything starts from are
+not. Persisting the run procedure itself would keep the link too and was not built, because
+losing a link is an inconvenience and losing a deposit is not.
+
+**A refund is complete at inclusion, not at the safe head.** Every other place in this build
+that turns a transaction into a durable fact waits for confirmation first, and a withdrawal
+does not: the run reports success once the collection is in a block. A reorg of that block
+would put the credit back in the escrow while the session reports itself refunded. The credit
+is not lost, because the next reclaim or refund on this deployment collects whatever the escrow
+is holding for either wallet, but that session's own completion claim would be wrong until then.
+Waiting for the safe head would add about two and a half minutes to the end of every session.
 
 **A refund collects the shared escrow credit, not this session's share of it.** The escrow
 aggregates credits per wallet across every deal and has no notion of a session, so one visitor

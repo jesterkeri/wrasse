@@ -242,6 +242,55 @@ repository alone, because the learned dimensions and both memory stores are deli
 part of the artifact. Reproducing the numbers needs the persona, the receipts, the operator
 baselines and those dimensions, which is the same list the reproducibility note above gives.
 
+### Two memories, one process, and how to check that yourself
+
+The claim is that each side's numbers come only from that side's memory. It is worth stating
+what that does and does not mean, because the easy overstatement is one this project does not
+make.
+
+The settlement runs in one process. `_bilateral_quote` opens both stores under one lock,
+because comparing two sequential snapshots cannot establish a common one, and a receipt landing
+between two reads would leave both sides holding sets that never coexisted. Inside that lock the
+two are kept apart: the buyer recalls the provider from the buyer's store, the provider recalls
+the buyer from its own, each side's learned dimensions are loaded from its own store, and each
+side's terms are produced from its own evidence and its own dimensions. Nothing shares a
+scoring input. What the two do share is a set of public Base receipts, which is not the same as
+sharing a database.
+
+So the honest phrasing is **two independently held memories on one host**, never two independent
+parties, and the page and this file both keep to it. There is no network between them and
+nothing in the demo pretends otherwise.
+
+You can check the separation instead of taking it on trust. `agent-positions` publishes one
+side's numbers from a process that opens exactly one store:
+
+```bash
+BASE="--base-price-wei 100000000000000 --base-bond-bps 500 --service-window 600 --payout-delay 1800"
+uv run wrasse agent-positions --role buyer    $BASE
+uv run wrasse agent-positions --role provider $BASE
+```
+
+Pass the same four baselines to both, because a proposal is a function of the baseline as well
+as the memory, and two sides quoted against different baselines settle to nothing meaningful.
+Those are the numbers the page starts with.
+
+Each prints that side's proposals, that side's published limits, and the ids of the receipts it
+holds; the buyer's are given per profile, since the profile is a buyer-side choice. On the two
+receipts currently on Base the urgent pair reads:
+
+| | buyer publishes | provider publishes |
+|---|---|---|
+| proposes | bond 3500 bps, window 300s | price 11800 bps, delay 893s |
+| limits | pay at most 12000 bps, delay at least 900s | post at most 2480 bps, needs at least 300s |
+
+Settle those eight numbers by hand with the rules in the table above: bond `min(3500, 2480)`,
+window `max(300, 300)`, price `min(11800, 12000)`, delay `max(893, 900)`. That gives bond 2480,
+window 300s, price 11800 bps which is 118000000000000 wei, and delay 900s, which is exactly what
+the live quote returns for `urgent`. The receipt ids are published for the same reason: a gap between what
+the two sides hold becomes an exchanged fact rather than an assertion one of them makes about
+itself. Neither side publishes its ontology, because a provider reading the buyer's dimensions
+would not be an independently held memory.
+
 ## Sending transactions
 
 Four commands sit between a quote and a settled deal.

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -683,13 +684,42 @@ class _Recovering(_Withdrawals):
         return super().__call__(argv, env, timeout)
 
 
-def _recovery_runner(chain, deals, **kwargs):
+class FakeLiabilities:
+    """The durable index of open deals, in memory.
+
+    Injected rather than pointed at a scratch file because what these tests are about is which
+    deals the procedure asks for and which it writes off, not SQLite.
+    """
+
+    def __init__(self, open_by_session=None):
+        self.open = dict(open_by_session or {})
+        self.closed: list[int] = []
+        self.recorded: list[tuple[int, str]] = []
+
+    def record(self, deal_id, session_id, detail=None):
+        self.recorded.append((int(deal_id), session_id))
+        self.open.setdefault(session_id, []).append(int(deal_id))
+
+    def close(self, deal_id):
+        self.closed.append(int(deal_id))
+        for ids in self.open.values():
+            if int(deal_id) in ids:
+                ids.remove(int(deal_id))
+
+    def open_deals(self, session_id=None):
+        if session_id is None:
+            return sorted({i for ids in self.open.values() for i in ids})
+        return sorted(self.open.get(session_id, []))
+
+
+def _recovery_runner(chain, deals, liabilities=None, **kwargs):
     return Runner(
         command=chain,
         balance_reader=lambda: {"buyer": 1, "provider": 10**18},
         credit_reader=lambda: {"buyer": 0, "provider": 10**14},
         deal_reader=lambda deal_id: deals[deal_id],
         chain_now=lambda: 10**9,
+        liabilities=liabilities or FakeLiabilities(),
         sleep=lambda _: None, clock=bounded_clock(), **kwargs,
     )
 
@@ -716,9 +746,9 @@ def test_a_deal_a_failed_run_left_open_is_closed_before_the_escrow_is_collected(
     chain = _Recovering()
     deals = {4: {"state": state, "accept_by": 1, "deadline": 1, "payout_available_at": 1}}
     run = _refund_run(tmp_path)
-    run.recover = [4]
+    held = FakeLiabilities({run.session_id: [4]})
 
-    _recovery_runner(chain, deals).execute(run)
+    _recovery_runner(chain, deals, held).execute(run)
 
     assert run.status == executor.SUCCEEDED, run.error
     assert chain.closed == [(command, "4")], "the open deal was left holding its deposit"
@@ -732,9 +762,9 @@ def test_a_deal_that_already_ended_is_not_touched(environment, tmp_path, state):
     chain = _Recovering()
     deals = {4: {"state": state, "accept_by": 1, "deadline": 1, "payout_available_at": 1}}
     run = _refund_run(tmp_path)
-    run.recover = [4]
+    held = FakeLiabilities({run.session_id: [4]})
 
-    _recovery_runner(chain, deals).execute(run)
+    _recovery_runner(chain, deals, held).execute(run)
 
     assert run.status == executor.SUCCEEDED, run.error
     assert chain.closed == []
@@ -747,7 +777,6 @@ def test_closing_a_deal_waits_for_the_deadline_the_contract_will_check(environme
     deals = {4: {"state": "Accepted", "accept_by": 1, "deadline": 500,
                  "payout_available_at": 1}}
     run = _refund_run(tmp_path)
-    run.recover = [4]
     seen = []
     times = iter([100, 200, 600, 600, 600, 600])
 
@@ -757,6 +786,7 @@ def test_closing_a_deal_waits_for_the_deadline_the_contract_will_check(environme
         credit_reader=lambda: {"buyer": 0, "provider": 10**14},
         deal_reader=lambda deal_id: deals[deal_id],
         chain_now=lambda: seen.append(next(times)) or seen[-1],
+        liabilities=FakeLiabilities({run.session_id: [4]}),
         sleep=lambda _: None, clock=bounded_clock(),
     ).execute(run)
 
@@ -775,9 +805,9 @@ def test_every_deal_the_session_opened_is_closed_not_just_the_last(environment, 
         3: {"state": "Delivered", "accept_by": 1, "deadline": 1, "payout_available_at": 1},
     }
     run = _refund_run(tmp_path)
-    run.recover = [1, 2, 3]
+    held = FakeLiabilities({run.session_id: [1, 2, 3]})
 
-    _recovery_runner(chain, deals).execute(run)
+    _recovery_runner(chain, deals, held).execute(run)
 
     assert run.status == executor.SUCCEEDED, run.error
     assert chain.closed == [("cancel-unaccepted", "2"), ("release-deal", "3")]
@@ -806,11 +836,65 @@ def test_a_reclaim_resolves_what_the_previous_process_left_open(environment, tmp
         run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
         paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
     )
-    Runner(command=command, sleep=lambda _: None).execute(run)
+    Runner(command=command, sleep=lambda _: None,
+           liabilities=FakeLiabilities()).execute(run)
 
     assert run.status == executor.SUCCEEDED, run.error
-    assert calls == ["tx-resolve"], "a reclaim must not send anything"
+    assert calls == ["tx-resolve"], "a reclaim with nothing to close must not send anything"
     assert "1 of 2" in run.steps[0].detail
+
+
+def test_a_reclaim_refuses_to_open_the_queue_while_a_wallet_is_still_held(
+    environment, tmp_path
+):
+    """`tx-resolve` exits zero having said a transaction is absent and needs a rebroadcast.
+
+    The row and its nonce stay exactly where they were, so counting a successful exit as a
+    reclaimed wallet let the next visitor's run reach a ledger that would refuse it. Every
+    row's status has to be read, not the command's.
+    """
+
+    def command(argv, env, timeout):
+        return 0, json.dumps([
+            {"intent_id": "i-1", "status": "included_success", "action": "resolved"},
+            {"intent_id": "i-2", "status": "unknown",
+             "action": "pass --rebroadcast to resend the identical bytes"},
+        ]), ""
+
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+    Runner(command=command, sleep=lambda _: None,
+           liabilities=FakeLiabilities()).execute(run)
+
+    assert run.status == executor.FAILED
+    assert "i-2 is unknown" in run.error
+    assert "nonce is not free" in run.error
+
+
+def test_a_reclaim_closes_the_deals_a_previous_process_left_behind(environment, tmp_path):
+    """The whole point of writing them down. The sessions that opened them no longer exist."""
+
+    chain = _Recovering()
+    deals = {8: {"state": "Accepted", "accept_by": 1, "deadline": 1, "payout_available_at": 1}}
+    held = FakeLiabilities({"a session that died": [8]})
+    run = Run(
+        run_id="r", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={"buyer": tmp_path / "b.db", "provider": tmp_path / "p.db"}, workdir=tmp_path,
+    )
+
+    Runner(
+        command=chain, balance_reader=lambda: {"buyer": 1, "provider": 10**18},
+        credit_reader=lambda: {"buyer": 0, "provider": 10**14},
+        deal_reader=lambda deal_id: deals[deal_id], chain_now=lambda: 10**9,
+        liabilities=held, sleep=lambda _: None, clock=bounded_clock(),
+    ).execute(run)
+
+    assert run.status == executor.SUCCEEDED, run.error
+    assert chain.closed == [("claim-timeout", "8")]
+    assert held.closed == [8], "the index still lists a deal that has been closed"
+    assert chain.roles == ["provider"], "and the money it released was collected"
 
 
 def test_a_reclaim_that_cannot_reach_the_chain_fails_rather_than_reporting_success(
@@ -829,3 +913,79 @@ def test_a_reclaim_that_cannot_reach_the_chain_fails_rather_than_reporting_succe
 
     assert run.status == executor.FAILED
     assert "unreachable" in run.error
+
+
+def test_the_queue_refuses_to_settle_while_the_reclaim_says_a_wallet_is_held(
+    environment, tmp_path
+):
+    """Freeing the wallets is a gate, not a report.
+
+    The reclaim runs first, which put it in the right order and nothing more: the worker went
+    on to the next run whatever it concluded. A settlement admitted then meets the ledger's
+    refusal three transactions in, with a deal already open and a visitor watching.
+    """
+
+    class Failing(Runner):
+        def __init__(self):
+            pass
+
+        def execute(self, run):
+            if run.kind == executor.RECLAIM:
+                run.status = executor.FAILED
+                run.error = "i-2 is unknown; the nonce is not free"
+                return
+            run.status = executor.SUCCEEDED
+            raise AssertionError("a settlement ran while a wallet was still held")
+
+    queue = executor.Queue(Failing())
+    reclaim = Run(
+        run_id="reclaim", session_id="", kind=executor.RECLAIM, profile="", baseline={},
+        paths={}, workdir=tmp_path,
+    )
+    settlement = make_run(environment)
+    queue.submit(reclaim)
+    queue.submit(settlement)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and settlement.status in (executor.QUEUED, executor.RUNNING):
+        time.sleep(0.01)
+    queue.stop()
+
+    assert settlement.status == executor.FAILED
+    assert "cannot sign until its wallets are free" in settlement.error
+    assert "the nonce is not free" in settlement.error
+    assert all(
+        step.status != executor.PENDING for step in settlement.steps
+    ), "a refused run must not leave steps looking like they are still going to happen"
+
+
+def test_a_refund_still_runs_when_the_queue_is_closed_to_settlements(environment, tmp_path):
+    """Collecting and closing is exactly what a service in that state should still do."""
+
+    ran = []
+
+    class Failing(Runner):
+        def __init__(self):
+            pass
+
+        def execute(self, run):
+            ran.append(run.kind)
+            if run.kind == executor.RECLAIM:
+                run.status = executor.FAILED
+                run.error = "a wallet is held"
+                return
+            run.status = executor.SUCCEEDED
+
+    queue = executor.Queue(Failing())
+    queue.submit(Run(run_id="reclaim", session_id="", kind=executor.RECLAIM, profile="",
+                     baseline={}, paths={}, workdir=tmp_path))
+    refund = _refund_run(tmp_path)
+    queue.submit(refund)
+
+    deadline = time.time() + 5
+    while time.time() < deadline and refund.status in (executor.QUEUED, executor.RUNNING):
+        time.sleep(0.01)
+    queue.stop()
+
+    assert refund.status == executor.SUCCEEDED, refund.error
+    assert ran == [executor.RECLAIM, executor.REFUND]

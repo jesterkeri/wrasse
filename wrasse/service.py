@@ -412,10 +412,32 @@ def _queue() -> executor.Queue:
 
     global _QUEUE
     if _QUEUE is None:
-        _QUEUE = executor.Queue()
+        _QUEUE = executor.Queue(after=_run_finished)
         if EXECUTION:
             _QUEUE.submit(_reclaim_run())
     return _QUEUE
+
+
+def _run_finished(run: executor.Run) -> None:
+    """Queue a session's final refund the moment its last settlement is over.
+
+    This used to happen in the GET handler that reports a run's progress, which made the
+    promise conditional on a browser continuing to poll. A visitor who watched their last
+    transaction land and closed the tab left the escrow holding their deposits, and the live
+    check could not catch it because the check is itself a poller.
+
+    Cleanup is caused by the work finishing, and the thing that knows the work has finished is
+    the worker.
+    """
+
+    if run.kind != executor.SETTLEMENT:
+        return
+    session = _session_registry().get(run.session_id)
+    if session is None:
+        return
+    if session.runs < sessions.RUNS_PER_SESSION:
+        return
+    _refund(session)
 
 
 def _reclaim_run() -> executor.Run:
@@ -444,8 +466,29 @@ def _reclaim_run() -> executor.Run:
 def _session_registry() -> sessions.Sessions:
     global _SESSIONS
     if _SESSIONS is None:
-        _SESSIONS = sessions.Sessions(_PATHS[WARM], busy=_session_is_busy)
+        _SESSIONS = sessions.Sessions(
+            _PATHS[WARM], busy=_session_is_busy, on_evict=_forget_session_stores
+        )
     return _SESSIONS
+
+
+def _forget_session_stores(session_id: str) -> None:
+    """Drop this session's open stores when its files are deleted.
+
+    The cache was keyed by session id and never pruned, so every evicted session left an open
+    pair of stores reachable forever, holding file descriptions on databases that no longer
+    exist. Quoting alone could grow it without bound, because quoting opens a pair and never
+    settles anything.
+    """
+
+    stores = _session_stores.pop(session_id, None)
+    for store in (stores or {}).values():
+        closer = getattr(store, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001 - a store that cannot close must not block eviction
+                pass
 
 
 def _session_is_busy(session: sessions.Session) -> bool:
@@ -458,7 +501,15 @@ def _session_is_busy(session: sessions.Session) -> bool:
 
     if _queue().busy_with(session.session_id):
         return True
-    return session.runs > 0 and not session.refunded
+    # A liability the escrow is actually holding, not merely a run that was attempted. Keying
+    # this on `runs > 0` kept every session that had ever pressed the button, including ones
+    # whose run refused before sending anything, so enough of those defeated the storage bound
+    # entirely.
+    from . import liabilities
+
+    if liabilities.open_deals(session.session_id):
+        return True
+    return session.finishing
 
 
 def _require_execution() -> None:
@@ -628,8 +679,7 @@ def _reconcile_refund(session: sessions.Session) -> None:
         # Retryable, and it must be. A withdrawal can revert or time out with credit still in
         # the escrow, and a session that stayed marked finished would report success over money
         # nobody could reach.
-        session.finishing = False
-        session.refund_run_id = None
+        _session_registry().abandon_finishing(session)
 
 
 def _refund(session: sessions.Session) -> dict:
@@ -638,10 +688,13 @@ def _refund(session: sessions.Session) -> dict:
     _reconcile_refund(session)
     if session.refunded and session.refund_run_id:
         return {"run_id": session.refund_run_id, "already_refunded": True}
-    if session.finishing and session.refund_run_id:
-        # Still in flight. A second press must not queue a second withdrawal: the ledger would
-        # be right to refuse it and the page would show two refunds for one collection.
-        return {"run_id": session.refund_run_id, "already_refunded": False}
+    # Claimed under the registry's own lock, the same one that admits settlements. Two presses,
+    # or a press racing the worker's automatic one, produce a single refund; the loser is handed
+    # the winner's run rather than queueing a second withdrawal the ledger would refuse.
+    if not _session_registry().begin_finishing(session):
+        if session.refund_run_id:
+            return {"run_id": session.refund_run_id, "already_refunded": session.refunded}
+        return {"run_id": None, "already_refunded": session.refunded}
 
     run_id = uuid.uuid4().hex
     workdir = session.directory / "runs" / run_id
@@ -664,11 +717,9 @@ def _refund(session: sessions.Session) -> dict:
             if other.deal_id is not None
         }),
     )
-    # `finishing`, not `refunded`. This stops a second press queueing a second withdrawal while
-    # the first is in flight, which is all it was ever meant to do. `refunded` is written by
-    # `_reconcile_refund` once the withdrawal has actually succeeded, because a flag set before
-    # the work made a failed refund permanent.
-    session.finishing = True
+    # `finishing` was set by the claim above; only the run id is recorded here. `refunded` is
+    # written by `_reconcile_refund` once a withdrawal has actually succeeded, because a flag
+    # set before the work made a failed refund permanent.
     session.refund_run_id = run_id
     _queue().submit(run)
     return {"run_id": run_id, "already_refunded": False}
@@ -692,14 +743,13 @@ def run_status(run_id: str) -> dict:
         # Every poll reconciles, so a refund that succeeded or failed while nobody was asking
         # is recorded the next time anybody asks.
         _reconcile_refund(session)
-        if (
-            run.kind == executor.SETTLEMENT
-            and run.status == executor.SUCCEEDED
-            and session.runs >= sessions.RUNS_PER_SESSION
-            and not session.refunded
-            and not session.finishing
-        ):
-            body["refund"] = _refund(session)
+        # Reported, never caused. The worker queues the final refund when the last run ends;
+        # this only shows what it did, so a visitor who stopped watching still gets one.
+        if session.refund_run_id:
+            body["refund"] = {
+                "run_id": session.refund_run_id,
+                "already_refunded": session.refunded,
+            }
         body["session"] = session.view()
     return body
 

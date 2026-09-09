@@ -142,6 +142,15 @@ _CONFIRMED = frozenset({"confirmed_success"})
 #: What the ledger calls a send that never reached a node.
 UNBROADCAST_STATUS = "unbroadcast"
 
+#: Statuses in which a row is no longer holding its wallet's nonce. Terminal ones have finished
+#: and `included_*` have consumed the nonce, which is the only question the next send asks. Any
+#: other status means the wallet is still blocked, whatever the resolver's exit code said.
+_FREED_STATUSES = frozenset({
+    "included_success", "included_reverted",
+    "confirmed_success", "confirmed_reverted",
+    "nonce_consumed_or_replaced", "unbroadcast",
+})
+
 #: Reaching any of these means the run is over and the outcome is not the one it wanted.
 _DEAD = frozenset(
     {"included_reverted", "confirmed_reverted", "stuck", "unbroadcast",
@@ -383,6 +392,10 @@ class Runner:
         deal_id_reader: Callable[[str], int] | None = None,
         balance_reader: Callable[[], dict[str, int]] | None = None,
         credit_reader: Callable[[], dict[str, int]] | None = None,
+        #: Where open deals are written down so a restart can find them. Injected like every
+        #: other collaborator that touches the world, so the procedure can be exercised without
+        #: one and a test can hand it a scratch file rather than the deployment's own.
+        liabilities: Any | None = None,
         deal_reader: Callable[[int], dict[str, Any]] | None = None,
         chain_now: Callable[[], int | None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -392,6 +405,11 @@ class Runner:
         self._deal_id = deal_id_reader or _default_deal_id_reader
         self._balances = balance_reader or _default_balance_reader
         self._credits = credit_reader or _default_credit_reader
+        if liabilities is None:
+            from . import liabilities as _liabilities
+
+            liabilities = _liabilities
+        self._liabilities = liabilities
         self._deal = deal_reader or _default_deal_reader
         self._chain_now = chain_now or _default_chain_now
         self._sleep = sleep
@@ -535,13 +553,47 @@ class Runner:
         step = self._begin(run, "reclaim")
         try:
             rows = self._cli(run, ["tx-resolve"])
+
+            # Every row's status, not the command's exit code. `tx-resolve` exits zero having
+            # reported that a transaction is absent and needs a deliberate rebroadcast, which
+            # leaves the row and its nonce exactly where they were. Counting that as reclaimed
+            # was the defect: the wallet stayed blocked and the next visitor met it.
+            held = [
+                row for row in rows
+                if str(row.get("status")) not in _FREED_STATUSES
+            ]
+            if held:
+                raise ExecutionError(
+                    "these transactions still hold a wallet and this service cannot free them "
+                    "on its own: "
+                    + "; ".join(
+                        f"{row.get('intent_id')} is {row.get('status')}"
+                        f" ({row.get('action') or 'no action'})" for row in held
+                    )
+                    + ". An operator has to decide whether to resend identical bytes; until "
+                    "then no settlement can be signed, because the nonce is not free."
+                )
+
+            # A restart inherits deals whose runs no longer exist. This is the only place that
+            # can find them, and finding them is what makes the recovery claim true rather
+            # than aspirational.
+            inherited = self._open_liabilities(None)
+            if inherited:
+                self._recover_deals(run, inherited)
+                self._collect(run, step)
         except ExecutionError as error:
             self._fail(run, str(error))
             return
+        except Exception as error:  # noqa: BLE001
+            self._fail(run, f"unexpected failure: {error}")
+            return
+
         moved = [row for row in rows if row.get("action") not in (None, "none")]
         self._end(step, detail=(
             f"{len(moved)} of {len(rows)} transactions were still open and have been resolved"
-            if moved else "nothing was left unresolved"
+            + (f"; {len(inherited)} deals left open by a previous process were closed"
+               if inherited else "")
+            if moved or inherited else "nothing was left unresolved"
         ))
         run.status = SUCCEEDED
         run.finished_at = _now()
@@ -567,48 +619,18 @@ class Runner:
 
         step = self._begin(run, "refund")
         try:
-            self._recover_deals(run)
-            before = self._balances()
-            credits = self._credits()
-            # Both sides, because which side is holding a credit depends on how the session's
-            # runs ended. A released deal credits the seller its price and stake back; a
-            # timeout credits the buyer the same total. Collecting only the seller left every
-            # timeout a visitor produced sitting in the escrow, and `withdraw` reverts on a
-            # zero credit, so a session made only of timeouts refunded nothing and reported a
-            # failure while the money it could not see stayed put.
-            owed = [role for role in ("provider", "buyer") if credits.get(role, 0) > 0]
+            # Read now, not when this run was queued. A settlement queued behind this one has
+            # no deal id yet, and a snapshot taken at submission would miss it; the durable
+            # index has it the moment the id exists.
+            self._recover_deals(run, self._open_liabilities(run.session_id or None))
+            owed = self._collect(run, step)
             if not owed:
-                run.refund_to = min(before, key=lambda role: before[role])
-                run.refund_wei = 0
                 self._end(step, detail="the escrow was holding nothing for either wallet")
-                run.status = SUCCEEDED
-                run.finished_at = _now()
-                return
-
-            hashes = []
-            for role in owed:
-                # Recomputed per collection rather than chosen once. The first withdrawal
-                # changes which wallet is emptier, and the point of choosing at all is to keep
-                # the pair level.
-                standing = self._balances()
-                run.refund_to = min(standing, key=lambda name: standing[name])
-                destination = self._address(run.refund_to)
-                sent = self._cli(run, ["withdraw", "--role", role, "--to", destination])
-                if sent.get("status") == UNBROADCAST_STATUS:
-                    raise ExecutionError(
-                        sent.get("error", "the refund was refused before sending")
-                    )
-                hashes.append(sent.get("tx_hash"))
-                self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
-            step.tx_hash = hashes[-1]
-            after = self._balances()
-            run.refund_wei = sum(
-                max(0, after[role] - before[role]) for role in after
-            )
-            self._end(step, detail=(
-                f"collected what the escrow held for the {' and the '.join(owed)}, into "
-                f"whichever wallet was emptier at the time"
-            ))
+            else:
+                self._end(step, detail=(
+                    f"collected what the escrow held for the {' and the '.join(owed)}, into "
+                    f"whichever wallet was emptier at the time"
+                ))
         except ExecutionError as error:
             self._fail(run, str(error))
             return
@@ -630,7 +652,7 @@ class Runner:
         "Delivered": ("release-deal", None),
     }
 
-    def _recover_deals(self, run: Run) -> None:
+    def _recover_deals(self, run: Run, deal_ids: Sequence[int]) -> None:
         """Drive every deal this session opened to a terminal state, before collecting.
 
         A settlement can fail after `createDeal` has already escrowed the price: the acceptance
@@ -644,10 +666,13 @@ class Runner:
         deal already terminal is skipped, so this costs one read per deal in the ordinary case.
         """
 
-        for deal_id in run.recover:
+        for deal_id in deal_ids:
             deal = self._deal(deal_id)
             action = self._RECOVERY.get(str(deal["state"]))
             if action is None:
+                # Terminal, so its value is already credited and `withdraw` can see it. Drop it
+                # from the durable index rather than reading it again on every later refund.
+                self._forget_liability(deal_id)
                 continue
             command, expires = action
             step = Step("recover", f"Close deal {deal_id}, which is still holding a deposit")
@@ -661,10 +686,47 @@ class Runner:
             sent = self._cli(run, [command, "--deal-id", str(deal_id)])
             step.tx_hash = sent.get("tx_hash")
             self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
+            self._forget_liability(deal_id)
             self._end(step, detail=(
                 f"deal {deal_id} was {deal['state']} and holding a deposit; it is now closed "
                 "and what it held has been credited"
             ))
+
+    def _collect(self, run: Run, step: Step) -> list[str]:
+        """Empty the escrow into the two wallets, and say which sides it collected for.
+
+        Both sides, because which side holds a credit depends on how the runs ended. A released
+        deal credits the seller its price and stake back; a timeout credits the buyer the same
+        total. Collecting only the seller left every timeout a visitor produced sitting in the
+        escrow, and `withdraw` reverts on a zero credit, so a session made only of timeouts
+        refunded nothing and reported a failure over money it never looked at.
+        """
+
+        before = self._balances()
+        credits = self._credits()
+        owed = [role for role in ("provider", "buyer") if credits.get(role, 0) > 0]
+        if not owed:
+            run.refund_to = min(before, key=lambda role: before[role])
+            run.refund_wei = 0
+            return []
+
+        hashes = []
+        for role in owed:
+            # Recomputed per collection rather than chosen once. The first withdrawal changes
+            # which wallet is emptier, and the point of choosing at all is to keep the pair
+            # level.
+            standing = self._balances()
+            run.refund_to = min(standing, key=lambda name: standing[name])
+            destination = self._address(run.refund_to)
+            sent = self._cli(run, ["withdraw", "--role", role, "--to", destination])
+            if sent.get("status") == UNBROADCAST_STATUS:
+                raise ExecutionError(sent.get("error", "the refund was refused before sending"))
+            hashes.append(sent.get("tx_hash"))
+            self._resolve_until(run, sent["intent_id"], _INCLUDED, INCLUSION_TIMEOUT)
+        step.tx_hash = hashes[-1]
+        after = self._balances()
+        run.refund_wei = sum(max(0, after[role] - before[role]) for role in after)
+        return owed
 
     def _address(self, role: str) -> str:
         from . import cli
@@ -883,6 +945,10 @@ class Runner:
         # The id exists nowhere until the log does, so every later step waits on this read
         # rather than on the wallet being free.
         run.deal_id = self._deal_id(sent["tx_hash"])
+        # Written down before anything else happens to it. Everything that knows this deal
+        # exists is in process memory and dies with the process; this file is what lets a
+        # restarted service find a deposit whose run it can no longer remember.
+        self._record_liability(run.deal_id, run.session_id, sent.get("tx_hash"))
         self._end(step, detail=f"deal {run.deal_id} is open")
         return sent
 
@@ -922,6 +988,15 @@ class Runner:
         self._cli(run, ["reconcile", "--tx", release["tx_hash"]])
         self._end(step, detail="both memories now hold this outcome")
 
+    def _record_liability(self, deal_id: int, session_id: str, tx_hash: str | None) -> None:
+        self._liabilities.record(deal_id, session_id, detail={"create_tx": tx_hash})
+
+    def _forget_liability(self, deal_id: int) -> None:
+        self._liabilities.close(deal_id)
+
+    def _open_liabilities(self, session_id: str | None) -> list[int]:
+        return self._liabilities.open_deals(session_id)
+
 
 class _Refused(Exception):
     """The two memories left no overlap. Carried as control flow, reported as an outcome."""
@@ -950,8 +1025,22 @@ class Queue:
     say so instead of showing a dead button.
     """
 
-    def __init__(self, runner: Runner | None = None, *, history: int = 200) -> None:
+    def __init__(
+        self,
+        runner: Runner | None = None,
+        *,
+        history: int = 200,
+        after: Callable[[Run], None] | None = None,
+    ) -> None:
         self._runner = runner or Runner()
+        #: Called with every run the moment it finishes, whatever it finished as. This is where
+        #: a session's automatic final refund is queued, because the thing that knows a run is
+        #: over is the worker rather than the next HTTP request that happens to arrive.
+        self._after = after
+        #: Set when the startup reclaim failed, and it closes the queue to settlements. Not to
+        #: refunds: a refund collects and closes, which is exactly what a service in this state
+        #: should still be able to do.
+        self._closed: str | None = None
         self._condition = threading.Condition()
         self._pending: deque[str] = deque()
         self._runs: dict[str, Run] = {}
@@ -1053,7 +1142,33 @@ class Queue:
                 self._active = run_id
                 run = self._runs[run_id]
             try:
-                self._runner.execute(run)
+                if run.kind == SETTLEMENT and self._closed is not None:
+                    # The reclaim failed, so at least one wallet is still holding a nonce for a
+                    # transaction nobody here remembers. Signing anyway would meet the ledger's
+                    # refusal three transactions into a visitor's run instead of before it.
+                    self._refuse(run, self._closed)
+                else:
+                    self._runner.execute(run)
+                    if run.kind == RECLAIM and run.status != SUCCEEDED:
+                        self._closed = run.error or "the startup reclaim did not succeed"
             finally:
                 with self._condition:
                     self._active = None
+                if self._after is not None:
+                    # Cleanup belongs to whatever finished the work, not to whoever happens to
+                    # poll next. A browser is not a durable job worker: a visitor who closes
+                    # the tab after their last run would otherwise leave the escrow full.
+                    try:
+                        self._after(run)
+                    except Exception:  # noqa: BLE001 - a callback must not kill the worker
+                        pass
+
+    def _refuse(self, run: Run, reason: str) -> None:
+        run.status = FAILED
+        run.error = (
+            f"this deployment cannot sign until its wallets are free. {reason}"
+        )
+        for step in run.steps:
+            if step.status == PENDING:
+                step.status = SKIPPED
+        run.finished_at = _now()

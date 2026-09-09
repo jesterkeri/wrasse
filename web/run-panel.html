@@ -168,9 +168,11 @@
     accept: ['waiting for the stake to be included', 12],
     deliver: ['waiting for delivery to be included', 12],
     release: ['waiting for the release to be included', 14],
-    confirm: ['the outcome is already known: the agent has read the receipt, the sender, '
-      + 'the logs and the contract\u2019s own state straight from Base. What this waits for is '
-      + 'Base no longer being able to reverse it, which is what makes it safe to remember',
+    confirm: ['the transaction is already in a block, and the resolver has seen it there. '
+      + 'What this waits for is Base no longer being able to reverse it. Only then does the '
+      + 'agent check the receipt, the sender, the logs and the contract\u2019s own state '
+      + 'against each other, because a memory written from a block that can still be '
+      + 'withdrawn would point at a history that no longer exists',
       150],
     teach: ['now it may become memory, so both sides are told', 5]
   };
@@ -254,13 +256,39 @@
 
   async function session() {
     // Kept for the tab rather than forever. A session holds a private copy of both memories,
-    // and the oldest are evicted, so a stale identifier from last week is expected to fail.
+    // the oldest are evicted, and the server loses its registry on restart, so a stored
+    // identifier is expected to stop working and the page has to handle that rather than
+    // return it forever. It used to: every press reused a dead id, got "no such session", and
+    // never created the new one that would have worked.
     var held = null;
     try { held = sessionStorage.getItem('wrasse-session'); } catch (e) { held = null; }
-    if (held) return held;
+    if (held && await alive(held)) return held;
+    if (held) {
+      try { sessionStorage.removeItem('wrasse-session'); } catch (e) { /* private mode */ }
+      note('That session is no longer on the server, so this starts a new one. The history '
+        + 'the old one had built is not recoverable; the two receipts everything starts from '
+        + 'are still there.');
+    }
     var made = await post('/api/session');
     try { sessionStorage.setItem('wrasse-session', made.session_id); } catch (e) { /* private mode */ }
     return made.session_id;
+  }
+
+  //: A session is addressable only through a run, so this asks the cheapest question that
+  //: names one: a quote against it. A 404 is the server saying it has never heard of this id.
+  async function alive(id) {
+    try {
+      var response = await fetch('/api/quote', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session_id: id })
+      });
+      return response.status !== 404;
+    } catch (error) {
+      // A network failure is not the server disowning the session, and throwing away a live
+      // session because the wifi dropped would lose a history the visitor built.
+      return true;
+    }
   }
 
   function drawKnown(run) {
@@ -295,8 +323,10 @@
     text(body, 'The price was ' + eth(t.price_wei) + ' ETH, the seller staked '
       + (t.provider_bond_bps / 100) + '% of it and had ' + Math.round(t.service_window / 60)
       + ' minutes to deliver. Nothing has left either wallet yet: settlement credits each side '
-      + 'inside the escrow, and the credits are collected in one transaction when you finish '
-      + 'the session. What the run is still waiting for is Base treating this as permanent, '
+      + 'inside the escrow, and they are collected in one step when you finish the session, '
+      + 'which is one transaction per side that is owed something plus one for any deal an '
+      + 'earlier run left open. What the run is still waiting for is Base treating this as '
+      + 'permanent, '
       + 'because a memory that could be withdrawn would make every deal signed in the meantime '
       + 'point at a history that no longer exists.');
     card.appendChild(body);

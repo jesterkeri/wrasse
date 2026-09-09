@@ -127,6 +127,7 @@ class Sessions:
         limit: int | None = None,
         runs_per_session: int | None = None,
         busy: Callable[["Session"], bool] | None = None,
+        on_evict: Callable[[str], None] | None = None,
     ) -> None:
         self._source = source
         self._root = root or SESSION_ROOT
@@ -135,6 +136,7 @@ class Sessions:
         #: Asked before deleting anything. Injected rather than imported, because the queue is
         #: the thing that knows a run is in flight and this module must not depend on it.
         self._busy = busy
+        self._on_evict = on_evict
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
         self._order: list[str] = []
@@ -171,10 +173,41 @@ class Sessions:
         with self._lock:
             return self._sessions.get(session_id)
 
+    def begin_finishing(self, session: Session) -> bool:
+        """Claim the right to refund this session, under the same lock that admits runs.
+
+        Returns whether this caller is the one that claimed it. Sharing the lock with `spend`
+        is the point: without it a settlement could be admitted between a refund deciding there
+        was nothing left to collect and that refund running, and the deal it then opened would
+        have nothing scheduled to close it.
+        """
+
+        with self._lock:
+            if session.finishing or session.refunded:
+                return False
+            session.finishing = True
+            return True
+
+    def abandon_finishing(self, session: Session) -> None:
+        """Give the claim back, for a refund that failed and may be retried."""
+
+        with self._lock:
+            session.finishing = False
+            session.refund_run_id = None
+
     def spend(self, session: Session) -> None:
         """Record a run against a session, or refuse when it has used its allowance."""
 
         with self._lock:
+            # The allowance first, because spending it is what triggers the refund, so a
+            # visitor who used all five would otherwise be told they had finished the session
+            # when what they did was reach its limit. Both are refusals; only one is the
+            # reason.
+            if session.runs >= self._runs:
+                raise PermissionError(
+                    f"this session has run {session.runs} settlements, which is its limit. "
+                    "Both wallets are shared and faucet-funded. Start a new session to run more."
+                )
             # A finished session cannot start another settlement. Its refund has already
             # collected, or is collecting, whatever the escrow was holding, so a later run
             # would credit the escrow again with nothing scheduled to empty it.
@@ -182,11 +215,6 @@ class Sessions:
                 raise PermissionError(
                     "this session has been finished and its escrow collected. A settlement "
                     "started now would leave its deposit behind. Start a new session."
-                )
-            if session.runs >= self._runs:
-                raise PermissionError(
-                    f"this session has run {session.runs} settlements, which is its limit. "
-                    "Both wallets are shared and faucet-funded. Start a new session to run more."
                 )
             session.runs += 1
 
@@ -217,5 +245,10 @@ class Sessions:
                     break
                 continue
             self._sessions.pop(oldest, None)
+            if self._on_evict is not None:
+                # Whatever else owns resources for this session has to let go at the same
+                # moment its files do. A cached pair of open stores outlives its own database
+                # otherwise, and holds a file description on a path that no longer exists.
+                self._on_evict(oldest)
             shutil.rmtree(session.directory, ignore_errors=True)
         self._order = keep + self._order
