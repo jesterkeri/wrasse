@@ -1534,3 +1534,92 @@ def test_a_deletion_case_that_times_out_is_not_reported_as_a_refusal(monkeypatch
     message = str(raised.value)
     assert "did not answer" in message
     assert "is not reported as one" in message
+
+
+def test_the_unreadable_case_leaves_a_file_no_sqlite_will_open(tmp_path):
+    """CI caught this and the suite did not, on a machine whose SQLite disagreed with mine.
+
+    The case used to write twenty-two bytes. A short non-empty file is ambiguous: the runner
+    opened it as a fresh EMPTY database instead of refusing it, so the quote succeeded and the
+    proof reported "a memory that will not open -> terms".
+
+    That is the empty-versus-absent confusion this whole project exists to refuse, appearing
+    inside the test that checks for it, on the one deliverable the entry is judged on.
+    """
+
+    import sqlite3
+
+    from wrasse import prove as proving
+
+    store = tmp_path / "a-store-of-its-own.db"
+    connection = sqlite3.connect(store)
+    connection.execute("create table entities (body text)")
+    connection.commit()
+    connection.close()
+
+    proving._unreadable({"buyer": store})
+
+    assert store.stat().st_size > 100, "a file shorter than the header is ambiguous to SQLite"
+    with pytest.raises(sqlite3.DatabaseError):
+        sqlite3.connect(store).execute("select count(*) from sqlite_master").fetchone()
+
+
+def test_a_corruption_that_did_not_corrupt_is_refused_rather_than_reported(tmp_path, monkeypatch):
+    """The self-check, which is what would have turned the CI failure into a loud error.
+
+    If the payload ever stops being unreadable on some future SQLite, this case must say so
+    rather than quietly becoming a fourth way of asking an empty store for terms.
+    """
+
+    from wrasse import prove as proving
+
+    store = tmp_path / "another-store-of-its-own.db"
+
+    def leaves_it_readable(_data):
+        connection = __import__("sqlite3").connect(store)
+        connection.execute("create table entities (body text)")
+        connection.commit()
+        connection.close()
+
+    monkeypatch.setattr(type(store), "write_bytes", lambda self, data: leaves_it_readable(data))
+
+    with pytest.raises(RuntimeError) as raised:
+        proving._unreadable({"buyer": store})
+    assert "proves nothing" in str(raised.value)
+
+
+def test_the_proof_copies_rows_that_are_still_in_the_write_ahead_log(tmp_path):
+    """The copy has to be a snapshot, not three files grabbed while someone else writes.
+
+    `shutil.copy` of a database, its `-wal` and its `-shm` is not consistent: the service holds
+    these stores open and SQLite checkpoints on its own schedule, so a copy taken across that
+    boundary can arrive without the rows it is supposed to carry. Every case then reasons about
+    a store nobody ever served, intermittently, which is how the one test this entry is judged
+    on came back wrong on CI and passed here three runs in a row.
+    """
+
+    import sqlite3
+
+    from wrasse import prove as proving
+
+    origin = tmp_path / "live-buyer.db"
+    live = sqlite3.connect(origin)
+    live.execute("pragma journal_mode=wal")
+    live.execute("create table entities (category text, body text)")
+    live.execute("insert into entities values ('chain_event', '{\"tx_hash\":\"0xabc\"}')")
+    live.commit()
+    # Deliberately still open and unchecked-pointed, which is the state the service leaves it in.
+
+    try:
+        (tmp_path / "snapshot").mkdir()
+        copied = proving._copy({"buyer": origin}, tmp_path / "snapshot")
+
+        rows = sqlite3.connect(copied["buyer"]).execute(
+            "select body from entities where category = 'chain_event'"
+        ).fetchall()
+        assert len(rows) == 1, "the snapshot lost a row that was still in the write-ahead log"
+        assert not copied["buyer"].with_name(copied["buyer"].name + "-wal").exists(), (
+            "the snapshot carried a sidecar, which means it is three files again"
+        )
+    finally:
+        live.close()

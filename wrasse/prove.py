@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -57,14 +56,40 @@ class Case:
 
 
 def _copy(source: dict[str, Path], into: Path) -> dict[str, Path]:
+    """A consistent snapshot of each store, through SQLite's own backup.
+
+    This used to be `shutil.copy` of the database and its `-wal` and `-shm` sidecars. Three
+    file copies of a database another process holds open are not a snapshot: the service keeps
+    these stores open, WAL content is checkpointed on SQLite's schedule rather than ours, and a
+    copy taken across that boundary can arrive without the rows it is supposed to carry. The
+    proof then reported something about a store nobody had ever served, intermittently, which
+    is the worst way for the one test this entry is judged on to be wrong.
+
+    `backup` takes a read lock and produces a copy that is consistent by construction, with no
+    sidecars to keep in step. The source is opened read-only, so proving this cannot alter the
+    memory it is proving.
+    """
+
     paths = {}
     for role, origin in source.items():
         target = into / f"{role}-memory.db"
-        for suffix in ("", "-wal", "-shm"):
-            sidecar = origin.with_name(origin.name + suffix)
-            if sidecar.is_file():
-                shutil.copy(sidecar, target.with_name(target.name + suffix))
-                target.with_name(target.name + suffix).chmod(0o600)
+        if origin.is_file():
+            reader = sqlite3.connect(f"file:{origin}?mode=ro", uri=True)
+            try:
+                writer = sqlite3.connect(target)
+                try:
+                    reader.backup(writer)
+                    # And leave it as ONE file. The backup inherits the source's WAL mode, so
+                    # the snapshot would arrive with a `-wal` beside it, and `_unreadable`
+                    # overwrites only the database. A corrupted main file next to a live log is
+                    # exactly the ambiguity this case must not have.
+                    writer.execute("pragma journal_mode=delete")
+                    writer.commit()
+                finally:
+                    writer.close()
+            finally:
+                reader.close()
+            target.chmod(0o600)
         paths[role] = target
     return paths
 
@@ -83,8 +108,35 @@ def _deleted(paths: dict[str, Path]) -> None:
 
 
 def _unreadable(paths: dict[str, Path]) -> None:
-    """Present, and not a database. An unreachable memory service looks like this."""
-    paths["buyer"].write_bytes(b"this is not a database")
+    """Present, and not a database. An unreachable memory service looks like this.
+
+    The payload is a page-sized block of noise, not the twenty-two byte string this used to
+    write. A short non-empty file is ambiguous to SQLite: the runner in CI opened it as a
+    fresh EMPTY database rather than refusing it, so the case reported terms and the whole
+    eligibility proof said "a memory that will not open -> terms". That is the worst possible
+    failure here, because it is the empty-versus-absent confusion this project exists to
+    refuse, appearing inside the test that checks for it.
+
+    A file whose first sixteen bytes are not "SQLite format 3\0" and which is longer than the
+    hundred-byte header cannot be read as a database by any implementation.
+    """
+
+    paths["buyer"].write_bytes(b"this is not a database. " * 171)
+
+    # And then check it, because the point of this case is that the store cannot be read, and
+    # a case that quietly stops breaking anything is worse than no case at all. `_edited` earns
+    # its result the same way.
+    connection = sqlite3.connect(paths["buyer"])
+    try:
+        connection.execute("select count(*) from sqlite_master").fetchone()
+    except sqlite3.DatabaseError:
+        return
+    finally:
+        connection.close()
+    raise RuntimeError(
+        "the corrupted memory still opened as a database, so this case proves nothing. It has "
+        "to be unreadable, not merely damaged."
+    )
 
 
 def _edited(paths: dict[str, Path]) -> None:

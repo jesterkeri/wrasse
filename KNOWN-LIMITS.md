@@ -129,6 +129,18 @@ because the learned dimensions and both memory stores are deliberately not part 
 names a recent canonical Base block matching its own reference. Re-querying a public fact later
 says nothing about who read it first.
 
+## Units, and where wei is still correct
+
+Every amount a visitor reads as prose is in ETH: the page, the service's error messages, and
+the executor's progress lines. Three separate wei leaks reached a live page before this was
+enforced, each found by someone clicking rather than by a test.
+
+`wrasse policy` is the exception and it is deliberate. Its output is the signing document, and
+`terms.price_wei` is the contract-facing field that goes into the policy hash. Rendering it in
+ETH would change what gets signed and break the commitment, so the claim is narrower than "no
+wei anywhere": **no wei in prose a visitor reads.** A machine-readable document that names its
+own unit in its own field name is not prose.
+
 ## Scope, stated once
 
 Local-machine compromise. Byzantine RPC comparison. Wallet identity resets. Arbitrary
