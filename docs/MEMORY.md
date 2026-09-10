@@ -2,8 +2,12 @@
 
 What Wrasse persists, what it recalls, and what that recall is allowed to decide.
 
-Two agents negotiate a job. Each holds its own memory, on the Sibyl memory client over SQLite,
-and neither can read the other's. Their terms move between negotiations because each one prices
+Two agents negotiate a job. Each has its own memory, a separate store on the Sibyl memory
+client over SQLite, and each may only cite what the OTHER party did. **They are separate
+stores representing independently held memories, not access-isolated processes:** on the
+live demo one quote coordinator opens both and reads both, which is how it produces a
+bilateral quote in one pass. Enforcing that boundary at the process or credential level is
+out of scope for this MVP and is recorded as such in `KNOWN-LIMITS.md`. Their terms move between negotiations because each one prices
 the risk the other has already demonstrated. Take either memory away and there are no terms at
 all, which you can check yourself in about three seconds: see **Checking it** at the end.
 
@@ -64,8 +68,14 @@ instead of quietly pricing as if nothing happened.
   seconds in. Memory may only be written once Base can no longer reverse the transaction, about
   two minutes later. A memory that could be withdrawn would leave every deal signed in between
   committed to a history that no longer exists.
-- **Nothing is rewritten.** Entries are added. A better record earns better terms; a worse one
-  is not edited away.
+- **A receipt is never rewritten.** Verified chain events are append-only. A better record
+  earns better terms; a worse one is not edited away, and no command removes one.
+- **A reading of an outcome can be replaced, deliberately and on the record.**
+  `learn-dimension --relearn` retires the dimension currently held for an outcome type and
+  asks for another, which changes what an unchanged receipt is worth. Nothing is erased:
+  the retired definition stays in the store, marked retired, so a bad reading can be
+  corrected without pretending it was never held. Saying "nothing is rewritten" without
+  this qualification would be false.
 - **Serving writes nothing at all.** The identity record and the persona commitment are written
   once at startup, before anything is served, so every request afterwards is a read.
 

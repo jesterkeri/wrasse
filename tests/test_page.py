@@ -258,3 +258,29 @@ def test_a_refusal_reads_as_a_result_rather_than_as_engine_output():
     assert "Nothing was sent and nothing was spent." in document, (
         "a refusal has to say that it cost nothing, or it reads as a failed payment"
     )
+    # And it has to be reachable from the branch a refusal actually takes. The explanation
+    # first shipped only on the failed-run path, so a normal refusal printed a generic sentence
+    # that never named the term to change: the advice existed and the visitor never saw it.
+    assert "refusalText((run.settled || {}).failed_on" in document, (
+        "the refused branch writes its own sentence again instead of the shared explanation"
+    )
+
+
+def test_the_simulator_names_no_stake_threshold_it_cannot_know():
+    """A number that is right on one tab and wrong on the other is worse than no number.
+
+    The simulator prices the history the visitor invents, not the two receipts this deployment
+    holds. With an empty history a 25% stake settles perfectly well, so a fixed "at or above 25
+    percent everything refuses" warning is an on-screen assertion about a run that has not
+    happened. That is the same mistake as the 50% figure it replaced, one tab over.
+    """
+
+    document = _document()
+    simulator = document[document.find("<!-- wrasse:sim-panel:start -->"):]
+
+    assert "At or above 25 percent" not in simulator, (
+        "the simulator names a threshold computed from a history it does not price"
+    )
+    assert "depends entirely on the history YOU build" in simulator, (
+        "the simulator has to say that the limit follows the history the visitor builds"
+    )

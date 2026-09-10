@@ -240,21 +240,16 @@
     provider_bond_bps: [
       'The deposit the seller locks up, and the one starting number that can break a deal by '
         + 'itself. Whatever you ask for here, what the buyer remembers is added on top of it, '
-        + 'and no seller will ever stake more than half the price. With the two receipts these '
-        + 'two hold, the buyer is already asking for about 25 percent by itself, so anything '
-        + 'from about 25 percent upward leaves nothing to sign.',
-      // Measured against the live engine rather than reasoned about: the buyer's demand is
-      // this figure plus a fixed amount its memory contributes, and the seller's hard
-      // ceiling is half the price. With the two receipts on this deployment that puts the
-      // cliff at 25 percent, not the 50 this used to name. The old text sent a visitor
-      // confidently past the edge and then showed them raw engine output.
-      function (bps) {
-        return Number(bps) >= 2500
-          ? 'At or above 25 percent. With the history these two hold, what the buyer adds on '
-            + 'top of this passes the half-the-price limit no seller will cross, so every '
-            + 'posting is refused.'
-          : null;
-      }
+        + 'and no seller will ever lock up more than half the price. Where that leaves the limit '
+        + 'depends entirely on the history YOU build below: with nothing on the record a large '
+        + 'stake is fine, and every outcome you add against the seller brings the ceiling down.',
+      // No number here on purpose. This panel prices the history the visitor invents, not the
+      // two receipts the deployment holds, so a fixed threshold would be an on-screen assertion
+      // about a run that has not happened: with an empty history 25 percent settles perfectly
+      // well, and after two bad outcomes a much smaller figure will not. The main tab can name
+      // a figure because its history is fixed and known; this one cannot, and naming one anyway
+      // is the same mistake as the 50 percent it replaced.
+      null
     ],
     service_window: [
       'How long the seller has to deliver. Never refuses on its own: the seller needs five '

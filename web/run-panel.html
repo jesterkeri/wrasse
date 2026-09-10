@@ -482,23 +482,42 @@
     return run;
   }
 
-  //: A refusal is a result, not a crash, and it has to read like one. The engine says
-  //: "no profile reached agreement: urgent refused on provider_bond_bps by 320", which is
-  //: exactly right for a log and useless to the person who just pressed a button: it names a
-  //: field, a number in units nothing on screen uses, and no way forward. The raw line stays
-  //: on the step above; this is the sentence underneath it.
+  //: A refusal is a result, not a crash, and it has to read like one. The server names the
+  //: field and the gap; a person needs the sentence. Keyed on the field rather than on a
+  //: substring of an error message, because the field is structured data the run already
+  //: carries and the message is prose that can change.
+  function refusalText(failedOn, profile) {
+    if (failedOn === 'provider_bond_bps') {
+      return 'No deal, and it is the stake. What you asked the seller to lock up is added to '
+        + 'what the buyer already demands from memory, and together they pass the '
+        + 'half-the-price limit no seller will cross. Lower the stake and run it again. '
+        + 'Nothing was sent and nothing was spent.';
+    }
+    if (failedOn === 'price_bps') {
+      return 'No deal, and it is the price. This seller will not go as low as this buyer will '
+        + 'pay, and both sides can point at a receipt for why. Try another profile, or raise '
+        + 'the price. Nothing was sent and nothing was spent.';
+    }
+    return 'No deal at these numbers for the ' + (profile || 'chosen') + ' profile, and that is '
+      + 'an answer rather than a failure. The two memories left no overlap, so nothing was '
+      + 'signed and nothing was spent.'
+      + (failedOn ? ' The term they could not meet on is ' + failedOn + '.' : '');
+  }
+
+  //: The other route to the same place. When `policy` itself exits non-zero the run is FAILED
+  //: rather than refused, and all that survives is the engine's line: "no profile reached
+  //: agreement: urgent refused on provider_bond_bps by 320". Right for a log, useless to
+  //: someone who just pressed a button. The raw line stays on the step above; this is the
+  //: sentence underneath it. Matched on the whole phrase, not the bare field name, so an
+  //: unrelated message that happens to mention the term is not rewritten into advice.
   function explain(message) {
     var raw = String(message || '');
     if (raw.indexOf('no profile reached agreement') === -1) return raw;
-    if (raw.indexOf('provider_bond_bps') !== -1) {
-      return 'No deal, and it is the stake. What you asked the seller to lock up is added to '
-        + 'what the buyer already demands from memory, and together they pass the half-the-price '
-        + 'limit no seller will cross. Lower the stake and run it again: with the history these '
-        + 'two hold, anything below about 25 percent settles, and the default of 5 percent '
-        + 'always does. Nothing was sent and nothing was spent.';
+    if (raw.indexOf('refused on provider_bond_bps') !== -1) {
+      return refusalText('provider_bond_bps', '');
     }
-    return 'No deal. These two could not agree on the numbers you set, so nothing was sent and '
-      + 'nothing was spent. Change one of the four and run it again.';
+    if (raw.indexOf('refused on price_bps') !== -1) return refusalText('price_bps', '');
+    return refusalText('', '');
   }
 
   function finish(message) {
@@ -550,9 +569,10 @@
             if (run.refund) watchRefund(run.refund.run_id);
             await afterQuote(run);
           } else if (run.status === 'refused') {
-            finish('No deal exists at this baseline for the ' + body.profile + ' profile, and '
-              + 'that is an answer rather than a failure. The two memories left no overlap, so '
-              + 'nothing was signed.');
+            // This is the branch a refusal actually takes. It used to write its own sentence,
+            // which said there was no overlap and never said WHICH term, so the one piece of
+            // advice a visitor could act on lived in a function this path never called.
+            finish(refusalText((run.settled || {}).failed_on, body.profile));
           } else if (run.status === 'failed') {
             finish(run.error || 'the run stopped');
             // A run that failed after opening a deal has left a deposit in the escrow, and
