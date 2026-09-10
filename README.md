@@ -7,6 +7,20 @@ accepted terms on Base, and write the verified outcome back to Sibyl Memory.
 > Memory changes real economic behaviour across sessions, and the outcome comes
 > back as verified evidence.
 
+## For judges
+
+| Open this | For |
+|---|---|
+| [The memory break](docs/atlas/11-the-memory-break.md) | The eligibility test, the four cases, and what each refusal says. Including that it failed the first time it was run. |
+| [The memory note](docs/MEMORY.md) | What is persisted, what is recalled, and what that recall decides. |
+| [Claims and evidence](docs/atlas/10-claims-and-evidence.md) | Every claim this project makes, beside what proves it. A row with an empty evidence column is a claim we do not make. |
+| [Known limits](KNOWN-LIMITS.md) | What this build does not do, and why each one is accepted rather than hidden. |
+
+The first three are pages of the [build atlas](docs/atlas/00-read-me-first.md), which traces
+every command hop by hop with the failure mode and recovery marked at each one. It states on
+its first page which of its pages were re-verified against the running build and which are a
+snapshot, because an atlas that quietly goes stale is worse than none.
+
 ## Try it, and check it
 
 | | |
