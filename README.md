@@ -48,6 +48,11 @@ reports what the project does each time. Terms come back only in the first case:
 | a file that will not open | refuses, and says it is not a database |
 | a receipt edited in place | refuses, and names the row that no longer proves its own identity |
 
+The first row prints the terms it produced, so the contrast is on the same screen: `urgent settles at
+0.000118 ETH, stake 24.8%, deliver within 5 minutes`, which are the numbers the live quote shows.
+The last row prints both hashes, the one the receipt is filed under and the one its contents now
+produce.
+
 The last one is the one worth reading. Nothing is missing and nothing errors: the store opens,
 answers, and hands back a receipt whose transaction hash has been changed. A project that was
 only displaying its memory would price that deal and never notice. A receipt's identity is

@@ -44,22 +44,44 @@ def quote(paths: dict[str, Path]) -> tuple[int, str]:
     env["WRASSE_PROVIDER_MEMORY_PATH"] = str(paths["provider"])
     env.pop("WRASSE_ALLOW_BROADCAST", None)
     done = subprocess.run(
+        # The page's own starting numbers, so the terms here are the terms a reader has
+        # already seen rather than the command line's defaults.
         [sys.executable, "-m", "wrasse.cli", "policy", PROVIDER,
          "--buyer", BUYER, "--reference-timestamp", "1788666320",
-         "--accept-by", "1788666920"],
+         "--accept-by", "1788666920", "--base-price-wei", "100000000000000",
+         "--base-bond-bps", "500", "--service-window", "600", "--payout-delay", "1800"],
         capture_output=True, text=True, env=env, cwd=REPO, timeout=180,
     )
     return done.returncode, (done.stderr.strip() or done.stdout.strip())
 
 
 def reason(text: str) -> str:
-    """The sentence the refusal actually gave, rather than a stack trace."""
+    """The sentence the refusal gave, without the module path in front of it."""
 
     for line in reversed(text.splitlines()):
         line = line.strip()
-        if line and not line.startswith(("Traceback", "  ", "During handling")):
-            return line[:150]
-    return text[:150]
+        if not line or line.startswith(("Traceback", "During handling")) or line.startswith("  "):
+            continue
+        if ": " in line and line.split(":")[0].replace(".", "").replace("_", "").isalnum():
+            line = line.split(": ", 1)[1]
+        return line if len(line) <= 220 else line[:217].rsplit(" ", 1)[0] + "..."
+    return text[:220]
+
+
+def terms_of(output: str) -> str:
+    """What the urgent profile settled at, so the contrast is on the screen."""
+
+    import json
+
+    try:
+        document = json.loads(output)
+        terms = document["buyer"]["profiles"]["urgent"]["terms"]
+    except Exception:  # noqa: BLE001 - the caller prints the raw output instead
+        return ""
+    price = str(terms["price_wei"]).rjust(19, "0")
+    eth = (price[:-18].lstrip("0") or "0") + "." + price[-18:].rstrip("0")
+    return (f"urgent settles at {eth} ETH, stake {terms['provider_bond_bps'] / 100:g}%, "
+            f"deliver within {terms['service_window'] // 60} minutes")
 
 
 def copy_memories(into: Path) -> dict[str, Path]:
@@ -115,9 +137,11 @@ def edited(paths):
         before = connection.execute(
             "select body from entities where category = 'chain_event'"
         ).fetchall()
+        # One character, keeping it a well-formed 32-byte hash. Parsing still succeeds; what
+        # fails is the receipt reproducing its own name, which is the check being demonstrated.
         connection.execute(
-            "update entities set body = replace(body, '\"tx_hash\":\"0x', "
-            "'\"tx_hash\":\"0xdead') where category = 'chain_event'"
+            "update entities set body = replace(body, '\"tx_hash\":\"0xbe', "
+            "'\"tx_hash\":\"0xbf') where category = 'chain_event'"
         )
         connection.commit()
         after = connection.execute(
@@ -158,7 +182,11 @@ def main() -> int:
             ok = got == expected
             mark = "  " if ok else "!!"
             print(f"{mark} {name:32s} -> {got}")
-            if got == "refusal":
+            if got == "terms":
+                detail = terms_of(output)
+                if detail:
+                    print(f"     {detail}")
+            else:
                 print(f"     {reason(output)}")
             if not ok:
                 failures.append(name)
