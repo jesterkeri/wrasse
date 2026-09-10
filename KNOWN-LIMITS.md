@@ -129,6 +129,21 @@ because the learned dimensions and both memory stores are deliberately not part 
 names a recent canonical Base block matching its own reference. Re-querying a public fact later
 says nothing about who read it first.
 
+## The stake limit moves with the history
+
+The page tells a visitor where the stake stops being settleable, and that figure is not a
+constant. The buyer's demand is what you ask for PLUS what its memory contributes, against a
+seller that never locks up more than half the price. With the two receipts this deployment
+holds, the contribution is 2520 basis points, so every posting refuses at 2500 and settles at
+2400. Measured against the live engine, not derived.
+
+The page used to name 50% as the edge, which is where the seller's own ceiling sits and is
+twice as far as the real one. A visitor following it walked past the limit and got raw engine
+output with no way forward. The guidance now states the mechanism, and the number beside it is
+correct for this deployment's history rather than for all time: settle more deals against the
+shared memory and the figure comes down. `tests/test_page.py` pins the shape of the claim, not
+the number, because the number is the part that moves.
+
 ## Units, and where wei is still correct
 
 Every amount a visitor reads as prose is in ETH: the page, the service's error messages, and

@@ -238,12 +238,21 @@
       null
     ],
     provider_bond_bps: [
-      'The deposit the seller locks up. This is the one starting number that can break a '
-        + 'deal by itself. No seller will ever stake more than 50% of the price, whatever '
-        + 'its history, so ask for more and there is nothing to sign.',
+      'The deposit the seller locks up, and the one starting number that can break a deal by '
+        + 'itself. Whatever you ask for here, what the buyer remembers is added on top of it, '
+        + 'and no seller will ever stake more than half the price. With the two receipts these '
+        + 'two hold, the buyer is already asking for about 25 percent by itself, so anything '
+        + 'from about 25 percent upward leaves nothing to sign.',
+      // Measured against the live engine rather than reasoned about: the buyer's demand is
+      // this figure plus a fixed amount its memory contributes, and the seller's hard
+      // ceiling is half the price. With the two receipts on this deployment that puts the
+      // cliff at 25 percent, not the 50 this used to name. The old text sent a visitor
+      // confidently past the edge and then showed them raw engine output.
       function (bps) {
-        return Number(bps) > 5000
-          ? 'Above 50%. Expect no deal on the stake, whatever the history says.'
+        return Number(bps) >= 2500
+          ? 'At or above 25 percent. With the history these two hold, what the buyer adds on '
+            + 'top of this passes the half-the-price limit no seller will cross, so every '
+            + 'posting is refused.'
           : null;
       }
     ],

@@ -482,13 +482,32 @@
     return run;
   }
 
+  //: A refusal is a result, not a crash, and it has to read like one. The engine says
+  //: "no profile reached agreement: urgent refused on provider_bond_bps by 320", which is
+  //: exactly right for a log and useless to the person who just pressed a button: it names a
+  //: field, a number in units nothing on screen uses, and no way forward. The raw line stays
+  //: on the step above; this is the sentence underneath it.
+  function explain(message) {
+    var raw = String(message || '');
+    if (raw.indexOf('no profile reached agreement') === -1) return raw;
+    if (raw.indexOf('provider_bond_bps') !== -1) {
+      return 'No deal, and it is the stake. What you asked the seller to lock up is added to '
+        + 'what the buyer already demands from memory, and together they pass the half-the-price '
+        + 'limit no seller will cross. Lower the stake and run it again: with the history these '
+        + 'two hold, anything below about 25 percent settles, and the default of 5 percent '
+        + 'always does. Nothing was sent and nothing was spent.';
+    }
+    return 'No deal. These two could not agree on the numbers you set, so nothing was sent and '
+      + 'nothing was spent. Change one of the four and run it again.';
+  }
+
   function finish(message) {
     clearInterval(timer);
     timer = null;
     if (ticker) { clearInterval(ticker); ticker = null; }
     button.disabled = false;
     text(button, 'Run it again');
-    if (message) note(message);
+    if (message) note(explain(message));
   }
 
   async function start() {
