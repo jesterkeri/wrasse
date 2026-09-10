@@ -73,3 +73,14 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("BASE_SEPOLIA_CHAIN_ID", "84532")
     monkeypatch.setenv("WRASSE_PROVIDER_A_ADDRESS", TEST_PROVIDER)
     monkeypatch.setenv("WRASSE_PROVIDER_PERSONA", str(write_persona(tmp_path, TEST_PROVIDER)))
+
+    # A present, empty memory for each side, because that is what a cold start actually is.
+    # These used to be absent files, and the code answered a missing store the same way it
+    # answered an empty one. They are different facts: an empty store has been asked and holds
+    # nothing, a missing store is a question nobody answered, and only the first is an answer.
+    # Creating the schema here leaves the identity record unwritten, so each test's first open
+    # still binds the store to whichever role and owner that test is using.
+    from sibyl_memory_client import MemoryClient
+
+    for role in ("buyer", "provider"):
+        MemoryClient.local(tmp_path / f"{role}-memory.db")

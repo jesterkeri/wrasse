@@ -29,6 +29,39 @@ time, so it is produced rather than declared.
 
 ## Why memory is load-bearing
 
+The hackathon's test is exact, so this repository answers it exactly:
+
+> Delete the memory layer. If your project still does what it claims, it is a wrapper and does
+> not qualify. If the core function breaks, memory is load-bearing.
+
+```bash
+uv run python scripts/delete-the-memory.py
+```
+
+That takes the memory away four ways, on throwaway copies that are destroyed afterwards, and
+reports what the project does each time. Terms come back only in the first case:
+
+| what is done to the memory | what the project does |
+|---|---|
+| nothing, both intact | produces terms |
+| both files deleted | refuses, and says the memory does not exist |
+| a file that will not open | refuses, and says it is not a database |
+| a receipt edited in place | refuses, and names the row that no longer proves its own identity |
+
+The last one is the one worth reading. Nothing is missing and nothing errors: the store opens,
+answers, and hands back a receipt whose transaction hash has been changed. A project that was
+only displaying its memory would price that deal and never notice. A receipt's identity is
+`keccak(chainId, contract, txHash, logIndex)`, recall recomputes it, and a row that no longer
+produces its own name is not evidence of anything.
+
+**This test failed when it was first written, and that is why it exists.** Deleting both
+memories produced baseline terms and called it a cold start. The two are not the same fact: an
+empty store is present, has been asked and holds nothing about this counterparty, while a
+missing store is a question nobody answered. Answering the second with terms is exactly what a
+wrapper does. It is refused now, and `tests/test_cli.py` holds that refusal so it cannot come
+back.
+
+
 The pricing path reads verified counterparty evidence through
 `WrasseStore.recall` in `wrasse/store.py`: an exact index of canonical event
 ids, resolved one lookup at a time. Fuzzy search is for display and never sets

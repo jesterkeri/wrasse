@@ -96,3 +96,49 @@ def test_same_inputs_produce_the_same_commitment(tmp_path, monkeypatch, capsys):
     second = json.loads(capsys.readouterr().out)
     for name, value in first["buyer"]["profiles"].items():
         assert value["policy_hash"] == second["buyer"]["profiles"][name]["policy_hash"]
+
+
+def test_a_memory_that_is_absent_is_refused_rather_than_read_as_a_cold_start(tmp_path):
+    """The hackathon's eligibility test, held as a unit test as well as a script.
+
+    "Delete the memory layer. If your project still does what it claims, it is a wrapper."
+
+    It used to quote. A missing file opened as an empty one, so deleting both memories produced
+    baseline terms and a `cold_start` verdict, which is precisely the behaviour of a project
+    that was never really using its memory to decide. An empty store is present, has been
+    asked, and holds nothing about this counterparty; a missing store is a question nobody
+    answered. Only the first is an answer.
+    """
+
+    from wrasse.cli import _open_stores
+    from wrasse.memory_gate import MemoryRequired
+
+    absent = {
+        "buyer": tmp_path / "no-such-buyer.db",
+        "provider": tmp_path / "no-such-provider.db",
+    }
+
+    with pytest.raises(MemoryRequired) as raised:
+        _open_stores(buyer="0x4444444444444444444444444444444444444444", provider="0x3333333333333333333333333333333333333333", paths=absent)
+
+    assert "does not exist" in str(raised.value)
+    assert not absent["buyer"].exists(), "refusing must not create the thing it refused over"
+
+
+def test_a_caller_whose_job_is_to_make_one_still_can(tmp_path):
+    """The cold pair has to be created before it can be empty, and that is deliberate.
+
+    Without this the refusal above would make an honest cold start unreachable, which would
+    trade one wrong answer for another.
+    """
+
+    from wrasse.cli import _open_stores
+
+    fresh = {"buyer": tmp_path / "new-buyer.db", "provider": tmp_path / "new-provider.db"}
+
+    stores = _open_stores(
+        buyer="0x4444444444444444444444444444444444444444", provider="0x3333333333333333333333333333333333333333", paths=fresh, allow_new=True
+    )
+
+    assert set(stores) == {"buyer", "provider"}
+    assert fresh["buyer"].is_file() and fresh["provider"].is_file()

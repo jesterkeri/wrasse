@@ -27,6 +27,7 @@ from .dimensions import (
     load_dimensions,
 )
 from .engine import PROFILES, produce_provider_terms, produce_terms
+from .memory_gate import MemoryRequired
 from .constants import NEGOTIATION_MANIFEST
 from .policy_document import (
     MAX_POLICY_BYTES,
@@ -184,7 +185,8 @@ def _persona_path() -> Path:
 
 
 def _open_stores(
-    *, buyer: str, provider: str, paths: dict[str, Path] | None = None
+    *, buyer: str, provider: str, paths: dict[str, Path] | None = None,
+    allow_new: bool = False,
 ) -> dict[str, WrasseStore]:
     """One identified memory per side, and never the same file twice.
 
@@ -193,9 +195,31 @@ def _open_stores(
     is right for a command and wrong for a service, where `os.environ` is shared by every
     in-flight request and two of them would interleave. The quote service holds one pair of
     stores per memory setting, opened once, and passes them here.
+
+    **A memory that is not there is refused, not invented.** `allow_new` is the deliberate
+    exception, for the two callers whose job is to make one: the command that creates a store
+    and the service's cold pair, which exists so a reader can see what these two quote without
+    a history.
+
+    Everywhere else, a missing file used to open as an empty one, and the two are not the same
+    thing. An empty store is an honest cold start: it is present, it has been asked, and it
+    holds nothing about this counterparty. A missing store is a question nobody answered, and
+    answering it with baseline terms is exactly the behaviour of a system that was never really
+    using its memory. Deleting the memory has to break this, or the memory was decoration.
     """
 
     paths = paths or {role: _store_path(role) for role in ("buyer", "provider")}
+    if not allow_new:
+        for role in ("buyer", "provider"):
+            if not paths[role].is_file():
+                raise MemoryRequired(
+                    f"the {role} memory at {paths[role]} does not exist. Terms are produced "
+                    "from what these two remember, so there is nothing to produce them from. "
+                    "This is refused rather than answered as a cold start, because a store "
+                    "that is present and empty is a different fact from one that is absent, "
+                    "and only the first is an answer. Point the path at a real memory, or "
+                    "create one deliberately with `wrasse init-memory`."
+                )
     if paths["buyer"].resolve() == paths["provider"].resolve():
         raise RuntimeError(
             f"both memory paths resolve to {paths['buyer'].resolve()}; one store cannot hold "

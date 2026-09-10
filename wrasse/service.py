@@ -231,10 +231,14 @@ def _initialise_metadata() -> None:
 
     digest, persona = persona_digest(cli._persona_path())
     for paths in _PATHS.values():
+        # The one caller whose job is to make a store that is not there yet. The cold pair
+        # exists so a reader can see what these two quote with no history, and it has to be
+        # created before it can be empty. Everywhere else a missing memory is refused.
         stores = cli._open_stores(
             buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
             provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
             paths=paths,
+            allow_new=True,
         )
         stores["provider"].commit_persona(name=persona["name"], digest=digest)
 
