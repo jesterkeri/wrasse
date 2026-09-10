@@ -1363,3 +1363,108 @@ def test_the_deletion_proof_refuses_when_there_is_no_memory_to_delete(service, m
     response = client.post("/api/prove")
     assert response.status_code == 503
     assert "no memory to take away" in response.json()["detail"]["error"]
+
+
+def test_a_missing_warm_memory_stops_the_service_rather_than_being_invented(service, monkeypatch):
+    """The eligibility hole, one layer above where it was fixed.
+
+    `_open_stores` refuses a store file that is not there. `_initialise_metadata` used to hand
+    it `allow_new=True` for both pairs, so the service created the warm pair on first open and
+    served baseline terms from two empty stores, under a page that says the numbers come from
+    two confirmed outcomes on Base. The cold pair is created on purpose and must stay creatable;
+    the warm pair must not be, and the difference is the whole eligibility argument.
+    """
+
+    from wrasse import cli as cli_module
+    from wrasse import service as module
+
+    client, warm = service
+    module._stores.clear()
+
+    missing = warm / "gone"
+    missing.mkdir()
+    monkeypatch.setitem(
+        module._PATHS, module.WARM,
+        {"buyer": missing / "buyer-memory.db", "provider": missing / "provider-memory.db"},
+    )
+
+    with pytest.raises(cli_module.MemoryRequired):
+        module._open(module.WARM)
+
+    assert not list(missing.iterdir()), "a refused open still created the store it refused"
+
+
+def test_the_cold_pair_is_still_created_when_it_is_not_there(service, monkeypatch):
+    """The other half, so the fix above cannot be a blanket refusal.
+
+    An empty store is present, has been asked, and holds nothing. That is an honest cold start
+    and it is the control the whole comparison rests on, so it has to be creatable. A change
+    that refused both pairs would pass the test above and take the page's left-hand column with
+    it.
+    """
+
+    from wrasse import service as module
+
+    client, warm = service
+    module._stores.clear()
+
+    fresh = warm / "cold-elsewhere"
+    monkeypatch.setitem(
+        module._PATHS, module.COLD,
+        {"buyer": fresh / "buyer-memory.db", "provider": fresh / "provider-memory.db"},
+    )
+    fresh.mkdir()
+
+    stores = module._open(module.COLD)
+    assert set(stores) == {"buyer", "provider"}
+    assert (fresh / "buyer-memory.db").is_file()
+
+
+def test_one_session_opened_from_two_requests_opens_its_stores_once(executing):
+    """The third first-open, which the fix for the other two left behind.
+
+    `_open` was serialised and this cache was not, so two requests naming one session both
+    passed `not in _session_stores` and both opened the same databases. Two open descriptions
+    on one SQLite file inside one process do not exclude each other, they block, and the
+    session belongs to a judge mid-demo.
+
+    Driven through the open itself rather than by racing two threads, because one interleaving
+    is not the property: the count of opens is.
+    """
+
+    import threading
+
+    from wrasse import cli as cli_module
+    from wrasse import service as module
+
+    client, _, _ = executing
+
+    response = client.post("/api/session")
+    assert response.status_code == 200, response.text
+    session = module._session_registry().get(response.json()["session_id"])
+    assert session is not None
+
+    module._session_stores.pop(session.session_id, None)
+
+    started = threading.Event()
+    opens = []
+    real = cli_module._open_stores
+
+    def slow(*args, **kwargs):
+        opens.append(1)
+        # Hold the open long enough that an unguarded second caller would be inside it too.
+        started.set()
+        time.sleep(0.3)
+        return real(*args, **kwargs)
+
+    module.cli._open_stores = slow
+    try:
+        first = threading.Thread(target=module._open_session, args=(session,))
+        first.start()
+        assert started.wait(5), "the first open never began"
+        module._open_session(session)
+        first.join(10)
+    finally:
+        module.cli._open_stores = real
+
+    assert len(opens) == 1, f"the session's stores were opened {len(opens)} times, not once"

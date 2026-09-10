@@ -18,8 +18,12 @@ accepted terms on Base, and write the verified outcome back to Sibyl Memory.
 
 Nothing on that page is a recording. The quote is computed when you ask for it, the simulator
 runs the same engine over a history you choose, and the settle button performs a real deal on
-Base Sepolia and shows you its transactions while they are being mined. Every number it prints
-appears in a transaction you can open on the explorer above.
+Base Sepolia and shows you its transactions while they are being mined.
+
+One of those three produces a transaction and two do not, and the page marks which is which. The two
+receipts the agents reason from, and every deal you settle, are on the explorer above. A quote
+you never sign is arithmetic over those receipts, and a simulated history is a rehearsal that
+signs nothing at all.
 
 Two things are worth knowing before you press anything. Both wallets are shared and funded from
 a faucet, so one worker settles one deal at a time and the page tells you your place in the

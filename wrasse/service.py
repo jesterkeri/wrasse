@@ -231,15 +231,21 @@ def _initialise_metadata() -> None:
     """
 
     digest, persona = persona_digest(cli._persona_path())
-    for paths in _PATHS.values():
-        # The one caller whose job is to make a store that is not there yet. The cold pair
-        # exists so a reader can see what these two quote with no history, and it has to be
-        # created before it can be empty. Everywhere else a missing memory is refused.
+    for memory, paths in _PATHS.items():
+        # Only the cold pair may be brought into existence. It exists so a reader can see what
+        # these two quote with no history, and it has to be created before it can be empty.
+        #
+        # The warm pair may not. This loop used to pass `allow_new=True` for both, which put
+        # the eligibility hole back one layer above the place it was fixed: with the volume
+        # empty or the source directory unset, the first warm quote created two empty stores
+        # and answered with baseline terms, under a page that says "Real evidence: two
+        # confirmed outcomes". A missing warm memory is a question nobody answered, and the
+        # only honest response is to refuse to start rather than to invent an empty history.
         stores = cli._open_stores(
             buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
             provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
             paths=paths,
-            allow_new=True,
+            allow_new=memory == COLD,
         )
         stores["provider"].commit_persona(name=persona["name"], digest=digest)
 
@@ -419,6 +425,14 @@ _START_LOCK = threading.Lock()
 #: another process. That is a deadlock, not a mutual exclusion.
 _session_stores: dict[str, dict[str, Any]] = {}
 
+#: And the lock that first open needs. `_open_lock` was added for the shared pair and this
+#: cache was left out, so the same check-then-open race stayed live on exactly the databases a
+#: judge is using: two requests naming one session both passed the membership test and both
+#: opened the same files, which is the second description this comment warns about. Separate
+#: from `_open_lock` because eviction already runs inside the session registry's own lock, and
+#: one lock reachable from two lock orders is how the next deadlock gets written.
+_session_open_lock = threading.RLock()
+
 
 def _queue() -> executor.Queue:
     """The worker, started on first use rather than at import.
@@ -516,7 +530,8 @@ def _forget_session_stores(session_id: str) -> None:
     settles anything.
     """
 
-    stores = _session_stores.pop(session_id, None)
+    with _session_open_lock:
+        stores = _session_stores.pop(session_id, None)
     for store in (stores or {}).values():
         closer = getattr(store, "close", None)
         if callable(closer):
@@ -566,13 +581,14 @@ def _open_session(session: sessions.Session) -> dict[str, Any]:
     not do is open a second description on the same file while the first is alive.
     """
 
-    if session.session_id not in _session_stores:
-        _session_stores[session.session_id] = cli._open_stores(
-            buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
-            provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
-            paths=session.paths,
-        )
-    return _session_stores[session.session_id]
+    with _session_open_lock:
+        if session.session_id not in _session_stores:
+            _session_stores[session.session_id] = cli._open_stores(
+                buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
+                provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
+                paths=session.paths,
+            )
+        return _session_stores[session.session_id]
 
 
 def _session_or_404(session_id: str) -> sessions.Session:
