@@ -1468,3 +1468,69 @@ def test_one_session_opened_from_two_requests_opens_its_stores_once(executing):
         module.cli._open_stores = real
 
     assert len(opens) == 1, f"the session's stores were opened {len(opens)} times, not once"
+
+
+def test_the_deletion_proof_spends_one_budget_across_all_four_cases(monkeypatch):
+    """`TIMEOUT` bounds the run, not each subprocess.
+
+    It used to bound each one, so four cases could hold the endpoint's lock for four times the
+    stated timeout between them while every later visitor waited behind it or timed out at the
+    proxy.
+
+    The property is that the budget handed to each case is what remains of one deadline, so it
+    strictly decreases. Asserting only that a tiny timeout raises does not test this: a
+    per-case budget of zero raises too, which is how the first version of this test survived
+    having the fix reverted under it.
+    """
+
+    from wrasse import prove as proving
+
+    budgets = []
+
+    def record(paths, buyer, provider, budget):
+        budgets.append(budget)
+        time.sleep(0.05)
+        return 1, "refused"
+
+    monkeypatch.setattr(proving, "TIMEOUT", 30.0)
+    monkeypatch.setattr(proving, "_quote", record)
+    # `CASES` holds the break functions directly, so patching the module attributes would not
+    # reach them. The mutations are not what this test is about; the budgets are.
+    monkeypatch.setattr(proving, "CASES", tuple(
+        (name, did, expected, lambda paths: None) for name, did, expected, _ in proving.CASES
+    ))
+
+    proving.prove({}, buyer="0x" + "1" * 40, provider="0x" + "2" * 40)
+
+    assert len(budgets) == len(proving.CASES)
+    assert budgets == sorted(budgets, reverse=True) and budgets[0] > budgets[-1], (
+        f"each case was given its own budget rather than what remained of one: {budgets}"
+    )
+    assert budgets[0] <= 30.0, "the first case was given more than the whole run's budget"
+
+
+def test_a_deletion_case_that_times_out_is_not_reported_as_a_refusal(monkeypatch):
+    """Three of the four cases pass BY refusing, so this distinction is the whole test.
+
+    A case that merely failed to answer in time would be indistinguishable from one that
+    declined to answer, and the proof would report a pass it had not earned.
+    """
+
+    import subprocess
+
+    from wrasse import prove as proving
+
+    def never_answers(paths, buyer, provider, budget):
+        raise subprocess.TimeoutExpired(cmd="wrasse policy", timeout=budget)
+
+    monkeypatch.setattr(proving, "_quote", never_answers)
+    monkeypatch.setattr(proving, "CASES", tuple(
+        (name, did, expected, lambda paths: None) for name, did, expected, _ in proving.CASES
+    ))
+
+    with pytest.raises(RuntimeError) as raised:
+        proving.prove({}, buyer="0x" + "1" * 40, provider="0x" + "2" * 40)
+
+    message = str(raised.value)
+    assert "did not answer" in message
+    assert "is not reported as one" in message

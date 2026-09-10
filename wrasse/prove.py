@@ -21,11 +21,15 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-#: What one whole run may take. Four quotes at about four seconds each, with room for a slow
-#: machine. A caller that cannot wait this long should not be calling this.
+#: What one whole run may take, ALL FOUR CASES TOGETHER. It used to be the budget for each
+#: subprocess, which meant four of them could hold the endpoint's lock for eight minutes
+#: between them and every later visitor pressing the button waited behind that or timed out at
+#: the proxy. A run takes about two and a half seconds in practice, so this is generous rather
+#: than tight, and it is now a bound on the thing that was actually unbounded.
 TIMEOUT = float(os.getenv("WRASSE_PROOF_TIMEOUT", "120"))
 
 
@@ -147,7 +151,9 @@ def _reason(text: str) -> str:
     return text[:260]
 
 
-def _quote(paths: dict[str, Path], buyer: str, provider: str) -> tuple[int, str]:
+def _quote(
+    paths: dict[str, Path], buyer: str, provider: str, budget: float
+) -> tuple[int, str]:
     env = dict(os.environ)
     env["WRASSE_BUYER_MEMORY_PATH"] = str(paths["buyer"])
     env["WRASSE_PROVIDER_MEMORY_PATH"] = str(paths["provider"])
@@ -157,7 +163,7 @@ def _quote(paths: dict[str, Path], buyer: str, provider: str) -> tuple[int, str]
          "--reference-timestamp", "1788666320", "--accept-by", "1788666920",
          "--base-price-wei", "100000000000000", "--base-bond-bps", "500",
          "--service-window", "600", "--payout-delay", "1800"],
-        capture_output=True, text=True, env=env, timeout=TIMEOUT,
+        capture_output=True, text=True, env=env, timeout=budget,
     )
     return done.returncode, (done.stderr.strip() or done.stdout.strip())
 
@@ -166,12 +172,29 @@ def prove(source: dict[str, Path], *, buyer: str, provider: str) -> list[Case]:
     """Run every case against a throwaway copy of `source` and report what happened."""
 
     results = []
+    deadline = time.monotonic() + TIMEOUT
     for name, did, expected, break_it in CASES:
         case = Case(name=name, did=did, expected=expected)
+        # One deadline across the whole run, not one per case. A case that cannot be given at
+        # least a second is refused outright rather than started: a timeout is not a refusal and
+        # must never be counted as one, because "it did not answer" and "it declined to answer"
+        # are the two things this whole test exists to tell apart.
+        budget = deadline - time.monotonic()
+        if budget < 1:
+            raise RuntimeError(
+                f"the deletion test ran out of time before {name!r}. It is bounded at "
+                f"{TIMEOUT:g} seconds for all four cases together."
+            )
         with tempfile.TemporaryDirectory(prefix="wrasse-proof-") as tmp:
             paths = _copy(source, Path(tmp))
             break_it(paths)
-            code, output = _quote(paths, buyer, provider)
+            try:
+                code, output = _quote(paths, buyer, provider, budget)
+            except subprocess.TimeoutExpired as expiry:
+                raise RuntimeError(
+                    f"{name!r} did not answer within the remaining {budget:.0f} seconds. That is "
+                    "not a refusal and is not reported as one."
+                ) from expiry
             case.outcome = "terms" if code == 0 else "refusal"
             if case.outcome == "terms":
                 try:
