@@ -42,6 +42,10 @@ The hackathon's test is exact, so this repository answers it exactly:
 uv run python scripts/delete-the-memory.py
 ```
 
+Or press **Take the memory away** on the live page, which runs the same four cases through the
+same module. What is persisted, what is recalled and what that recall decides is written out in
+[`docs/MEMORY.md`](docs/MEMORY.md).
+
 That takes the memory away four ways, on throwaway copies that are destroyed afterwards, and
 reports what the project does each time. Terms come back only in the first case:
 
