@@ -158,5 +158,45 @@
     "name": "the scope trio says which of the three steps is the real one",
     "old": "{ k: 'Never here', v: 'Paying anyone. Nothing is sent and nothing is signed on this page.' }",
     "new": "{ k: 'Only in step three', v: 'Signing. Steps one and two read memory and do arithmetic; nothing is sent until you press the button in step three.' }"
+  },
+  {
+    "name": "the tagline says what the project is",
+    "old": "Wrasse is a negotiation engine for software agents. This page is a working demo of it.",
+    "new": "Two agents negotiate the same job. Their terms change because each remembers what the other did last time."
+  },
+  {
+    "name": "the argument's table says what the memory holds",
+    "old": "text-align:right\">if they forgot</div>\n            <div s",
+    "new": "text-align:right\">No verified history</div>\n            <div s"
+  },
+  {
+    "name": "the live quote's table says what the memory holds",
+    "old": "text-align:right\">if they forgot</div>\n          <div sty",
+    "new": "text-align:right\">No verified history</div>\n          <div sty"
+  },
+  {
+    "name": "the refusal flip says it too",
+    "old": "color:var(--fg-subtle)\">if they forgot</div>",
+    "new": "color:var(--fg-subtle)\">No verified history</div>"
+  },
+  {
+    "name": "warm column 1 says what the memory holds",
+    "old": "acing:0.14em;text-transform:uppercase;color:var(--k-memory)\">because they remember<",
+    "new": "acing:0.14em;text-transform:uppercase;color:var(--k-memory)\">With two verified receipts<"
+  },
+  {
+    "name": "warm column at 24178 says what the memory holds",
+    "old": "ted);text-align:right\">No verified history</div>\n            <div style=\"padding:10px 11px;background:var(--primary);font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.08em;text-transform:uppercase;color:var(--on-primary);text-align:right\">because they remember<",
+    "new": "ted);text-align:right\">No verified history</div>\n            <div style=\"padding:10px 11px;background:var(--primary);font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.08em;text-transform:uppercase;color:var(--on-primary);text-align:right\">With two verified receipts<"
+  },
+  {
+    "name": "warm column at 50603 says what the memory holds",
+    "old": "-muted);text-align:right\">No verified history</div>\n          <div style=\"padding:9px 11px;background:var(--primary);font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.08em;text-transform:uppercase;color:var(--on-primary);text-align:right\">because they remember<",
+    "new": "-muted);text-align:right\">No verified history</div>\n          <div style=\"padding:9px 11px;background:var(--primary);font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.08em;text-transform:uppercase;color:var(--on-primary);text-align:right\">With two verified receipts<"
+  },
+  {
+    "name": "the real banner",
+    "old": "<b style=\"color:var(--fg-strong)\">The argument, in plain words.</b> Every number it cites appears again on the live quote, where you can open the transaction behind it.",
+    "new": "<b style=\"color:var(--fg-strong)\">Real evidence:</b> two confirmed outcomes on Base Sepolia. These receipts are the history behind this quote, and both open on the block explorer."
   }
 ]
