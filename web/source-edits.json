@@ -128,5 +128,35 @@
     "name": "and its box says which unit it wants",
     "old": "<span style=\"display:block;font:500 11px/1.5 'Geist Mono',ui-monospace,monospace;color:var(--fg-muted)\">price_wei</span>\n            <input type=\"text\" inputmode=\"numeric\" value=\"{{ glimpse.value }}\"",
     "new": "<span style=\"display:block;font:500 11px/1.5 'Geist Mono',ui-monospace,monospace;color:var(--fg-muted)\">in ETH</span>\n            <input type=\"text\" inputmode=\"decimal\" value=\"{{ glimpse.value }}\""
+  },
+  {
+    "name": "two tabs, not three",
+    "old": "      tabs: [\n        { key: 'why', label: 'Why this matters' },\n        { key: 'try', label: 'Try it' },\n        { key: 'sim', label: 'Simulate' }\n      ].map(function (t) {\n        const on = st.stage === 'sim' ? t.key === 'sim' : (inStory ? t.key === 'why' : t.key === 'try');\n        // Try it reads as a button even when it is not the current place: it is\n        // the thing readers said they would click.\n        const cta = t.key === 'try' && !on;",
+    "new": "      // Two, not three. \"Try it\" was a third tab pointing at content the visitor had\n      // already scrolled past: the real settlement panel sits at the foot of this same\n      // page, so the tab duplicated a place rather than naming a different one. Worse, it\n      // sat beside the simulator as though a hypothetical rehearsal and a real transaction\n      // on Base were two flavours of the same thing, which is what made the whole demo read\n      // as staged. One tab is the argument and the real thing; the other is the lab, and it\n      // says so.\n      tabs: [\n        { key: 'why', label: 'See it work' },\n        { key: 'sim', label: 'Simulate' }\n      ].map(function (t) {\n        // The story and the live settlement are the same place, so the first tab stays lit\n        // through both. Only the lab is elsewhere.\n        const on = t.key === 'sim' ? st.stage === 'sim' : st.stage !== 'sim';\n        const cta = false;"
+  },
+  {
+    "name": "the headline names the first step",
+    "old": "title: 'The only difference is memory.',",
+    "new": "title: '1. The same job, quoted twice.',"
+  },
+  {
+    "name": "and the body says what the next step is",
+    "old": "body: 'Left column, these two have no record of each other. Right column, they remember two deals that already went wrong. Everything else about the job is identical.',",
+    "new": "body: 'Left column, these two have no record of each other. Right column, they remember two deals that already went wrong. Everything else about the job is identical. The two deals are underneath, and you can open both on the block explorer.',"
+  },
+  {
+    "name": "the receipts are the second step",
+    "old": "{ k: 'The first deal they remember', v: PLAIN.timeout_claimed_without_delivery",
+    "new": "{ k: '2. The first deal they remember', v: PLAIN.timeout_claimed_without_delivery"
+  },
+  {
+    "name": "the button says what it does, which is not running a job",
+    "old": "button: 'Run your own job'",
+    "new": "button: 'Quote it live, with numbers you choose'"
+  },
+  {
+    "name": "the scope trio says which of the three steps is the real one",
+    "old": "{ k: 'Never here', v: 'Paying anyone. Nothing is sent and nothing is signed on this page.' }",
+    "new": "{ k: 'Only in step three', v: 'Signing. Steps one and two read memory and do arithmetic; nothing is sent until you press the button in step three.' }"
   }
 ]
