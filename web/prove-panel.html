@@ -1,0 +1,189 @@
+<!-- The eligibility test, performed rather than described.
+     Sibyl's rule is "delete the memory layer; if your project still does what it claims, it is
+     a wrapper". A paragraph asserting we pass is worth nothing, and a recording of a terminal
+     is worth little more, so this runs the four cases on demand against the memories this
+     deployment is actually serving. Same module as `scripts/delete-the-memory.py`, so the
+     browser and the terminal cannot drift apart and disagree about whether we pass.
+     Sibling of <x-dc>, never a child: see the note in `web/run-panel.html`. -->
+<section id="wrasse-prove" hidden>
+  <style>
+    /* Every value lifted from the design, same as the settlement panel: 16px radius on
+       `--surface`, the 12px/2px/0.18em action button, the mono face for anything that is a
+       value rather than a sentence. */
+    #wrasse-prove{position:relative;clear:both;max-width:none;margin:0 auto;
+      padding:0 clamp(14px,3vw,44px) 28px;
+      font:14px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;color:var(--fg,#141412)}
+    #wrasse-prove .wp-card{background:var(--surface,transparent);border-radius:16px;
+      padding:clamp(20px,2.5vw,28px)}
+    #wrasse-prove h2{font:600 clamp(19px,2.2vw,26px)/1.2 Inter,sans-serif;letter-spacing:-0.4px;
+      color:var(--fg-strong,inherit);margin:0 0 10px}
+    #wrasse-prove p{max-width:74ch;margin:0 0 14px;color:var(--fg-muted,inherit)}
+    #wrasse-prove .wp-eyebrow{font:600 11px/1.4 Inter,sans-serif;letter-spacing:0.16em;
+      text-transform:uppercase;color:var(--fg-subtle,inherit);margin:0 0 10px}
+    #wrasse-prove button.wp-go{flex:0 0 auto;min-width:230px;min-height:52px;padding:15px 14px;
+      cursor:pointer;border:2px solid var(--line-strong,#c4c4cc);border-radius:12px;
+      background:var(--primary,transparent);color:var(--on-primary,inherit);
+      font:600 12px/1.15 Inter,sans-serif;letter-spacing:0.18em;text-transform:uppercase}
+    #wrasse-prove button.wp-go[disabled]{opacity:0.55;cursor:default}
+    #wrasse-prove .wp-controls{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:18px 0 0}
+    #wrasse-prove .wp-detail{font:500 11px/1.5 'Geist Mono',ui-monospace,monospace;
+      color:var(--fg-subtle,inherit)}
+    #wrasse-prove .wp-rows{margin:20px 0 0;border:1px solid var(--line-strong,#c4c4cc);
+      border-radius:12px;overflow:hidden}
+    #wrasse-prove .wp-row{display:grid;grid-template-columns:1.25fr 1fr;gap:4px 18px;
+      padding:13px 15px;border-top:1px solid var(--line,#e4e4ea)}
+    #wrasse-prove .wp-row:first-child{border-top:0}
+    #wrasse-prove .wp-what{font:500 13px/1.4 Inter,sans-serif;color:var(--fg-strong,inherit)}
+    #wrasse-prove .wp-did{grid-column:1;font:500 11px/1.5 'Geist Mono',ui-monospace,monospace;
+      color:var(--fg-subtle,inherit)}
+    #wrasse-prove .wp-said{grid-column:2;grid-row:1 / span 2;align-self:start}
+    #wrasse-prove .wp-verdict{font:700 12px/1.3 Inter,sans-serif;letter-spacing:0.14em;
+      text-transform:uppercase}
+    #wrasse-prove .wp-why{margin-top:5px;font:500 12px/1.5 Inter,sans-serif;
+      color:var(--fg-muted,inherit);overflow-wrap:anywhere}
+    /* One column below the width where two columns stop being two columns. */
+    @media (max-width:640px){
+      #wrasse-prove .wp-row{grid-template-columns:1fr}
+      #wrasse-prove .wp-said{grid-column:1;grid-row:auto}
+    }
+    #wrasse-prove .wp-summary{margin:16px 0 0;padding:14px 16px;border-radius:12px;
+      background:var(--surface-2,transparent);font:500 13px/1.55 Inter,sans-serif;
+      color:var(--fg,inherit);max-width:78ch}
+  </style>
+
+  <div class="wp-card">
+    <div class="wp-eyebrow">Step two, and it costs nothing</div>
+    <h2>2. Take the memory away, and watch it stop working</h2>
+    <p id="wp-intro">
+      Everything above could be a program with two prices written into it. This is how you tell
+      the difference. It takes the memory away from the two agents this page is serving and asks
+      them for the same quote again, four times over: once with nothing broken, then with both
+      memory files deleted, then with one that will not open, then with a single character of one
+      transaction hash changed. The first has to produce terms and the other three have to refuse,
+      because a build that refuses everything proves nothing either.
+    </p>
+    <p>
+      It runs on a throwaway copy in a temporary directory, which is deleted afterwards. The
+      memories themselves are read to be copied and never written, so this changes nothing for
+      the next person to open the page. Nothing is signed and no money moves.
+    </p>
+    <div class="wp-controls">
+      <button class="wp-go" id="wp-go" type="button">Delete the memory and re-quote</button>
+      <span id="wp-status" class="wp-detail"></span>
+    </div>
+    <div id="wp-rows" class="wp-rows" hidden></div>
+    <div id="wp-summary" class="wp-summary" hidden></div>
+  </div>
+</section>
+
+<script>
+(function () {
+  'use strict';
+
+  var root = document.getElementById('wrasse-prove');
+  var button = document.getElementById('wp-go');
+  var status = document.getElementById('wp-status');
+  var rows = document.getElementById('wp-rows');
+  var summary = document.getElementById('wp-summary');
+
+  function text(node, value) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+    node.appendChild(document.createTextNode(value));
+  }
+
+  //: Wei to an exact ETH string by moving the decimal point. A float cannot hold eighteen
+  //: significant figures, so 0.1 ETH divides to 99999999999999998 wei and the page would be
+  //: quoting a number nobody produced. The same reasoning, and the same method, as the engine.
+  function eth(wei) {
+    var digits = String(wei);
+    if (!/^[0-9]+$/.test(digits)) return String(wei);
+    while (digits.length < 19) digits = '0' + digits;
+    var whole = digits.slice(0, -18);
+    var frac = digits.slice(-18).replace(/0+$/, '');
+    return frac ? whole + '.' + frac : whole;
+  }
+
+  function terms(t) {
+    return 'pays ' + eth(t.price_wei) + ' ETH, seller stakes '
+      + (Number(t.provider_bond_bps) / 100) + '%, delivered in '
+      + Math.round(Number(t.service_window) / 60) + 'm, paid '
+      + Math.round(Number(t.payout_delay) / 60) + 'm after delivery';
+  }
+
+  function render(body) {
+    while (rows.firstChild) rows.removeChild(rows.firstChild);
+    body.cases.forEach(function (c) {
+      var row = document.createElement('div');
+      row.className = 'wp-row';
+
+      var what = document.createElement('div');
+      what.className = 'wp-what';
+      text(what, c.name);
+
+      var did = document.createElement('div');
+      did.className = 'wp-did';
+      text(did, c.did);
+
+      var said = document.createElement('div');
+      said.className = 'wp-said';
+      var verdict = document.createElement('div');
+      verdict.className = 'wp-verdict';
+      // Green for the answer this case was supposed to give, whichever answer that is. The
+      // control passing is terms; the three failures passing is a refusal. Colouring by
+      // outcome rather than by expectation would paint the control red for working.
+      verdict.style.color = c.passed ? 'var(--good, inherit)' : 'var(--bad, inherit)';
+      text(verdict, c.outcome === 'terms' ? 'It quoted' : 'It refused');
+      said.appendChild(verdict);
+
+      var why = document.createElement('div');
+      why.className = 'wp-why';
+      text(why, c.terms ? terms(c.terms) : (c.detail || ''));
+      said.appendChild(why);
+
+      row.appendChild(what);
+      row.appendChild(said);
+      row.appendChild(did);
+      rows.appendChild(row);
+    });
+    rows.hidden = false;
+
+    text(summary, body.passed
+      ? 'With both memories intact it quotes. With the memory deleted, unreadable, or altered '
+        + 'by one character, it refuses and says why. The terms above are not written into this '
+        + 'program: they are read out of what these two agents remember, and taking that away '
+        + 'does not degrade the answer, it removes it.'
+      : 'At least one case did not answer the way it has to. Read the rows above: this is the '
+        + 'test failing in the open rather than a page telling you it passed.');
+    summary.style.color = body.passed ? 'var(--fg, inherit)' : 'var(--bad, inherit)';
+    summary.hidden = false;
+
+    text(status, body.age_seconds > 0
+      ? 'answered from a run ' + Math.round(body.age_seconds) + ' seconds ago'
+      : 'just run, against the memories this page is serving');
+  }
+
+  async function run() {
+    button.disabled = true;
+    text(status, 'taking the memory away and re-quoting, four times');
+    rows.hidden = true;
+    summary.hidden = true;
+    try {
+      var response = await fetch('/api/prove', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+      });
+      var body = await response.json();
+      if (!response.ok) {
+        throw new Error((body && body.detail && body.detail.error) || ('HTTP ' + response.status));
+      }
+      render(body);
+    } catch (error) {
+      text(status, String((error && error.message) || error));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  button.addEventListener('click', run);
+  root.hidden = false;
+})();
+</script>

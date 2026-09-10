@@ -110,9 +110,9 @@
     "new": "remembering half from docs/examples/policy.schema3.json at 01eaa90 / no history half from"
   },
   {
-    "name": "the comparison carries its own numbers",
+    "name": "the comparison carries its own numbers, and says whose deposit it is",
     "old": "'Both sides get something, and both sides give something. The buyer gets a deposit ' + cmpRows[0].prose + ' and delivery ' + cmpRows[2].prose + ', because it paid once and got nothing. The seller gets ' + cmpRows[1].prose + ' money and its payment ' + cmpRows[3].prose + ', because it delivered once and was made to wait. Two gains each. Nobody is being punished; the terms have simply moved to match the risk each side has already proved it carries.'",
-    "new": "'Both sides get something, and both sides give something. The buyer gets a deposit ' + cmpRows[0].prose + ', ' + cmpRows[0].warm + ' and not ' + cmpRows[0].cold + ', and delivery ' + cmpRows[2].prose + ', ' + cmpRows[2].warm + ' and not ' + cmpRows[2].cold + ', because it paid once and got nothing. The seller gets ' + cmpRows[1].prose + ' money, ' + cmpRows[1].warm + ' and not ' + cmpRows[1].cold + ', and its payment ' + cmpRows[3].prose + ', ' + cmpRows[3].warm + ' and not ' + cmpRows[3].cold + ', because it delivered once and was made to wait. Two gains each. Nobody is being punished; the terms have simply moved to match the risk each side has already proved it carries.'"
+    "new": "'Both sides get something, and both sides give something. The buyer gets a deposit from the seller ' + cmpRows[0].prose + ', ' + cmpRows[0].warm + ' and not ' + cmpRows[0].cold + ', and delivery ' + cmpRows[2].prose + ', ' + cmpRows[2].warm + ' and not ' + cmpRows[2].cold + ', because it paid once and got nothing. The seller gets ' + cmpRows[1].prose + ' money, ' + cmpRows[1].warm + ' and not ' + cmpRows[1].cold + ', and its payment ' + cmpRows[3].prose + ', ' + cmpRows[3].warm + ' and not ' + cmpRows[3].cold + ', because it delivered once and was made to wait. Two gains each. Nobody is being punished; the terms have simply moved to match the risk each side has already proved it carries.'"
   },
   {
     "name": "the inline quote box reads ETH like the rest of the form",
@@ -198,5 +198,25 @@
     "name": "the body introduces the receipts it now sits above",
     "old": "body: 'Left column, these two have no record of each other. Right column, they remember two deals that already went wrong. Everything else about the job is identical. The two deals are underneath, and you can open both on the block explorer.',",
     "new": "body: 'Here are the two deals they remember. Both are real transactions on Base Sepolia and both open on the block explorer. Underneath is the same job quoted twice: once by two agents with no record of each other, once by these two. Everything else about the job is identical.',"
+  },
+  {
+    "name": "the seller never took the money, and the contract would not let it",
+    "old": "timeout_claimed_without_delivery: 'The seller took the money and never delivered.',",
+    "new": "timeout_claimed_without_delivery: 'The seller never delivered, and when the deadline passed the buyer had to claim back its payment and the seller\u2019s stake.',"
+  },
+  {
+    "name": "the simulator's opening says the same thing correctly",
+    "old": "the seller keeps the money without delivering, or the buyer makes the seller wait to be paid.",
+    "new": "the seller never delivers and you have to claim your money back, or the buyer makes the seller wait to be paid."
+  },
+  {
+    "name": "the first job's outcome, as the tester picks it",
+    "old": "choice(1, R1.event_type, 'provider', 'The seller takes the money and never delivers', true),",
+    "new": "choice(1, R1.event_type, 'provider', 'The seller never delivers, and you claim your money back', true),"
+  },
+  {
+    "name": "the second job's outcome, as the tester picks it",
+    "old": "if (first !== R1.event_type) opts.push(choice(2, R1.event_type, 'provider', 'The seller takes the money and never delivers', true));",
+    "new": "if (first !== R1.event_type) opts.push(choice(2, R1.event_type, 'provider', 'The seller never delivers, and you claim your money back', true));"
   }
 ]

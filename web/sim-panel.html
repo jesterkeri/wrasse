@@ -94,7 +94,7 @@
   </style>
 
   <div class="ws-card">
-    <div class="ws-step">Step one</div>
+    <div class="ws-step">Before you start</div>
     <div class="sim-banner">Hypothetical rehearsal: you choose the history. Nothing is
       signed and no memory changes.</div>
     <h2>Set the job</h2>
@@ -111,14 +111,14 @@
   </div>
 
   <div class="ws-card">
-    <div class="ws-step">Step two</div>
+    <div class="ws-step">Their record, so far</div>
     <h2>What they remember</h2>
     <div class="ws-history" id="ws-history"></div>
     <button type="button" class="ws-quiet" id="ws-clear">Start over from two strangers</button>
   </div>
 
   <div class="ws-card">
-    <div class="ws-step">Step three</div>
+    <div class="ws-step">Watch them argue it out</div>
     <h2>Let them negotiate</h2>
     <p id="ws-lede">
       Pick how the buyer is posting the job, then watch the exchange. Each line names the number
@@ -138,7 +138,7 @@
   </div>
 
   <div class="ws-card" id="ws-next" hidden>
-    <div class="ws-step">Step four</div>
+    <div class="ws-step">And then it goes round again</div>
     <h2>Teach the agents what happened</h2>
     <p>
       A different thing from the numbers above. Those decide what the two of them will agree
@@ -260,7 +260,7 @@
   };
 
   var OUTCOMES = [
-    { id: 'timeout_claimed_without_delivery', label: 'the seller took the money and never delivered' },
+    { id: 'timeout_claimed_without_delivery', label: 'the seller never delivered, and the buyer had to claim its money back' },
     { id: 'delivered_and_claimed_after_delay', label: 'it was delivered, and the seller was made to wait' },
     { id: 'delivered_and_released_by_buyer', label: 'it was delivered and paid promptly' }
   ];
@@ -637,6 +637,10 @@
     root.hidden = !sim;
     var settle = document.getElementById('wrasse-run');
     if (settle) settle.style.display = sim ? 'none' : '';
+    // The deletion proof belongs to the argument tab. On the simulator it would be answering a
+    // question about memories the tester just invented, which is not the question it answers.
+    var proof = document.getElementById('wrasse-prove');
+    if (proof) proof.style.display = sim ? 'none' : '';
   }
   new MutationObserver(follow).observe(document.body, {
     attributes: true, attributeFilter: ['data-stage']

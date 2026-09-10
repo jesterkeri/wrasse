@@ -132,3 +132,65 @@ def test_the_profiles_are_ordered_for_reading():
     assert [p["id"] for p in page_view(WARM, memory=True)["profiles"]] == [
         "urgent", "sensitive", "budget",
     ]
+
+
+# The bundle is generated, and every hand change to it lives in `web/source-edits.json` so a
+# fresh export from the design tool is one command away from correct. That only holds while a
+# rebuild is a no-op. Twice in one day an edit was written whose replacement rewrote text that
+# an EARLIER edit produces: the first run applied both, and the second could find neither the
+# earlier edit's `old` (long gone from the bundle) nor its `new` (just overwritten), so
+# `apply-overrides.py` refused with ANCHOR LOST and the page could not be rebuilt at all.
+#
+# Both times it was found by running the script twice by hand. Nothing in the suite covered
+# it, which is the whole reason it happened twice.
+
+BUNDLE = Path(__file__).resolve().parent.parent / "web" / "index.html"
+EDITS = Path(__file__).resolve().parent.parent / "web" / "source-edits.json"
+_OPEN = '  <script type="__bundler/template">\n'
+
+
+def _document() -> str:
+    """The application document the bundle carries, without writing the gitignored unpack."""
+
+    text = BUNDLE.read_text(encoding="utf-8")
+    start = text.index(_OPEN) + len(_OPEN)
+    return json.loads(text[start : text.index("\n  </script>", start)])
+
+
+@pytest.mark.parametrize("edit", json.loads(EDITS.read_text(encoding="utf-8")), ids=lambda e: e["name"])
+def test_every_source_edit_is_still_present_in_the_bundle(edit):
+    """Each edit's replacement survives every edit that runs after it.
+
+    This is the exact condition `apply-overrides.py` tests to decide an edit is already
+    applied. An edit whose `new` is absent from the committed bundle cannot be skipped on the
+    next run, and its `old` is no longer there either, so the rebuild fails closed.
+    """
+
+    assert edit["new"] in _document(), (
+        f"{edit['name']!r} is not present in web/index.html. A later edit has rewritten the "
+        "text this one produces, so the next rebuild will refuse. Fold the wording into this "
+        "edit rather than adding a second one that overwrites it."
+    )
+
+
+@pytest.mark.parametrize("edit", json.loads(EDITS.read_text(encoding="utf-8")), ids=lambda e: e["name"])
+def test_no_source_edit_anchors_inside_an_injected_panel(edit):
+    """The panels are re-injected from their own files on every run, so an edit there is lost.
+
+    `apply-overrides.py` strips each `wrasse:<name>` region and re-appends it from
+    `web/run-panel.html` or `web/sim-panel.html`. An edit whose anchor lies inside one of those
+    regions would apply, be thrown away moments later in the same run, and read as applied in
+    the diff. Panel text is changed in the panel file itself.
+    """
+
+    document = _document()
+    for marker in ("prove-panel", "run-panel", "sim-panel"):
+        start = document.find(f"<!-- wrasse:{marker}:start -->")
+        end = document.find(f"<!-- wrasse:{marker}:end -->")
+        if start == -1 or end == -1:
+            continue
+        region = document[start:end]
+        assert edit["new"] not in region, (
+            f"{edit['name']!r} anchors inside the {marker} region, which is regenerated from "
+            f"web/{marker}.html on every run. Change that file instead."
+        )

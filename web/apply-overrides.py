@@ -26,6 +26,7 @@ PAGE = HERE / "index.html"
 #: The islands, in the order they are appended. Each is wrapped in its own markers so a
 #: re-run replaces it rather than adding a second copy.
 PANELS = [
+    ("the deletion proof", HERE / "prove-panel.html", "prove-panel"),
     ("the settlement panel", HERE / "run-panel.html", "run-panel"),
     ("the simulator", HERE / "sim-panel.html", "sim-panel"),
 ]

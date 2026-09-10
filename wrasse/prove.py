@@ -92,21 +92,35 @@ def _edited(paths: dict[str, Path]) -> None:
     """
     connection = sqlite3.connect(paths["buyer"])
     try:
-        before = connection.execute(
-            "select body from entities where category = 'chain_event'"
+        # Read the hash out and flip a character of the one that is there, rather than matching
+        # a literal. The first version replaced a hardcoded prefix, which meant the case passed
+        # only against the two receipts this demo happened to hold: any other store, including
+        # the suite's fixture, edited nothing and reported that the shape had changed. A case
+        # that silently does nothing on an unfamiliar store is worse than no case at all, since
+        # it would have read as a pass on a deployment it never actually tested.
+        rows = connection.execute(
+            "select rowid, body from entities where category = 'chain_event'"
         ).fetchall()
+        if not rows:
+            raise RuntimeError(
+                "this memory holds no chain events, so there is no receipt to alter and this "
+                "case proves nothing."
+            )
+
+        rowid, body = rows[0]
+        event = json.loads(body)
+        original = str(event["tx_hash"])
+        # The last character, so it stays a well-formed 32-byte value. Nothing is missing and
+        # nothing fails to parse: the store opens, answers, and hands back a receipt that no
+        # longer reproduces its own name.
+        event["tx_hash"] = original[:-1] + ("0" if original[-1] != "0" else "1")
+        if event["tx_hash"] == original:
+            raise RuntimeError("the hash did not change, so this case proves nothing.")
+
         connection.execute(
-            "update entities set body = "
-            "replace(body, '\"tx_hash\":\"0xbe', '\"tx_hash\":\"0xbf') "
-            "where category = 'chain_event'"
+            "update entities set body = ? where rowid = ?", (json.dumps(event), rowid)
         )
         connection.commit()
-        if before == connection.execute(
-            "select body from entities where category = 'chain_event'"
-        ).fetchall():
-            raise RuntimeError(
-                "nothing was edited, so this case proves nothing. The stored shape changed."
-            )
     finally:
         connection.close()
 

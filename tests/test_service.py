@@ -1295,3 +1295,71 @@ def test_reconciling_an_older_refund_does_not_disturb_a_newer_one(executing):
     # And the caller that does name the current one still works.
     assert registry.settle_refund(session, "r2", succeeded=True) is True
     assert session.refunded is True
+
+
+def test_the_deletion_proof_answers_all_four_cases_and_writes_nothing(service):
+    """The eligibility test, served to a browser rather than run in a terminal.
+
+    Sibyl's rule is that a project whose core function survives deleting the memory layer is a
+    wrapper. The page has to be able to demonstrate that on demand, so this endpoint takes the
+    memory away from the stores this deployment is serving and quotes again, four ways.
+
+    Two properties, and the second is the one that would be discovered in production. The
+    control has to produce terms while the three broken cases refuse, because a build that
+    refuses everything proves nothing about memory. And the live stores have to come back
+    byte-identical, because a proof button that damaged the memory it was proving would take
+    the demo down the first time a judge pressed it twice.
+    """
+
+    import hashlib
+
+    client, warm = service
+
+    assert client.get("/api/quote", params={"memory": "on"}).status_code == 200
+    before = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(warm.glob("*memory.db*"))
+    }
+
+    response = client.post("/api/prove")
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    outcomes = {case["name"]: case["outcome"] for case in body["cases"]}
+    assert outcomes == {
+        "both memories intact": "terms",
+        "both memory files deleted": "refusal",
+        "a memory that will not open": "refusal",
+        "a receipt edited in place": "refusal",
+    }, "the four cases did not answer the way the eligibility test needs them to"
+    assert body["passed"] is True
+
+    control = [case for case in body["cases"] if case["name"] == "both memories intact"][0]
+    assert control["terms"], "the control has to show the terms memory produced"
+    for case in body["cases"]:
+        if case["outcome"] == "refusal":
+            assert case["detail"], f"{case['name']} refused without saying why"
+
+    after = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(warm.glob("*memory.db*"))
+    }
+    assert before == after, "the deletion proof wrote to the memory it was proving"
+
+
+def test_the_deletion_proof_refuses_when_there_is_no_memory_to_delete(service, monkeypatch):
+    """A deployment with no stores cannot answer the question, and must not pretend to.
+
+    Four refusals from a machine that never had a memory would read as a pass, which is exactly
+    the confusion the eligibility test exists to catch. It is answered with a 503 that says the
+    test has no subject.
+    """
+
+    from wrasse import service as module
+
+    client, warm = service
+    monkeypatch.setitem(module._PATHS[module.WARM], "buyer", warm / "nothing-here.db")
+
+    response = client.post("/api/prove")
+    assert response.status_code == 503
+    assert "no memory to take away" in response.json()["detail"]["error"]

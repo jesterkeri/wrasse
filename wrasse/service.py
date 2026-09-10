@@ -65,6 +65,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -76,7 +77,7 @@ from pydantic import BaseModel, Field
 
 from sibyl_memory_client import MemoryClient
 
-from . import cli, executor, sessions, simulate as simulation
+from . import cli, executor, prove, sessions, simulate as simulation
 from .evidence import CHAIN_EVENT_CATEGORY
 from .page import page_view
 from .store import persona_digest
@@ -881,6 +882,66 @@ class _SuppliedTime:
     """`_executability` reads one field off the argparse namespace. This is that field."""
 
     inclusion_margin = 0
+
+
+#: One proof at a time, and a result stays fresh for this long. Each run starts four
+#: subprocesses that each open a store and quote, so an unguarded button is a way for one
+#: visitor to spend the whole machine. The age is reported rather than hidden: a result served
+#: instantly with no explanation is exactly what a judge should distrust.
+_PROOF_TTL = float(os.getenv("WRASSE_PROOF_TTL", "45"))
+_proof_lock = threading.Lock()
+_proof: dict[str, Any] = {"at": 0.0, "body": None}
+
+
+@app.post("/api/prove")
+def prove_memory_is_load_bearing() -> JSONResponse:
+    """Take the memory away from the memories this deployment is actually serving.
+
+    The eligibility test is a claim about behaviour, so it is answered by behaviour rather than
+    by a paragraph: delete the memory layer, and if the thing still does what it claims, it is
+    a wrapper. The four cases run against a throwaway copy of the live stores, in a temporary
+    directory that is removed afterwards. The stores themselves are opened to be copied and are
+    never written, so pressing this does not change what the next visitor sees.
+
+    The control case matters as much as the three failures. Three refusals on their own would
+    only show that this build refuses; the intact run is what shows it refuses *because* the
+    memory is gone rather than because it refuses everything.
+    """
+
+    if not _PATHS[WARM]["buyer"].is_file() or not _PATHS[WARM]["provider"].is_file():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "this deployment has no memory to take away, so the test has no "
+                         "subject. Both stores must be present before it can mean anything.",
+            },
+        )
+
+    with _proof_lock:
+        age = time.monotonic() - _proof["at"]
+        if _proof["body"] is not None and age < _PROOF_TTL:
+            return JSONResponse({**_proof["body"], "age_seconds": round(age, 1)})
+
+        try:
+            cases = prove.prove(
+                _PATHS[WARM],
+                buyer=cli._required_env("WRASSE_BUYER_ADDRESS"),
+                provider=cli._required_env("WRASSE_PROVIDER_A_ADDRESS"),
+            )
+        except Exception as error:  # noqa: BLE001 - reported to the page, never a 500 page
+            raise HTTPException(
+                status_code=503,
+                detail={"error": f"the deletion test could not be run: {error}"},
+            ) from error
+
+        body = {
+            "question": "Delete the memory layer. Does this still do what it claims?",
+            "cases": [case.view() for case in cases],
+            "passed": all(case.passed for case in cases),
+            "age_seconds": 0.0,
+        }
+        _proof["at"], _proof["body"] = time.monotonic(), body
+        return JSONResponse(body)
 
 
 # Mounted last, so every `/api/...` route above wins and the page only catches what is left.
