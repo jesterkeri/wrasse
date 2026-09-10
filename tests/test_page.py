@@ -284,3 +284,51 @@ def test_the_simulator_names_no_stake_threshold_it_cannot_know():
     assert "depends entirely on the history YOU build" in simulator, (
         "the simulator has to say that the limit follows the history the visitor builds"
     )
+
+
+def test_the_page_recovers_from_a_session_the_server_is_still_refusing():
+    """It knew how to replace a forgotten session and not a finished one.
+
+    Pressing Finish collects the escrow and closes the session. Every settlement after that is
+    refused with 429 and a sentence ending "Start a new session." The page kept the dead id in
+    the tab, showed the message, and offered no button anywhere that would do what the message
+    asked. A visitor who pressed Finish once could not run another deal without knowing to open
+    a private window.
+
+    The recovery already existed for a session the server had forgotten. This is the same path,
+    one condition wider.
+    """
+
+    document = _document()
+
+    assert "Start a new session" in document, (
+        "the page no longer keys on the sentence the server refuses with"
+    )
+    assert "That session was finished, so this starts a fresh one" in document, (
+        "a finished session no longer replaces itself"
+    )
+    # And the recovery has to be on the path a run actually takes. Asserting only that the
+    # helper exists passes with the helper orphaned, which is how the first version of this
+    # test survived having the call site reverted under it.
+    assert "await submit(body)" in document, (
+        "the run posts to /api/execute directly again, so the recovery is dead code"
+    )
+
+
+def test_the_sentence_the_page_keys_on_is_the_one_the_server_sends():
+    """A page matching on server prose is a coupling, so it gets a test rather than a comment.
+
+    The recovery above fires on the substring "Start a new session". If `sessions.py` reworded
+    that refusal, the page would stop recovering and nothing would fail: the visitor would land
+    back in the dead end, and the only symptom would be a button that does nothing.
+    """
+
+    from wrasse import sessions
+
+    source = Path(sessions.__file__).read_text(encoding="utf-8")
+    finished = "this session has been finished and its escrow collected."
+    assert finished in source
+    # Both refusals a visitor can hit end with it: the finished session and the spent one.
+    assert source.count("Start a new session") >= 2, (
+        "the page recovers by matching this sentence; a refusal that omits it is a dead end"
+    )

@@ -529,6 +529,27 @@
     if (message) note(explain(message));
   }
 
+  //: A session that is finished, or has used its five runs, is refused with 429 and a
+  //: sentence ending "Start a new session." The page knew how to replace a session the server
+  //: had forgotten, and not one it was still refusing, so the stored id stayed in the tab and
+  //: every press after pressing Finish failed the same way with no button anywhere that would
+  //: do what the message asked. Same recovery as the 404 path, one condition wider.
+  async function submit(body) {
+    try {
+      return await post('/api/execute', body);
+    } catch (error) {
+      var said = String((error && error.message) || '');
+      if (said.indexOf('Start a new session') === -1) throw error;
+      try { sessionStorage.removeItem('wrasse-session'); } catch (e) { /* private mode */ }
+      var made = await post('/api/session');
+      try { sessionStorage.setItem('wrasse-session', made.session_id); } catch (e) { /* ditto */ }
+      body.session_id = made.session_id;
+      note('That session was finished, so this starts a fresh one. The two receipts everything '
+        + 'is priced from are still there; anything the finished session had learned is not.');
+      return await post('/api/execute', body);
+    }
+  }
+
   async function start() {
     button.disabled = true;
     text(button, 'Running\u2026');
@@ -539,7 +560,7 @@
       var sessionId = await session();
       var body = { session_id: sessionId, profile: chosen, outcome: ending,
                    baseline: baseline() };
-      var queued = await post('/api/execute', body);
+      var queued = await submit(body);
       var runId = queued.run_id;
       //: Counted from the ending rather than fixed. A timeout sends three transactions, not
       //: four, and a number a judge can check against the receipt links has to be right.
