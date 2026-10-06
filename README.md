@@ -7,6 +7,13 @@ accepted terms on Base, and write the verified outcome back to Sibyl Memory.
 > Memory changes real economic behaviour across sessions, and the outcome comes
 > back as verified evidence.
 
+## Prize payout wallet
+
+`0xb0b7EbA59e1C65688821Ca32CB503d1df0616DA7`
+
+USDC on **Base mainnet** (chain 8453). This is the payout address for the Sibyl Labs hackathon
+prize. It is not one of the Base Sepolia development wallets listed further down.
+
 ## For judges: start with the build atlas
 
 **[The build atlas](docs/atlas/00-read-me-first.md)** is twelve pages tracing every command hop
